@@ -189,6 +189,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/
 `Xray_template_split.json` — режим выборочной маршрутизации:
 
 - домены из актуального на момент генерации списка [itdoginfo/allow-domains — Russia inside](https://github.com/itdoginfo/allow-domains/blob/main/Russia/inside-raw.lst) идут через балансировщик `USA`;
+- дополнительно подключены отдельные списки Telegram и Google AI;
+- IPv4/IPv6-подсети Telegram, Meta/Instagram и Twitter тоже идут через VPN — это важно для приложений, которые подключаются прямо к IP;
 - запросы к Cloudflare DNS `1.1.1.1` и `1.0.0.1` также идут через VPN;
 - реклама из `geosite:category-ads-all` блокируется;
 - UDP/443 блокируется, чтобы приложения откатывались с QUIC на маршрутизируемый TCP;
