@@ -1,119 +1,187 @@
-# remnanode-setup
+# Multi-protocol Remnawave Node
 
-Автоматическая установка **ноды Remnawave** на чистый Debian/Ubuntu-сервер: VLESS (Reality/Vision self-steal + XHTTP), Trojan и Hysteria2 за **Caddy L4** с SNI-роутингом. Один запуск — и нода готова к подключению к панели.
+Установщик ноды Remnawave с четырьмя протоколами на одном публичном порту:
 
-Скрипт идемпотентный: повторный запуск не ломает уже настроенное (сборка Caddy, сертификаты, `.env` — всё пропускается или переиспользуется).
+- VLESS Reality/Vision с локальным self-steal;
+- VLESS XHTTP + Reality;
+- Trojan TLS;
+- Hysteria2.
 
-Каждый push и pull request автоматически проверяет Bash/ShellCheck, JSON5-шаблоны и JavaScript веб-фасада через GitHub Actions.
+Caddy L4 принимает `443/tcp` и распределяет соединения по SNI. Hysteria2 принимает `443/udp` напрямую. Обычный браузер на self-steal-домене получает локальный TLS-сайт в стиле закрытого файлообменника.
 
----
+> Форма входа на маскировочном сайте декоративная: данные никуда не отправляются и не сохраняются.
 
-## Что делает
+## Совместимость с Remnawave 3.x
 
-- **Preflight** — проверка ОС, архитектуры, ядра (BBR), RAM и диска.
-- **Docker** — установка через `get.docker.com`, ротация логов, `live-restore`.
-- **Caddy + caddy-l4** — воспроизводимая сборка кастомного бинаря через `xcaddy` с зафиксированными стабильными версиями (`xcaddy v0.4.5`, [`caddy-l4 v0.1.2`](https://github.com/mholt/caddy-l4/releases/tag/v0.1.2)), `setcap` на биндинг привилегированных портов.
-- **L4-роутинг по SNI** на `:443/tcp`:
-  | SNI | → | Локальный порт | Инбаунд |
-  |-----|---|----------------|---------|
-  | `SELF_STEAL_HOST` (по умолчанию `<prefix>1.<domain>`) | → | `127.0.0.1:10443` | VLESS Reality + Vision |
-  | `XHTTP_SNI` | → | `127.0.0.1:10444` | VLESS XHTTP |
-  | `TROJAN_HOST` | → | `127.0.0.1:10445` | Trojan (TLS) |
-  | *остальное* | → | `127.0.0.1:9443` | локальный TLS-сайт |
-- **Настоящий REALITY self-steal** — target Vision указывает на локальный TLS-сайт Caddy `127.0.0.1:9443`, а не на внешний Google/Cloudflare. Обычный браузер и невалидная REALITY-проба получают ваш реальный сайт и сертификат.
-- **Правдоподобный веб-фасад** — адаптивный интерфейс закрытого файлообменника с формой входа. Форма ничего не отправляет и не сохраняет: после попытки входа показывает временную недоступность авторизации.
-- **XHTTP остаётся с внешним target.** Прямой XHTTP+REALITY self-steal на локальный TLS target имеет [известную несовместимость в актуальных версиях Xray](https://github.com/XTLS/Xray-core/issues/5923); self-steal включён для стабильного Vision/RAW-инбаунда.
-- **Hysteria2** — слушает `:443/udp` напрямую из контейнера (host-network), в обход Caddy.
-- **Сертификаты** — `acme.sh` (Let's Encrypt, EC-256) для self-steal, `TROJAN_HOST` и `HY_HOST`, установка в `/etc/remna-certs`, автоперевыпуск.
-- **sysctl-тюнинг** — BBR + `fq`, UDP-буферы, backlog, `nofile` до 1 048 576.
-- **Firewall (ufw)** — SSH, `443/tcp`, `443/udp`, `80/tcp` (acme), а API-порт ноды — **только с IP панели**. Существующие правила по умолчанию сохраняются.
-- **Нода Remnawave** — `docker-compose.yml` + `.env` (0600), `network_mode: host`, `NET_ADMIN`, ротация логов, health-poll после старта.
+Проверено по официальным исходникам и документации Remnawave на 13 августа 2026 года.
 
----
+| Компонент | Статус | Что проверено |
+|---|---|---|
+| Panel `3.0.x–3.2.x` | ✅ Совместимо | Config Profiles, Hosts, Internal Squads и XRAY_JSON `injectHosts`; REST API не используется |
+| Node `3.0.0–3.1.1` | ✅ Совместимо | `NODE_PORT`, `SECRET_KEY`, host network, `NET_ADMIN`, сертификаты и Xray-core `v26.7.28` |
+| Remnawave `2.x` | ⚠️ Не целевая ветка | `injectHosts` доступен с `2.6.3`, но инструкция написана для интерфейса 3.x |
+
+Официальный compose Node 3.x использует `NODE_PORT`, `SECRET_KEY`, `network_mode: host` и `NET_ADMIN`. Установщик следует этой схеме, добавляет сертификаты, лимиты и ротацию логов, а образ фиксирует на проверенной версии `remnawave/node:3.1.1`.
+
+Полный интеграционный тест требует живой панели, DNS и публичного IP. CI репозитория проверяет Bash/ShellCheck, JSON5-шаблоны, JavaScript фасада и форматирование. После установки на конкретном сервере выполните [проверку](#проверка-после-установки).
+
+Официальные источники:
+
+- [Установка Remnawave Node](https://docs.rw/install/remnawave-node)
+- [Config Profiles](https://docs.rw/learn-en/config-profiles)
+- [XRAY_JSON и injectHosts](https://docs.rw/learn/xray-json-advanced)
+- [Образы Remnawave Node](https://github.com/remnawave/node/pkgs/container/node)
+
+## Какой файл куда загружать
+
+Это два разных типа шаблонов. Не меняйте их местами.
+
+| Файл | Куда в Remnawave 3.x | Назначение |
+|---|---|---|
+| `Multiselect.json` | **Config Profiles → Create Config Profile** | Серверная конфигурация Xray с четырьмя inbound'ами |
+| `Xray_template.json` | **Templates → XRAY_JSON** | Клиентская подписка с балансировщиком и инжектом хостов |
+| `remnanode-setup.sh` | Запуск от `root` на ноде | Docker, Caddy L4, сертификаты, UFW и Node |
+| `self-steal-site.html` | В панель не загружается | Локальный сайт для self-steal |
+
+## Схема портов
+
+| Публичный вход | SNI | Локальный получатель |
+|---|---|---|
+| `443/tcp` | self-steal-домен | Vision `127.0.0.1:10443` |
+| `443/tcp` | внешний XHTTP SNI | XHTTP `127.0.0.1:10444` |
+| `443/tcp` | Trojan-домен | Trojan `127.0.0.1:10445` |
+| `443/tcp` | любой другой SNI | сайт `127.0.0.1:9443` |
+| `443/udp` | Hysteria2-домен | Hysteria2 внутри Node |
+
+Vision использует `target: 127.0.0.1:9443`: REALITY крадёт рукопожатие у собственного TLS-сайта. XHTTP оставлен с внешним target, потому что локальный XHTTP+REALITY self-steal имеет [известную проблему в Xray-core](https://github.com/XTLS/Xray-core/issues/5923).
 
 ## Требования
 
-- Debian 11/12 или Ubuntu 20.04+ (`amd64` или `arm64`), root-доступ.
-- Минимум ~1 GB RAM и ~3 GB свободного диска (сборка Go + Docker).
-- Три A-записи на **IP ноды** (по умолчанию префикс `usa`):
+- отдельный сервер ноды с Debian 11/12 или Ubuntu 20.04+;
+- `amd64` или `arm64`, root-доступ;
+- желательно от 1 GB RAM и 3 GB свободного места;
+- Remnawave Panel 3.x;
+- публичный IPv4 ноды и IP панели;
+- три A-записи на IP ноды.
 
-  | Домен | Назначение | Нужен валидный сертификат |
-  |-------|-----------|---------------------------|
-  | `<prefix>1.<domain>` | адрес и SNI VLESS Reality self-steal | **да** |
-  | `<prefix>2.<domain>` | Trojan | **да** |
-  | `<prefix>3.<domain>` | Hysteria2 | **да** |
+Пример для префикса `usa`:
 
-- Панель Remnawave, где заранее создаётся нода — она выдаёт `SECRET_KEY`.
+| A-запись | Назначение |
+|---|---|
+| `usa1.example.com` | Reality/Vision self-steal |
+| `usa2.example.com` | Trojan TLS |
+| `usa3.example.com` | Hysteria2 TLS |
 
----
+До запуска проверьте DNS и доступность `80/tcp`, `443/tcp`, `443/udp`. Node Port, например `2222/tcp`, должен быть доступен только с IP панели.
 
-## Быстрый старт
+## Пошаговая установка для Remnawave 3.x
 
-Через process substitution (stdin остаётся свободным для интерактивных вопросов):
+### 1. Создайте серверный Config Profile
+
+Откройте **Config Profiles → Create Config Profile** и вставьте `Multiselect.json`.
+
+Замените плейсхолдеры:
+
+| Плейсхолдер | Пример |
+|---|---|
+| `<prefix>1.<domain>` | `usa1.example.com` |
+| `<prefix>2.<domain>` | `usa2.example.com` |
+| `<prefix>3.<domain>` | `usa3.example.com` |
+
+Проверьте inbound'ы:
+
+| Tag | Listen | Port | Критичное поле |
+|---|---|---:|---|
+| `REALITY_VISION` | `127.0.0.1` | `10443` | `target: 127.0.0.1:9443`, self-steal-домен в `serverNames` |
+| `REALITY_XHTTP` | `127.0.0.1` | `10444` | внешний SNI в `serverNames` |
+| `TROJAN` | `127.0.0.1` | `10445` | сертификаты в `/etc/remna-certs/<домен>/` |
+| `HYSTERIA2` | `0.0.0.0` | `443/udp` | сертификат Hysteria2-домена |
+
+`privateKey`, `shortIds` и массивы `clients` оставьте под управлением Remnawave.
+
+### 2. Создайте ноду
+
+Откройте **Nodes → Management → +**:
+
+1. Укажите публичный IP ноды.
+2. Укажите Node Port, например `2222`.
+3. Скопируйте выданный панелью `SECRET_KEY`.
+4. Выберите Config Profile из шага 1.
+5. Активируйте все четыре inbound'а и сохраните ноду.
+
+Сгенерированный панелью compose отдельно запускать не нужно: установщик создаёт совместимый compose сам. Нужны только `SECRET_KEY`, IP и Node Port.
+
+### 3. Запустите установщик на ноде
+
+Рекомендуемый вариант — сначала скачать и просмотреть:
 
 ```bash
-apt-get update && apt-get install -y curl; \
-bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/remnanode-setup.sh)
-```
-
-Либо скачать, просмотреть и запустить:
-
-```bash
+apt-get update && apt-get install -y curl
 curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/remnanode-setup.sh -o remnanode-setup.sh
-less remnanode-setup.sh          # инспекция перед запуском
+less remnanode-setup.sh
 bash remnanode-setup.sh
 ```
 
-> Скрипт спросит: базовый домен, префикс, домен self-steal, маскировочный SNI и путь XHTTP, IP панели, порт API и `SECRET_KEY`. Ответы сохраняются в `/root/remnanode.env` и переиспользуются при следующем запуске.
+Короткий вариант:
 
-### Порядок действий
+```bash
+apt-get update && apt-get install -y curl
+bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/remnanode-setup.sh)
+```
 
-1. Поднимите A-записи `<prefix>1/2/3` на IP ноды.
-2. В панели: **Nodes → Add** — укажите IP ноды и порт API (по умолчанию `2222`; **советую сменить**), скопируйте `SECRET_KEY`.
-3. Запустите скрипт, вставьте `SECRET_KEY` на **9-м вопросе** интерактива.
-4. Настройте инбаунды в панели на локальные порты `10443` / `10444` / `10445`, Hysteria2 — на `443/udp` (карта портов — в финальном выводе скрипта; пример клиентского шаблона — `Multiselect.json`).
-   Для `REALITY_VISION` обязательно задайте `target: 127.0.0.1:9443`, а в `serverNames` — значение `SELF_STEAL_HOST`.
-5. Дождитесь статуса **online** у ноды.
-6. Создайте шаблон Xray с балансером (см. `Xray_template.json`).
-7. Заведите хосты под инбаунды, проставляя тег балансера ровно тот, что указан в `pattern` шаблона (`^USA$` → тег `USA`).
-8. Разложите хосты по схеме ниже.
+Скрипт спросит базовый домен, префикс, self-steal-домен, внешний SNI и путь XHTTP, IP панели, Node Port и `SECRET_KEY`. SSH-порт определяется автоматически; при необходимости передайте `--ssh-port N`. Ответы сохраняются в `/root/remnanode.env`.
 
----
+### 4. Проверьте статус ноды
 
-#### Схема хостов
+В **Nodes → Management** нода должна стать `Online`. Если она offline, сначала проверяйте Node Port, `SECRET_KEY` и UFW — хосты и клиентский шаблон на этот статус не влияют.
 
-Должно получиться **4 инжектируемых хоста** (с тегом, скрытые) + **1 виртуальный** (без тега, видимый — именно он несёт шаблон и показывается в подписке).
+### 5. Создайте четыре рабочих хоста
 
-> **Два разных тумблера — не перепутайте:**
-> - **Видимость хоста** (верхний) — включён/выключен. Должен быть **ON у всех пяти**.
-> - **Скрыть хост** (вкладка «Расширенные») — тот самый `HIDDEN`, по которому инжект выбирает хосты.
+В **Hosts** создайте по хосту для каждого inbound'а. Всем четырём задайте одинаковый тег, например `USA`, включите видимость и **Hide host**.
 
-| # | Протокол | Адрес | Порт | Тег | Скрыть хост | Видимость |
-|---|----------|-------|------|-----|:-----------:|:---------:|
-| 1 | Reality/Vision | `<prefix>1.<domain>` | `443` | `USA` | ✅ ON | ✅ ON |
-| 2 | XHTTP | `<prefix>1.<domain>` | `443` | `USA` | ✅ ON | ✅ ON |
-| 3 | Trojan | `<prefix>2.<domain>` | `443` | `USA` | ✅ ON | ✅ ON |
-| 4 | Hysteria2 | `<prefix>3.<domain>` | `443` | `USA` | ✅ ON | ✅ ON |
-| 5 | **Виртуальный** | `<prefix>1.<domain>` | `443` | *— пусто —* | ❌ **OFF** | ✅ ON |
+| Inbound | Address | Публичный port | Tag | Hide host |
+|---|---|---:|---|---|
+| `REALITY_VISION` | `usa1.example.com` | `443` | `USA` | ON |
+| `REALITY_XHTTP` | `usa1.example.com` | `443` | `USA` | ON |
+| `TROJAN` | `usa2.example.com` | `443` | `USA` | ON |
+| `HYSTERIA2` | `usa3.example.com` | `443` | `USA` | ON |
 
-Хосты 1–4 инжект подставит в балансер как outbound'ы (`selectFrom: "HIDDEN"` берёт только скрытые). Хост 5 остаётся видимым в подписке — на него вешаете шаблон Xray из п. 6.
+Для первых трёх хостов вручную укажите публичный порт `443`. Порты `10443–10445` локальные и не должны попадать клиентам.
 
-> **Почему у виртуального хоста нет тега.** Инжект выбирает только *скрытые* хосты, а виртуальный — не скрыт, поэтому в балансер он не попадёт при любом теге. Оставляем поле пустым, чтобы не путать его с инжектируемыми.
+В XHTTP Host укажите те же `path` и внешний SNI, что в Config Profile и установщике.
 
-> **Почему у виртуального хоста адрес не важен.** Реальные адрес/порт/ключи клиент берёт из инжектируемых хостов. Адрес виртуального — просто «обёртка» для шаблона и remark'а, можно ставить любой валидный.
+### 6. Создайте XRAY_JSON-шаблон
 
----
+Откройте **Templates → XRAY_JSON** и вставьте `Xray_template.json`.
 
-#### Важно
+Если используете тег не `USA`, замените его в:
 
-- **Порт 443 у всех хостов — обязательно.** Reality/XHTTP/Trojan сидят на локальных `10443/10444/10445` **за Caddy**, наружу их нет — клиент коннектится на публичный `:443`, где стоит Caddy L4 и роутит по SNI. Панель по умолчанию подставляет в хост порт инбаунда (`1044x`) — **переопределите на 443 вручную**, иначе клиент уйдёт на мёртвый локальный порт и словит таймаут *без единой ошибки в панели*. Hysteria2 слушает `0.0.0.0:443/udp` напрямую — его порт уже верный, трогать не надо.
+- `routing.balancers[].tag`;
+- `remnawave.injectHosts[].selector.pattern`.
 
-- **Сквады.** Инбаунд **каждого** из пяти хостов (включая виртуальный) должен быть в скваде пользователя. Иначе виртуальный хост в подписке просто не появится, и дебажить «пустую подписку» будете долго.
----
+`tagPrefix: "proxy"`, `routing.balancers[].selector: ["proxy"]` и `burstObservatory.subjectSelector: ["proxy"]` должны совпадать.
 
-## Неинтерактивный режим (CI / массовый деплой)
+### 7. Создайте виртуальный хост
 
-Все параметры можно передать через переменные окружения:
+Это видимая оболочка для XRAY_JSON-шаблона:
+
+| Поле | Значение |
+|---|---|
+| Inbound | любой inbound этого профиля |
+| Address | валидный адрес, например `usa1.example.com` |
+| Port | `443` |
+| Tag | пусто |
+| Видимость | ON |
+| Hide host | **OFF** |
+| XRAY_JSON template | шаблон из шага 6 |
+
+Итого: четыре скрытых рабочих хоста и один видимый виртуальный.
+
+### 8. Добавьте inbound'ы в Internal Squad
+
+Откройте **Internal Squads** и включите все inbound'ы, к которым привязаны пять хостов. Иначе виртуальный хост не попадёт в подписку.
+
+## Неинтерактивный запуск
 
 ```bash
 BASE_DOMAIN=example.com \
@@ -128,67 +196,86 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/
   --non-interactive --yes
 ```
 
----
+Для воспроизводимого деплоя можно зафиксировать Node:
+
+```bash
+NODE_IMAGE=remnawave/node:3.1.1 \
+bash remnanode-setup.sh
+```
+
+Без `NODE_IMAGE` используется `remnawave/node:3.1.1`. Версия зафиксирована намеренно: будущий `latest` может перейти на несовместимую major-ветку.
 
 ## Флаги
 
-```
---no-compose          не трогать docker-compose.yml (только .env + up -d)
+```text
+--no-compose          не заменять docker-compose.yml; обновить только .env
 --no-firewall         не настраивать ufw
---reset-firewall      удалить существующие правила ufw перед настройкой
---force-dns           не прерываться при несовпадении DNS
---ssh-port N          явно указать SSH-порт для правила ufw
---node-image REF      образ ноды (по умолчанию remnawave/node:latest)
--y | --yes            авто-подтверждение всех y/n вопросов
---non-interactive     не задавать вопросы: значения из env/дефолтов
--h | --help           справка
+--reset-firewall      удалить существующие правила ufw
+--force-dns           продолжить при несовпадении DNS и IP ноды
+--ssh-port N          явно указать SSH-порт для UFW
+--node-image REF      образ ноды; по умолчанию remnawave/node:3.1.1
+-y, --yes             подтвердить вопросы yes/no
+--non-interactive     брать значения из env и дефолтов
+-h, --help            показать справку
 ```
 
-**Переменные окружения:** `BASE_DOMAIN`, `PREFIX`, `SELF_STEAL_HOST`, `XHTTP_SNI`, `XHTTP_PATH`, `PANEL_IP`, `NODE_API_PORT`, `SECRET_KEY`, `NODE_IMAGE`, `SELF_STEAL_TEMPLATE_URL`, `XCADDY_VERSION`, `CADDY_L4_VERSION`, а также пути `NODE_DIR`, `CERT_DIR`, `ENV_STORE`.
+Переменные: `BASE_DOMAIN`, `PREFIX`, `SELF_STEAL_HOST`, `XHTTP_SNI`, `XHTTP_PATH`, `PANEL_IP`, `NODE_API_PORT`, `SECRET_KEY`, `NODE_IMAGE`, `SELF_STEAL_TEMPLATE_URL`, `XCADDY_VERSION`, `CADDY_L4_VERSION`, `NODE_DIR`, `CERT_DIR`, `ENV_STORE`.
 
-Шаблон страницы лежит отдельно в `self-steal-site.html`. Его можно заменить своим файлом, указав публичный HTTPS-адрес в `SELF_STEAL_TEMPLATE_URL`. При ошибке скачивания установщик создаст минимальную локальную страницу входа и не оставит повреждённый файл.
-
----
+Свой фасад можно передать через публичный HTTPS URL в `SELF_STEAL_TEMPLATE_URL`. При ошибке установщик создаст минимальную локальную страницу.
 
 ## Проверка после установки
 
 ```bash
-docker logs remnanode --tail 120                              # логи ноды
-docker exec -it remnanode tail -f /var/log/xray/current       # логи Xray
-systemctl status caddy --no-pager                             # статус Caddy
-ss -lntup | grep -E ':443|:9443|:10443|:10444|:10445'         # слушатели
-ufw status numbered                                           # правила firewall
+docker ps --filter name=remnanode
+docker logs remnanode --tail 120
+docker exec -it remnanode tail -f /var/log/xray/current
+systemctl status caddy --no-pager
+ss -lntup | grep -E ':443|:9443|:10443|:10444|:10445'
+ufw status numbered
 ```
 
-Проверка SNI-роутинга вручную:
+Проверка self-steal:
 
 ```bash
-echo | openssl s_client -connect 127.0.0.1:9443 -servername <prefix>1.<domain> -verify_return_error -brief
+echo | openssl s_client \
+  -connect 127.0.0.1:9443 \
+  -servername usa1.example.com \
+  -verify_return_error -brief
 ```
 
----
+Откройте `https://usa1.example.com/` в браузере. Должен появиться фасад файлообменника с валидным сертификатом.
+
+Ожидаемый итог:
+
+- нода `Online`;
+- `443/tcp` слушает Caddy, `443/udp` — Xray/Hysteria2;
+- `10443–10445` слушаются только на `127.0.0.1`;
+- XRAY_JSON содержит `proxy`, `proxy-2`, `proxy-3`, `proxy-4`;
+- клиент подключается, балансировщик видит четыре outbound'а.
 
 ## Диагностика
 
-| Симптом | Причина / решение |
-|---------|-------------------|
-| Сертификаты не выпускаются | A-записи `<prefix>1/2/3` не указывают на ноду, либо `80/tcp` занят. Проверьте `dig`, освободите порт 80. |
-| `UDP/443 не слушается` | В панели у Hysteria2-инбаунда нет привязанных юзеров, либо инбаунд не на `443/udp`. |
-| Caddy не поднимается | `journalctl -u caddy -n 50` — обычно опечатка в SNI или конфликт порта 443 с host-процессом. |
-| Нода `offline` в панели | API-порт закрыт для IP панели, неверный `SECRET_KEY`, либо `PANEL_IP` в ufw не совпадает. |
-| BBR не активировался | Старое ядро или OpenVZ. Нужно ядро ≥ 4.9 и `modprobe tcp_bbr`. |
+| Симптом | Что проверить |
+|---|---|
+| Сертификат не выпускается | A-запись, `80/tcp`, другой процесс на порту 80 |
+| Нода `Offline` | Node Port, `SECRET_KEY`, IP панели в UFW, `docker logs remnanode` |
+| Клиент идёт на `1044x` | В Host заменить внутренний порт на публичный `443` |
+| Нет виртуального хоста | Видимость ON, Hide host OFF, inbound в Internal Squad |
+| Только один outbound | Рабочие хосты должны быть Hide host ON и иметь тег из `selector.pattern` |
+| XHTTP не работает | Одинаковые `path` и SNI в Profile, Host и установщике |
+| Trojan не стартует | Пути `/etc/remna-certs/<домен>/...` в Config Profile |
+| UDP/443 не слушается | Hysteria2 inbound активен; порт не занят другим сервисом |
+| Caddy не запускается | `journalctl -u caddy -n 100`; конфликт `443/tcp` или неверный SNI |
+| BBR не активен | поддержка BBR ядром или необходимость перезагрузки |
 
-Полный лог каждой сессии: `/var/log/remnanode-setup-<дата>.log`.
+Лог установки: `/var/log/remnanode-setup-<дата>.log`.
 
----
+## Повторный запуск и безопасность
 
-## Безопасность
-
-- `.env` с `SECRET_KEY` создаётся с правами `0600`.
-- Приватные ключи сертификатов — `0600`, в контейнер монтируются **read-only**.
-- Ключ self-steal имеет `0640 root:caddy`, чтобы Caddy мог читать его; наружу порт `9443` не открывается.
-- API-порт ноды доступен только с IP панели (правило ufw `allow from <PANEL_IP>`).
-- Повторный запуск не сбрасывает ufw, не перезапускает Docker без изменения его конфигурации и не пересоздаёт контейнер ноды без необходимости.
-- `--reset-firewall` следует применять только на чистом сервере: он удаляет все существующие правила ufw.
-
----
+- `.env` с секретом создаётся с правами `0600`.
+- Ключи сертификатов монтируются в Node read-only.
+- Node Port разрешается в UFW только с IP панели.
+- Повторный запуск не сбрасывает UFW и не перезапускает Docker без необходимости.
+- Compose не пересоздаёт контейнер принудительно.
+- `--reset-firewall` применяйте только на чистом сервере: он удаляет существующие правила.
+- Для обновления Node измените `NODE_IMAGE` и повторите запуск. Перед сменой версии проверьте [официальные релизы](https://github.com/remnawave/panel/releases).
