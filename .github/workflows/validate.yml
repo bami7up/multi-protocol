@@ -1,0 +1,41 @@
+name: Validate templates and installer
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install validators
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck jq
+
+      - name: Validate installer
+        run: |
+          bash -n remnanode-setup.sh
+          shellcheck -x remnanode-setup.sh
+
+      - name: Validate JSON5 templates
+        run: |
+          npx --yes json5@2.2.3 -s 2 Multiselect.json > /tmp/multiselect.json
+          tail -n +2 Xray_template.json | npx --yes json5@2.2.3 -s 2 > /tmp/xray-template.json
+          jq -e . /tmp/multiselect.json /tmp/xray-template.json >/dev/null
+
+      - name: Validate facade JavaScript
+        run: |
+          sed -n '/<script>/,/<\/script>/p' self-steal-site.html | sed '1d;$d' > /tmp/self-steal-site.js
+          node --check /tmp/self-steal-site.js
+
+      - name: Check whitespace
+        run: "! git grep -nI -E '[[:blank:]]+$' -- '*.sh' '*.json' '*.md' '*.html' '*.yml'"
