@@ -40,6 +40,7 @@ Caddy L4 принимает `443/tcp` и распределяет соедине
 |---|---|---|
 | `Multiselect.json` | **Config Profiles → Create Config Profile** | Серверная конфигурация Xray с четырьмя inbound'ами |
 | `Xray_template.json` | **Templates → XRAY_JSON** | Клиентская подписка с балансировщиком и инжектом хостов |
+| `Xray_template_split.json` | **Templates → XRAY_JSON** | Опциональный split-routing: выбранные домены через VPN, остальное напрямую |
 | `remnanode-setup.sh` | Запуск от `root` на ноде | Docker, Caddy L4, сертификаты, UFW и Node |
 | `self-steal-site.html` | В панель не загружается | Локальный сайт для self-steal |
 
@@ -180,6 +181,23 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/
 ### 8. Добавьте inbound'ы в Internal Squad
 
 Откройте **Internal Squads** и включите все inbound'ы, к которым привязаны пять хостов. Иначе виртуальный хост не попадёт в подписку.
+
+## Опциональный split-routing
+
+`Xray_template.json` — безопасный full-tunnel: весь пользовательский трафик, кроме заблокированного BitTorrent, идёт через VPN.
+
+`Xray_template_split.json` — режим выборочной маршрутизации:
+
+- домены из актуального на момент генерации списка [itdoginfo/allow-domains — Russia inside](https://github.com/itdoginfo/allow-domains/blob/main/Russia/inside-raw.lst) идут через балансировщик `USA`;
+- запросы к Cloudflare DNS `1.1.1.1` и `1.0.0.1` также идут через VPN;
+- реклама из `geosite:category-ads-all` блокируется;
+- UDP/443 блокируется, чтобы приложения откатывались с QUIC на маршрутизируемый TCP;
+- весь трафик, не совпавший со списком, идёт через `direct`;
+- BitTorrent блокируется: выводить его через `direct`, как в исходном примере, небезопасно — клиент раскрывает реальный IP.
+
+Для split-routing создайте второй шаблон типа **XRAY_JSON** и вставьте в него `Xray_template_split.json`. Затем назначьте его нужному виртуальному хосту или отдельной группе пользователей.
+
+> Split-routing не является режимом полной приватности. Любой отсутствующий или новый домен пойдёт напрямую до следующего обновления списка. Для обычной VPN-подписки оставляйте `Xray_template.json`.
 
 ## Неинтерактивный запуск
 
