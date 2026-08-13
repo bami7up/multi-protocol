@@ -48,12 +48,16 @@ jobs:
             (.remnawave.injectHosts[0].selector.type == "tagRegex") and
             (.remnawave.injectHosts[0].selectFrom == "HIDDEN") and
             (.remnawave.injectHosts[0].tagPrefix == "proxy") and
+            (.dns.servers == ["94.140.14.14", "94.140.15.15"]) and
             (.routing.balancers[0].selector == ["proxy"]) and
             (.burstObservatory.subjectSelector == ["proxy"])
           ' /tmp/xray-template.json >/dev/null
           jq -e '
             (.remnawave.injectHosts[0].selector.pattern == "^USA$") and
+            (.dns.servers == ["94.140.14.14", "94.140.15.15"]) and
+            ([.. | strings] | any(. == "geosite:category-ads-all") | not) and
             (.routing.rules | map(select(.ruleTag == "BITTORRENT_BLOCK" and .protocol == ["bittorrent"] and .outboundTag == "block")) | length == 1) and
+            (.routing.rules | map(select(.ruleTag == "ADGUARD_DNS_PROXY" and .ip == ["94.140.14.14", "94.140.15.15"] and .port == "53" and .balancerTag == "USA")) | length == 1) and
             (.routing.rules | map(select(.ruleTag == "SERVICE_IP_PROXY" and (.ip | length > 100) and .balancerTag == "USA")) | length == 1) and
             (.routing.rules | map(select(.ruleTag == "RU_SPLIT_PROXY" and (.domain | length > 1200) and .balancerTag == "USA")) | length == 1) and
             (.routing.rules[-1].ruleTag == "DEFAULT_DIRECT") and
