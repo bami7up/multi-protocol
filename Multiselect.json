@@ -1,4 +1,4 @@
-// Это самый бомжатский конфиг, на котором все минимально работает. При необходимости можете сами все доделать как захотите. 
+// Это самый бомжатский конфиг, на котором все минимально работает. При необходимости можете сами все доделать как захотите.
 // #TODO я бы рекомендовал реализовать касмтомный кфг для подключения многих нод к одним инбаундам
 
 {
@@ -40,13 +40,13 @@
         "realitySettings": {
           "show": false,
           "xver": 0,
-          "target": "www.google.com:443",
+          "target": "127.0.0.1:9443", // Self-steal: локальный TLS-сайт Caddy, созданный установщиком
           "shortIds": [
             ""
           ],
           "privateKey": "",
           "serverNames": [
-            "www.google.com"
+            "<prefix>1.<domain>" // Тот же домен, что SELF_STEAL_HOST
           ]
         }
       }
@@ -119,11 +119,11 @@
             "h2",
             "http/1.1"
           ],
-          "serverName": "2<domain>",
+          "serverName": "<prefix>2.<domain>",
           "certificates": [
             {
-              "keyFile": "/etc/remna-certs/<2domain>/key.pem",
-              "certificateFile": "/etc/remna-certs/<2domain>/fullchain.pem"
+              "keyFile": "/etc/remna-certs/<prefix>2.<domain>/key.pem",
+              "certificateFile": "/etc/remna-certs/<prefix>2.<domain>/fullchain.pem"
             }
           ]
         }
@@ -151,11 +151,11 @@
           "alpn": [
             "h3"
           ],
-          "serverName": "3<domain>",
+          "serverName": "<prefix>3.<domain>",
           "certificates": [
             {
-              "keyFile": "/etc/remna-certs/3<domain>/key.pem",
-              "certificateFile": "/etc/remna-certs/3<domain>/fullchain.pem"
+              "keyFile": "/etc/remna-certs/<prefix>3.<domain>/key.pem",
+              "certificateFile": "/etc/remna-certs/<prefix>3.<domain>/fullchain.pem"
             }
           ]
         },
