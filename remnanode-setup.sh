@@ -11,7 +11,7 @@ SSH_PORT_OVERRIDE=""
 NODE_DIR="${NODE_DIR:-/opt/remnanode}"
 CERT_DIR="${CERT_DIR:-/etc/remna-certs}"
 ENV_STORE="${ENV_STORE:-/root/remnanode.env}"
-NODE_IMAGE="${NODE_IMAGE:-remnawave/node:latest}"
+NODE_IMAGE="${NODE_IMAGE:-remnawave/node:3.1.1}"
 SELF_STEAL_TEMPLATE_URL="${SELF_STEAL_TEMPLATE_URL:-https://raw.githubusercontent.com/bami7up/multi-protocol/main/self-steal-site.html}"
 XCADDY_VERSION="${XCADDY_VERSION:-v0.4.5}"
 CADDY_L4_VERSION="${CADDY_L4_VERSION:-v0.1.2}"
@@ -32,7 +32,7 @@ remnanode-setup.sh — установка ноды Remnawave (VLESS + Trojan + H
   --reset-firewall      сбросить существующие правила ufw перед настройкой
   --force-dns           не прерываться при несовпадении DNS
   --ssh-port N          явно указать SSH-порт для правила ufw
-  --node-image REF      образ ноды (по умолчанию remnawave/node:latest)
+  --node-image REF      образ ноды (по умолчанию remnawave/node:3.1.1)
   -y | --yes            авто-подтверждение всех «y/n» вопросов
   --non-interactive     не задавать вопросы: все значения из env/дефолтов
   -h | --help           показать эту справку
@@ -727,7 +727,7 @@ services:
   remnanode:
     container_name: remnanode
     hostname: remnanode
-    image: ${NODE_IMAGE:-remnawave/node:latest}
+    image: ${NODE_IMAGE:-remnawave/node:3.1.1}
     network_mode: host
     restart: always
     cap_add:
