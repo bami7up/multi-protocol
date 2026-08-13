@@ -29,8 +29,27 @@ jobs:
       - name: Validate JSON5 templates
         run: |
           npx --yes json5@2.2.3 -s 2 Multiselect.json > /tmp/multiselect.json
-          tail -n +2 Xray_template.json | npx --yes json5@2.2.3 -s 2 > /tmp/xray-template.json
+          npx --yes json5@2.2.3 -s 2 Xray_template.json > /tmp/xray-template.json
           jq -e . /tmp/multiselect.json /tmp/xray-template.json >/dev/null
+          jq -e '
+            [.inbounds[].tag] == ["REALITY_VISION", "REALITY_XHTTP", "TROJAN", "HYSTERIA2"] and
+            (.inbounds[0].listen == "127.0.0.1") and
+            (.inbounds[0].port == 10443) and
+            (.inbounds[0].streamSettings.realitySettings.target == "127.0.0.1:9443") and
+            (.inbounds[1].listen == "127.0.0.1") and
+            (.inbounds[1].port == 10444) and
+            (.inbounds[2].listen == "127.0.0.1") and
+            (.inbounds[2].port == 10445) and
+            (.inbounds[3].listen == "0.0.0.0") and
+            (.inbounds[3].port == 443)
+          ' /tmp/multiselect.json >/dev/null
+          jq -e '
+            (.remnawave.injectHosts[0].selector.type == "tagRegex") and
+            (.remnawave.injectHosts[0].selectFrom == "HIDDEN") and
+            (.remnawave.injectHosts[0].tagPrefix == "proxy") and
+            (.routing.balancers[0].selector == ["proxy"]) and
+            (.burstObservatory.subjectSelector == ["proxy"])
+          ' /tmp/xray-template.json >/dev/null
 
       - name: Validate facade JavaScript
         run: |
