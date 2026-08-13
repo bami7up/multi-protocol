@@ -30,7 +30,8 @@ jobs:
         run: |
           npx --yes json5@2.2.3 -s 2 Multiselect.json > /tmp/multiselect.json
           npx --yes json5@2.2.3 -s 2 Xray_template.json > /tmp/xray-template.json
-          jq -e . /tmp/multiselect.json /tmp/xray-template.json >/dev/null
+          npx --yes json5@2.2.3 -s 2 Xray_template_split.json > /tmp/xray-template-split.json
+          jq -e . /tmp/multiselect.json /tmp/xray-template.json /tmp/xray-template-split.json >/dev/null
           jq -e '
             [.inbounds[].tag] == ["REALITY_VISION", "REALITY_XHTTP", "TROJAN", "HYSTERIA2"] and
             (.inbounds[0].listen == "127.0.0.1") and
@@ -50,6 +51,14 @@ jobs:
             (.routing.balancers[0].selector == ["proxy"]) and
             (.burstObservatory.subjectSelector == ["proxy"])
           ' /tmp/xray-template.json >/dev/null
+          jq -e '
+            (.remnawave.injectHosts[0].selector.pattern == "^USA$") and
+            (.routing.rules | map(select(.ruleTag == "BITTORRENT_BLOCK" and .protocol == ["bittorrent"] and .outboundTag == "block")) | length == 1) and
+            (.routing.rules | map(select(.ruleTag == "RU_SPLIT_PROXY" and (.domain | length > 1000) and .balancerTag == "USA")) | length == 1) and
+            (.routing.rules[-1].ruleTag == "DEFAULT_DIRECT") and
+            (.routing.rules[-1].network == "tcp,udp") and
+            (.routing.rules[-1].outboundTag == "direct")
+          ' /tmp/xray-template-split.json >/dev/null
 
       - name: Validate facade JavaScript
         run: |
