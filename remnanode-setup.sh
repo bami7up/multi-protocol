@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 BUILD_COMPOSE=1
 MANAGE_FIREWALL=1
-RESET_FIREWALL=1
+RESET_FIREWALL=0
 FORCE_DNS=0
 ASSUME_YES="${ASSUME_YES:-0}"
 NONINTERACTIVE="${NONINTERACTIVE:-0}"
@@ -12,6 +12,10 @@ NODE_DIR="${NODE_DIR:-/opt/remnanode}"
 CERT_DIR="${CERT_DIR:-/etc/remna-certs}"
 ENV_STORE="${ENV_STORE:-/root/remnanode.env}"
 NODE_IMAGE="${NODE_IMAGE:-remnawave/node:latest}"
+SELF_STEAL_TEMPLATE_URL="${SELF_STEAL_TEMPLATE_URL:-https://raw.githubusercontent.com/bami7up/multi-protocol/main/self-steal-site.html}"
+XCADDY_VERSION="${XCADDY_VERSION:-v0.4.5}"
+CADDY_L4_VERSION="${CADDY_L4_VERSION:-v0.1.2}"
+CADDY_STOPPED_FOR_ACME=0
 LOG_DIR="/var/log"
 LOG_FILE="${LOG_DIR}/remnanode-setup-$(date +%F-%H%M%S).log"
 
@@ -25,7 +29,7 @@ remnanode-setup.sh — установка ноды Remnawave (VLESS + Trojan + H
 Флаги:
   --no-compose          не трогать docker-compose.yml (только .env + up -d)
   --no-firewall         не настраивать ufw
-  --no-reset-firewall   не делать 'ufw reset' (сохранить существующие правила)
+  --reset-firewall      сбросить существующие правила ufw перед настройкой
   --force-dns           не прерываться при несовпадении DNS
   --ssh-port N          явно указать SSH-порт для правила ufw
   --node-image REF      образ ноды (по умолчанию remnawave/node:latest)
@@ -34,8 +38,9 @@ remnanode-setup.sh — установка ноды Remnawave (VLESS + Trojan + H
   -h | --help           показать эту справку
 
 Переменные окружения (для --non-interactive / CI):
-  BASE_DOMAIN, PREFIX, VISION_SNI, XHTTP_SNI, XHTTP_PATH,
-  PANEL_IP, NODE_API_PORT, SECRET_KEY, NODE_IMAGE
+  BASE_DOMAIN, PREFIX, SELF_STEAL_HOST, XHTTP_SNI, XHTTP_PATH,
+  PANEL_IP, NODE_API_PORT, SECRET_KEY, NODE_IMAGE, SELF_STEAL_TEMPLATE_URL,
+  XCADDY_VERSION, CADDY_L4_VERSION
 USAGE
 }
 
@@ -43,7 +48,8 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --no-compose)  BUILD_COMPOSE=0 ;;
     --no-firewall) MANAGE_FIREWALL=0 ;;
-    --no-reset-firewall) RESET_FIREWALL=0 ;;
+    --reset-firewall) RESET_FIREWALL=1 ;;
+    --no-reset-firewall) RESET_FIREWALL=0 ;; # совместимость со старыми командами
     --force-dns)   FORCE_DNS=1 ;;
     -y|--yes)      ASSUME_YES=1 ;;
     --non-interactive) NONINTERACTIVE=1; ASSUME_YES=1 ;;
@@ -124,6 +130,34 @@ retry() {
 have() { command -v "$1" >/dev/null 2>&1; }
 require_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Запускать нужно от root (sudo -i)."; }
 
+is_ipv4() {
+  local ip="$1" a b c d extra octet
+  IFS=. read -r a b c d extra <<<"$ip"
+  [[ -z "$extra" && -n "$a" && -n "$b" && -n "$c" && -n "$d" ]] || return 1
+  for octet in "$a" "$b" "$c" "$d"; do
+    [[ "$octet" =~ ^[0-9]{1,3}$ ]] || return 1
+    (( 10#$octet <= 255 )) || return 1
+  done
+}
+
+is_fqdn() {
+  local name="${1%.}" label
+  local -a labels
+  [[ ${#name} -le 253 && "$name" == *.* ]] || return 1
+  IFS=. read -r -a labels <<<"$name"
+  (( ${#labels[@]} >= 2 )) || return 1
+  for label in "${labels[@]}"; do
+    [[ ${#label} -ge 1 && ${#label} -le 63 ]] || return 1
+    [[ "$label" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]] || return 1
+  done
+  [[ "${labels[-1]}" =~ ^[a-zA-Z]{2,63}$ ]]
+}
+
+is_safe_xhttp_path() {
+  local pattern='^/[a-zA-Z0-9._~!()*+,;=:@%/-]*$'
+  [[ ${#1} -le 2048 && "$1" =~ $pattern ]]
+}
+
 apt_wait() {
   local -i waited=0
   while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
@@ -194,6 +228,9 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 on_err() {
   local ec=$? line=$1 cmd=$2
+  if [[ "${CADDY_STOPPED_FOR_ACME:-0}" -eq 1 ]]; then
+    systemctl start caddy >/dev/null 2>&1 || true
+  fi
   printf '\n %s✖ НЕПРЕДВИДЕННЫЙ СБОЙ%s код=%s строка=%s\n   %s%s%s\n' \
     "$C_RED$C_B" "$C_RST" "$ec" "$line" "$C_DIM$C_GRY" "$cmd" "$C_RST" >&2
   printf '   Полный лог: %s\n' "$LOG_FILE" >&2
@@ -258,6 +295,8 @@ step 1 "Переменные окружения"
 
 if [[ -f "$ENV_STORE" ]]; then
   if confirm "Найден $ENV_STORE. Загрузить сохранённые переменные?" "y"; then
+    # ENV_STORE — намеренно настраиваемый путь.
+    # shellcheck disable=SC1090
     source "$ENV_STORE" || warn "Не удалось прочитать $ENV_STORE — продолжаю без него."
     ok "Переменные загружены из $ENV_STORE"
   fi
@@ -268,7 +307,7 @@ if have curl; then
   SERVER_IP="$(curl -4 -sS --max-time 10 https://ifconfig.me 2>/dev/null || true)"
   [[ -n "$SERVER_IP" ]] || SERVER_IP="$(curl -4 -sS --max-time 10 https://api.ipify.org 2>/dev/null || true)"
 fi
-if [[ "$SERVER_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+if is_ipv4 "$SERVER_IP"; then
   ok "Публичный IPv4: $SERVER_IP"
 else
   SERVER_IP=""
@@ -285,36 +324,53 @@ ok "Домены: $VLESS_HOST / $TROJAN_HOST / $HY_HOST"
 ACME_EMAIL="admin@${BASE_DOMAIN}"
 ok "Email для Let's Encrypt: $ACME_EMAIL"
 
-ask VISION_SNI "Маскировочный SNI для Vision/Reality" "${VISION_SNI:-www.google.com}"
+ask SELF_STEAL_HOST "Домен self-steal для Vision/Reality" "${SELF_STEAL_HOST:-$VLESS_HOST}"
+# Обратная совместимость с шаблонами/старыми env: для Vision SNI всегда равен
+# домену локального TLS-сайта. Иначе это снова будет обычный внешний REALITY target.
+VISION_SNI="$SELF_STEAL_HOST"
 ask XHTTP_SNI  "Маскировочный SNI для XHTTP"          "${XHTTP_SNI:-www.gstatic.com}"
 ask XHTTP_PATH "Путь XHTTP"                           "${XHTTP_PATH:-/api/v3/sync/r1}"
 ask PANEL_IP   "IP панели Remnawave"                  "${PANEL_IP:-}"
 ask NODE_API_PORT "Порт ноды для связи с панелью"     "${NODE_API_PORT:-2222}"
 
-[[ "$BASE_DOMAIN" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]] || die "Некорректный домен: $BASE_DOMAIN"
-[[ "$PREFIX" =~ ^[a-zA-Z0-9-]+$ ]]                      || die "Некорректный префикс: $PREFIX"
-[[ "$PANEL_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]     || die "Некорректный IP панели: $PANEL_IP"
+is_fqdn "$BASE_DOMAIN"       || die "Некорректный домен: $BASE_DOMAIN"
+[[ "$PREFIX" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ && ${#PREFIX} -le 50 ]] \
+  || die "Некорректный префикс: $PREFIX"
+is_fqdn "$SELF_STEAL_HOST"   || die "Некорректный self-steal домен: $SELF_STEAL_HOST"
+is_fqdn "$XHTTP_SNI"         || die "Некорректный XHTTP SNI: $XHTTP_SNI"
+is_safe_xhttp_path "$XHTTP_PATH" || die "Некорректный XHTTP path: $XHTTP_PATH"
+is_ipv4 "$PANEL_IP"          || die "Некорректный IP панели: $PANEL_IP"
 { [[ "$NODE_API_PORT" =~ ^[0-9]+$ ]] && (( NODE_API_PORT >= 1 && NODE_API_PORT <= 65535 )); } \
   || die "Некорректный порт ноды: $NODE_API_PORT"
+[[ "$SELF_STEAL_HOST" != "$TROJAN_HOST" && "$SELF_STEAL_HOST" != "$HY_HOST" ]] \
+  || die "SELF_STEAL_HOST должен отличаться от доменов Trojan/Hysteria2."
+[[ "$XHTTP_SNI" != "$SELF_STEAL_HOST" && "$XHTTP_SNI" != "$TROJAN_HOST" ]] \
+  || die "XHTTP_SNI конфликтует с SNI другого маршрута Caddy."
+[[ "$SELF_STEAL_TEMPLATE_URL" == https://* ]] \
+  || die "SELF_STEAL_TEMPLATE_URL должен начинаться с https://"
+[[ "$NODE_IMAGE" =~ ^[a-zA-Z0-9][a-zA-Z0-9._/:@-]+$ ]] || die "Некорректная ссылка на образ: $NODE_IMAGE"
+[[ "$XCADDY_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Некорректная версия xcaddy: $XCADDY_VERSION"
+[[ "$CADDY_L4_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Некорректная версия caddy-l4: $CADDY_L4_VERSION"
 
 export SERVER_IP BASE_DOMAIN PREFIX VLESS_HOST TROJAN_HOST HY_HOST ACME_EMAIL \
-       VISION_SNI XHTTP_SNI XHTTP_PATH PANEL_IP NODE_API_PORT
+       SELF_STEAL_HOST VISION_SNI XHTTP_SNI XHTTP_PATH PANEL_IP NODE_API_PORT
 
 ( umask 077
-  cat > "$ENV_STORE" <<EOF
-export SERVER_IP="$SERVER_IP"
-export BASE_DOMAIN="$BASE_DOMAIN"
-export PREFIX="$PREFIX"
-export VLESS_HOST="$VLESS_HOST"
-export TROJAN_HOST="$TROJAN_HOST"
-export HY_HOST="$HY_HOST"
-export ACME_EMAIL="$ACME_EMAIL"
-export VISION_SNI="$VISION_SNI"
-export XHTTP_SNI="$XHTTP_SNI"
-export XHTTP_PATH="$XHTTP_PATH"
-export PANEL_IP="$PANEL_IP"
-export NODE_API_PORT="$NODE_API_PORT"
-EOF
+  {
+    printf 'export SERVER_IP=%q\n' "$SERVER_IP"
+    printf 'export BASE_DOMAIN=%q\n' "$BASE_DOMAIN"
+    printf 'export PREFIX=%q\n' "$PREFIX"
+    printf 'export VLESS_HOST=%q\n' "$VLESS_HOST"
+    printf 'export TROJAN_HOST=%q\n' "$TROJAN_HOST"
+    printf 'export HY_HOST=%q\n' "$HY_HOST"
+    printf 'export ACME_EMAIL=%q\n' "$ACME_EMAIL"
+    printf 'export SELF_STEAL_HOST=%q\n' "$SELF_STEAL_HOST"
+    printf 'export VISION_SNI=%q\n' "$VISION_SNI"
+    printf 'export XHTTP_SNI=%q\n' "$XHTTP_SNI"
+    printf 'export XHTTP_PATH=%q\n' "$XHTTP_PATH"
+    printf 'export PANEL_IP=%q\n' "$PANEL_IP"
+    printf 'export NODE_API_PORT=%q\n' "$NODE_API_PORT"
+  } > "$ENV_STORE"
 )
 grep -q "source $ENV_STORE" /root/.bashrc 2>/dev/null \
   || echo "[ -f $ENV_STORE ] && source $ENV_STORE" >> /root/.bashrc
@@ -326,7 +382,7 @@ kv "SERVER_IP"     "$SERVER_IP"
 kv "VLESS"         "$VLESS_HOST"
 kv "TROJAN"        "$TROJAN_HOST"
 kv "HYSTERIA2"     "$HY_HOST"
-kv "VISION_SNI"    "$VISION_SNI"
+kv "SELF_STEAL"    "$SELF_STEAL_HOST -> 127.0.0.1:9443"
 kv "XHTTP_SNI"     "$XHTTP_SNI"
 kv "PANEL_IP"      "$PANEL_IP"
 kv "NODE_API_PORT" "$NODE_API_PORT"
@@ -336,7 +392,7 @@ confirm "Всё верно, продолжаем?" "y" || die "Отменено 
 
 step 2 "Проверка DNS и SNI"
 DNS_OK=1
-for d in "$VLESS_HOST" "$TROJAN_HOST" "$HY_HOST"; do
+for d in "$VLESS_HOST" "$TROJAN_HOST" "$HY_HOST" "$SELF_STEAL_HOST"; do
   resolved="$(dig +short "$d" A 2>/dev/null | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/{print; exit}' || true)"
   if [[ -z "$SERVER_IP" ]]; then
     note "$d -> ${resolved:-<нет A-записи>}"
@@ -350,11 +406,13 @@ if [[ "$DNS_OK" -eq 0 && "$FORCE_DNS" -eq 0 ]]; then
   confirm "DNS не совпадает — сертификаты могут не выпуститься. Продолжить?" "n" \
     || die "Прервано из-за DNS. Поправьте A-записи или запустите с --force-dns."
 fi
-for d in "$VISION_SNI" "$XHTTP_SNI"; do
-  proto="$(echo | timeout 8 openssl s_client -connect "$d:443" -servername "$d" -alpn h2 -tls1_3 -brief 2>&1 \
-           | grep -Ei 'Protocol|ALPN' | tr '\n' ' ' || true)"
-  [[ -n "$proto" ]] && ok "SNI $d: $proto" || warn "SNI $d: не удалось проверить TLS1.3/h2"
-done
+proto="$(echo | timeout 8 openssl s_client -connect "$XHTTP_SNI:443" -servername "$XHTTP_SNI" -alpn h2 -tls1_3 -brief 2>&1 \
+         | grep -Ei 'Protocol|ALPN' | tr '\n' ' ' || true)"
+if [[ -n "$proto" ]]; then
+  ok "SNI $XHTTP_SNI: $proto"
+else
+  warn "SNI $XHTTP_SNI: не удалось проверить TLS1.3/h2"
+fi
 
 step 3 "Базовые пакеты и Docker"
 retry 3 5 apt_get update -y || warn "apt-get update с ошибкой — продолжаю."
@@ -363,9 +421,11 @@ retry 3 5 apt_get install -y curl gnupg debian-keyring debian-archive-keyring ap
                    ufw psmisc \
   || die "Не удалось установить базовые пакеты."
 
+DOCKER_RESTART_REQUIRED=0
 if ! have docker; then
   retry 3 10 bash -c 'curl -fsSL https://get.docker.com | sh' \
     || die "Не удалось установить Docker через get.docker.com."
+  DOCKER_RESTART_REQUIRED=1
 else
   ok "Docker уже установлен"
 fi
@@ -379,12 +439,18 @@ if [[ ! -f /etc/docker/daemon.json ]]; then
   "live-restore": true
 }
 EOF
+  DOCKER_RESTART_REQUIRED=1
   ok "Настроена ротация логов Docker (/etc/docker/daemon.json)"
 else
   warn "/etc/docker/daemon.json уже есть — не перезаписываю (проверьте log-opts вручную)."
 fi
 systemctl enable --now docker || die "Не удалось запустить docker.service."
-systemctl restart docker      || die "Не удалось перезапустить docker.service."
+if [[ "$DOCKER_RESTART_REQUIRED" -eq 1 ]]; then
+  systemctl restart docker || die "Не удалось применить настройки docker.service."
+  ok "Docker перезапущен для применения новой конфигурации"
+else
+  note "Конфигурация Docker не менялась — restart не требуется."
+fi
 docker --version || true
 docker compose version >/dev/null 2>&1 || die "docker compose plugin недоступен."
 ok "Docker готов"
@@ -399,10 +465,10 @@ if [[ "$MANAGE_FIREWALL" -eq 1 ]]; then
   ok "SSH-порт для ufw: $SSH_PORT (переопределить: --ssh-port N)"
 
   if [[ "$RESET_FIREWALL" -eq 1 ]]; then
-    warn "ufw reset: текущие правила будут стёрты (--no-reset-firewall чтобы сохранить)."
+    warn "--reset-firewall: текущие правила ufw будут стёрты."
     ufw --force reset        >/dev/null || die "ufw reset не удался."
   else
-    note "ufw reset пропущен — правила добавляются поверх существующих."
+    note "Существующие правила ufw сохранены; нужные правила добавляются поверх."
   fi
   ufw default deny incoming  >/dev/null
   ufw default allow outgoing >/dev/null
@@ -436,10 +502,10 @@ if ! caddy list-modules 2>/dev/null | grep -qE 'layer4'; then
   retry 3 5 apt_get install -y caddy golang-go build-essential libcap2-bin \
     || die "Не удалось установить caddy/golang/build-essential."
 
-  retry 3 10 env GOBIN=/usr/local/bin go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest \
+  retry 3 10 env GOBIN=/usr/local/bin go install "github.com/caddyserver/xcaddy/cmd/xcaddy@$XCADDY_VERSION" \
     || die "Не удалось установить xcaddy."
   mkdir -p /root/build-caddy-l4
-  ( cd /root/build-caddy-l4 && retry 2 10 xcaddy build --with github.com/mholt/caddy-l4 --output ./caddy ) \
+  ( cd /root/build-caddy-l4 && retry 2 10 xcaddy build --with "github.com/mholt/caddy-l4@$CADDY_L4_VERSION" --output ./caddy ) \
     || die "xcaddy build не удался."
   /root/build-caddy-l4/caddy list-modules 2>/dev/null | grep -qE 'layer4' \
     || die "В собранном бинаре нет модулей layer4."
@@ -457,42 +523,7 @@ else
 fi
 caddy version || true
 
-step 6 "Caddyfile — L4-роутинг по SNI"
-cp -a /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.backup-$(date +%F-%H%M%S)" 2>/dev/null || true
-cat > /etc/caddy/Caddyfile <<EOF
-{
-  layer4 {
-    :443 {
-      @vision tls sni $VISION_SNI
-      route @vision {
-        proxy 127.0.0.1:10443
-      }
-      @xhttp tls sni $XHTTP_SNI
-      route @xhttp {
-        proxy 127.0.0.1:10444
-      }
-      @trojan tls sni $TROJAN_HOST
-      route @trojan {
-        proxy 127.0.0.1:10445
-      }
-      route {
-        proxy $VISION_SNI:443
-      }
-    }
-  }
-}
-EOF
-caddy fmt --overwrite /etc/caddy/Caddyfile || warn "caddy fmt не удался — продолжаю."
-caddy validate --config /etc/caddy/Caddyfile || die "Caddyfile невалиден — исправьте SNI/синтаксис."
-systemctl restart caddy || die "Не удалось перезапустить Caddy."
-sleep 1
-if systemctl is-active --quiet caddy; then
-  ok "Caddy запущен (restart)"
-else
-  die "Caddy не поднялся. journalctl -u caddy -n 50"
-fi
-
-step 7 "Сертификаты acme.sh (Trojan + Hysteria2)"
+step 6 "Сертификаты acme.sh (self-steal + Trojan + Hysteria2)"
 if ss -lntup 2>/dev/null | grep -q ':80 '; then
   warn "Порт 80 занят — acme.sh standalone может не выпустить сертификаты:"
   ss -lntup 2>/dev/null | grep ':80 ' | sed 's/^/   /' || true
@@ -511,30 +542,122 @@ issue_cert() {
   if "$ACME" --list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$d"; then
     ok "Сертификат для $d уже выпущен — пропускаю issue"
   else
-    "$ACME" --issue --standalone -d "$d" --keylength ec-256 \
-      || warn "Не удалось выпустить сертификат для $d (проверьте DNS/порт 80)."
+    if systemctl is-active --quiet caddy; then
+      systemctl stop caddy || die "Не удалось освободить порт 80 для ACME."
+      CADDY_STOPPED_FOR_ACME=1
+      note "Caddy временно остановлен для ACME standalone challenge."
+    fi
+    if ss -H -lnt 'sport = :80' 2>/dev/null | grep -q .; then
+      ss -H -lntp 'sport = :80' 2>/dev/null | sed 's/^/   /' || true
+      die "Порт 80 занят другим процессом — ACME standalone challenge невозможен."
+    fi
+    if ! "$ACME" --issue --standalone -d "$d" --keylength ec-256; then
+      warn "Не удалось выпустить сертификат для $d (проверьте DNS/порт 80)."
+      return 1
+    fi
   fi
 }
-issue_cert "$TROJAN_HOST"
-issue_cert "$HY_HOST"
+issue_cert "$SELF_STEAL_HOST" || die "Без сертификата $SELF_STEAL_HOST настоящий self-steal невозможен."
+issue_cert "$TROJAN_HOST" || die "Не удалось подготовить обязательный сертификат Trojan."
+issue_cert "$HY_HOST" || die "Не удалось подготовить обязательный сертификат Hysteria2."
 
-mkdir -p "$CERT_DIR/$TROJAN_HOST" "$CERT_DIR/$HY_HOST"
+mkdir -p "$CERT_DIR/$SELF_STEAL_HOST" "$CERT_DIR/$TROJAN_HOST" "$CERT_DIR/$HY_HOST"
+"$ACME" --install-cert -d "$SELF_STEAL_HOST" --ecc \
+  --key-file       "$CERT_DIR/$SELF_STEAL_HOST/key.pem" \
+  --fullchain-file "$CERT_DIR/$SELF_STEAL_HOST/fullchain.pem" \
+  --reloadcmd "systemctl reload caddy >/dev/null 2>&1 || true" \
+  || die "Не удалось установить сертификат self-steal для $SELF_STEAL_HOST."
 "$ACME" --install-cert -d "$TROJAN_HOST" --ecc \
   --key-file       "$CERT_DIR/$TROJAN_HOST/key.pem" \
   --fullchain-file "$CERT_DIR/$TROJAN_HOST/fullchain.pem" \
   --reloadcmd "docker restart remnanode >/dev/null 2>&1 || true" \
-  || warn "install-cert для $TROJAN_HOST не удался (сертификат мог не выпуститься)."
+  || die "install-cert для $TROJAN_HOST не удался."
 "$ACME" --install-cert -d "$HY_HOST" --ecc \
   --key-file       "$CERT_DIR/$HY_HOST/key.pem" \
   --fullchain-file "$CERT_DIR/$HY_HOST/fullchain.pem" \
   --reloadcmd "docker restart remnanode >/dev/null 2>&1 || true" \
-  || warn "install-cert для $HY_HOST не удался (сертификат мог не выпуститься)."
+  || die "install-cert для $HY_HOST не удался."
+
+for cert_file in \
+  "$CERT_DIR/$SELF_STEAL_HOST/key.pem" "$CERT_DIR/$SELF_STEAL_HOST/fullchain.pem" \
+  "$CERT_DIR/$TROJAN_HOST/key.pem" "$CERT_DIR/$TROJAN_HOST/fullchain.pem" \
+  "$CERT_DIR/$HY_HOST/key.pem" "$CERT_DIR/$HY_HOST/fullchain.pem"; do
+  [[ -s "$cert_file" ]] || die "Сертификат или ключ отсутствует/пуст: $cert_file"
+done
 
 chown -R root:root "$CERT_DIR"
 find "$CERT_DIR" -type d -exec chmod 755 {} \; || true
 find "$CERT_DIR" -type f -name 'key.pem'       -exec chmod 600 {} \; || true
 find "$CERT_DIR" -type f -name 'fullchain.pem' -exec chmod 644 {} \; || true
+chown root:caddy "$CERT_DIR/$SELF_STEAL_HOST/key.pem" "$CERT_DIR/$SELF_STEAL_HOST/fullchain.pem"
+chmod 640 "$CERT_DIR/$SELF_STEAL_HOST/key.pem"
 ok "Сертификаты установлены в $CERT_DIR (автопродление — таймер/cron acme.sh)"
+
+step 7 "Caddyfile — SNI-роутинг и локальный self-steal сайт"
+SELF_STEAL_ROOT=/var/www/remnanode-self-steal
+mkdir -p "$SELF_STEAL_ROOT"
+SELF_STEAL_TEMPLATE_TMP="$(mktemp)"
+if retry 3 3 curl -fsSL "$SELF_STEAL_TEMPLATE_URL" -o "$SELF_STEAL_TEMPLATE_TMP"; then
+  install -m 644 "$SELF_STEAL_TEMPLATE_TMP" "$SELF_STEAL_ROOT/index.html"
+  ok "Шаблон закрытого файлообменника установлен"
+else
+  warn "Не удалось скачать шаблон — устанавливаю минимальную локальную заглушку."
+  cat > "$SELF_STEAL_ROOT/index.html" <<EOF
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Secure workspace</title></head><body><main><h1>Secure file workspace</h1><form><label>Workspace ID <input autocomplete="off"></label><label>Password <input type="password" autocomplete="off"></label><button type="button">Sign in</button></form></main></body></html>
+EOF
+fi
+rm -f "$SELF_STEAL_TEMPLATE_TMP"
+chmod -R a=rX "$SELF_STEAL_ROOT"
+
+cp -a /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.backup-$(date +%F-%H%M%S)" 2>/dev/null || true
+cat > /etc/caddy/Caddyfile <<EOF
+{
+  auto_https disable_redirects
+  layer4 {
+    :443 {
+      @vision tls sni $SELF_STEAL_HOST
+      route @vision {
+        proxy 127.0.0.1:10443
+      }
+      @xhttp tls sni $XHTTP_SNI
+      route @xhttp {
+        proxy 127.0.0.1:10444
+      }
+      @trojan tls sni $TROJAN_HOST
+      route @trojan {
+        proxy 127.0.0.1:10445
+      }
+      route {
+        proxy 127.0.0.1:9443
+      }
+    }
+  }
+}
+
+https://$SELF_STEAL_HOST:9443 {
+  bind 127.0.0.1
+  tls $CERT_DIR/$SELF_STEAL_HOST/fullchain.pem $CERT_DIR/$SELF_STEAL_HOST/key.pem
+  root * $SELF_STEAL_ROOT
+  header {
+    -Server
+    Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:; form-action 'none'; base-uri 'none'; frame-ancestors 'none'"
+    X-Content-Type-Options nosniff
+    Referrer-Policy no-referrer
+    Permissions-Policy "camera=(), microphone=(), geolocation=()"
+  }
+  file_server
+}
+EOF
+caddy fmt --overwrite /etc/caddy/Caddyfile || warn "caddy fmt не удался — продолжаю."
+caddy validate --config /etc/caddy/Caddyfile || die "Caddyfile невалиден — исправьте SNI/синтаксис."
+systemctl restart caddy || die "Не удалось перезапустить Caddy."
+sleep 1
+if systemctl is-active --quiet caddy; then
+  CADDY_STOPPED_FOR_ACME=0
+  ok "Caddy запущен: :443 L4 и локальный TLS-сайт 127.0.0.1:9443"
+else
+  die "Caddy не поднялся. journalctl -u caddy -n 50"
+fi
 
 step 8 "sysctl-тюнинг (BBR/fq, UDP-буферы, fd-лимиты)"
 cat > /etc/sysctl.d/99-remnanode.conf <<'EOF'
@@ -640,13 +763,13 @@ else
 fi
 
 ( cd "$NODE_DIR" && retry 3 10 docker compose pull ) || die "docker compose pull не удался."
-( cd "$NODE_DIR" && docker compose up -d --force-recreate ) || die "docker compose up не удался."
+( cd "$NODE_DIR" && docker compose up -d --remove-orphans ) || die "docker compose up не удался."
 
 log "Жду готовности ноды (до 30s)..."
 node_ready=0
 for _ in $(seq 1 15); do
   state="$(docker inspect -f '{{.State.Status}}' remnanode 2>/dev/null || echo missing)"
-  if [[ "$state" == running ]] && ss -lntp 2>/dev/null | grep -q ":${NODE_API_PORT} "; then
+  if [[ "$state" == running ]] && ss -H -lnt "sport = :${NODE_API_PORT}" 2>/dev/null | grep -q .; then
     node_ready=1; break
   fi
   sleep 2
@@ -654,7 +777,8 @@ done
 if [[ "$node_ready" -eq 1 ]]; then
   ok "Нода запущена и слушает API-порт $NODE_API_PORT"
 else
-  warn "Нода не подтвердила готовность за 30s (state=${state:-?}). Проверьте: docker logs remnanode --tail 120"
+  docker logs remnanode --tail 120 2>&1 | sed 's/^/   /' || true
+  die "Нода не подтвердила готовность за 30s (state=${state:-?})."
 fi
 docker ps --filter name=remnanode --format 'table {{.Names}}\t{{.Status}}' | sed 's/^/   /' || true
 docker exec remnanode sh -lc \
@@ -664,7 +788,7 @@ ok "Контейнер remnanode запущен"
 
 step 10 "Проверка слушателей и маршрутизации"
 printf '   %s%sTCP listeners%s\n' "$C_B" "$C_MAG" "$C_RST"
-ss -lntup 2>/dev/null | grep -E ':443|:10443|:10444|:10445|:'"$NODE_API_PORT" | sed 's/^/     /' || true
+ss -lntup 2>/dev/null | grep -E ':443|:9443|:10443|:10444|:10445|:'"$NODE_API_PORT" | sed 's/^/     /' || true
 printf '   %s%sUDP listeners (Hysteria2)%s\n' "$C_B" "$C_MAG" "$C_RST"
 ss -lnuap 2>/dev/null | grep ':443' | sed 's/^/     /' || warn "UDP/443 не слушается — проверьте Hysteria2 inbound в панели."
 for pair in "Vision:$VISION_SNI" "XHTTP:$XHTTP_SNI" "Trojan:$TROJAN_HOST"; do
@@ -672,6 +796,9 @@ for pair in "Vision:$VISION_SNI" "XHTTP:$XHTTP_SNI" "Trojan:$TROJAN_HOST"; do
   printf '   %s%s%s (%s)%s\n' "$C_B" "$C_MAG" "$name" "$sni" "$C_RST"
   echo | timeout 8 openssl s_client -connect 127.0.0.1:443 -servername "$sni" -brief 2>&1 | head -6 | sed 's/^/     /' || true
 done
+printf '   %s%sSelf-steal target (%s)%s\n' "$C_B" "$C_MAG" "$SELF_STEAL_HOST" "$C_RST"
+echo | timeout 8 openssl s_client -connect 127.0.0.1:9443 -servername "$SELF_STEAL_HOST" -verify_return_error -brief 2>&1 \
+  | head -8 | sed 's/^/     /' || die "Локальный TLS-сайт self-steal не прошёл проверку."
 
 echo
 printf '%s%s╭──────────────────────────────────────────────────────────────╮%s\n' "$C_B" "$C_GRN" "$C_RST"
@@ -680,7 +807,7 @@ printf '%s%s│%s  %s✔ ГОТОВО%s  Проверьте статус нод�
 printf '%s%s╰──────────────────────────────────────────────────────────────╯%s\n' "$C_B" "$C_GRN" "$C_RST"
 echo
 printf '   %s%sКонфигурация нод-инбаундов (сверьте в панели)%s\n' "$C_B" "$C_MAG" "$C_RST"
-kv "Vision/Reality" "SNI $VISION_SNI  →  127.0.0.1:10443  (dest/self-steal: $VISION_SNI:443)"
+kv "Vision/Reality" "SNI $SELF_STEAL_HOST  →  127.0.0.1:10443  (target: 127.0.0.1:9443)"
 kv "XHTTP"          "SNI $XHTTP_SNI  path $XHTTP_PATH  →  127.0.0.1:10444"
 kv "Trojan (TLS)"   "SNI $TROJAN_HOST  →  127.0.0.1:10445  (cert $CERT_DIR/$TROJAN_HOST)"
 kv "Hysteria2"      "UDP/443 напрямую  (cert $CERT_DIR/$HY_HOST)"

@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Vaultdrop — Secure file workspace</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1020;
+      --panel: rgba(20, 28, 49, .82);
+      --panel-strong: #151e34;
+      --line: rgba(255, 255, 255, .09);
+      --muted: #91a0bc;
+      --text: #f5f7fb;
+      --accent: #6c7cff;
+      --accent-2: #54d6c5;
+      --danger: #ff8d9b;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      min-height: 100vh;
+      margin: 0;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 15% 0%, rgba(108, 124, 255, .20), transparent 34rem),
+        radial-gradient(circle at 100% 85%, rgba(84, 214, 197, .12), transparent 28rem),
+        var(--bg);
+    }
+
+    button, input { font: inherit; }
+    button { cursor: pointer; }
+    .icon { width: 1.2rem; height: 1.2rem; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+
+    .shell { min-height: 100vh; display: grid; grid-template-columns: 15.5rem 1fr; }
+    .sidebar { padding: 1.5rem 1.1rem; border-right: 1px solid var(--line); background: rgba(8, 13, 26, .62); backdrop-filter: blur(16px); }
+    .brand { display: flex; align-items: center; gap: .8rem; padding: 0 .45rem 1.7rem; font-size: 1.05rem; font-weight: 750; letter-spacing: -.02em; }
+    .brand-mark { display: grid; place-items: center; width: 2.15rem; height: 2.15rem; border-radius: .7rem; color: white; background: linear-gradient(135deg, var(--accent), #9b6cff); box-shadow: 0 10px 25px rgba(108, 124, 255, .25); }
+    .nav-label { margin: .7rem .65rem; color: #65738e; font-size: .68rem; font-weight: 750; letter-spacing: .12em; text-transform: uppercase; }
+    .nav-item { display: flex; align-items: center; gap: .75rem; width: 100%; margin: .15rem 0; padding: .72rem .75rem; border: 0; border-radius: .7rem; color: var(--muted); background: transparent; text-align: left; }
+    .nav-item.active { color: white; background: rgba(108, 124, 255, .14); }
+    .nav-item .count { margin-left: auto; color: #65738e; font-size: .76rem; }
+    .storage { margin-top: 2rem; padding: 1rem; border: 1px solid var(--line); border-radius: .9rem; background: rgba(255,255,255,.025); }
+    .storage-row { display: flex; justify-content: space-between; color: var(--muted); font-size: .75rem; }
+    .bar { height: .36rem; margin: .7rem 0; overflow: hidden; border-radius: 2rem; background: rgba(255,255,255,.07); }
+    .bar::before { content: ""; display: block; width: 37%; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
+
+    main { min-width: 0; padding: 1.5rem 2rem 3rem; }
+    .topbar { display: flex; align-items: center; gap: 1rem; }
+    .search { position: relative; flex: 1; max-width: 34rem; }
+    .search svg { position: absolute; top: 50%; left: .95rem; color: #63718c; transform: translateY(-50%); }
+    .search input { width: 100%; padding: .82rem 1rem .82rem 2.8rem; border: 1px solid var(--line); border-radius: .85rem; outline: 0; color: var(--text); background: rgba(255,255,255,.035); }
+    .ghost, .primary { display: inline-flex; align-items: center; justify-content: center; gap: .55rem; min-height: 2.75rem; padding: 0 1rem; border-radius: .75rem; color: white; }
+    .ghost { border: 1px solid var(--line); background: rgba(255,255,255,.04); }
+    .primary { border: 0; background: linear-gradient(135deg, var(--accent), #825cff); box-shadow: 0 9px 24px rgba(108,124,255,.2); }
+
+    .heading { display: flex; align-items: end; justify-content: space-between; margin: 2.5rem 0 1.2rem; }
+    h1 { margin: 0; font-size: clamp(1.6rem, 3vw, 2.25rem); letter-spacing: -.045em; }
+    .subtitle { margin: .45rem 0 0; color: var(--muted); font-size: .9rem; }
+    .view-toggle { display: flex; padding: .25rem; border: 1px solid var(--line); border-radius: .7rem; background: rgba(255,255,255,.025); }
+    .view-toggle button { display: grid; place-items: center; width: 2.1rem; height: 2rem; border: 0; border-radius: .45rem; color: var(--muted); background: transparent; }
+    .view-toggle .active { color: white; background: rgba(255,255,255,.08); }
+
+    .files { overflow: hidden; border: 1px solid var(--line); border-radius: 1rem; background: var(--panel); box-shadow: 0 28px 70px rgba(0,0,0,.22); }
+    .file-row { display: grid; grid-template-columns: minmax(12rem, 1.8fr) 1fr .65fr 2.2rem; align-items: center; min-height: 4.45rem; padding: 0 1.15rem; border-top: 1px solid var(--line); }
+    .file-row:first-child { border-top: 0; }
+    .file-row.header { min-height: 2.9rem; color: #687690; font-size: .68rem; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
+    .file { display: flex; align-items: center; gap: .85rem; min-width: 0; }
+    .file-icon { display: grid; flex: 0 0 auto; place-items: center; width: 2.35rem; height: 2.35rem; border-radius: .65rem; color: #89a0ff; background: rgba(108,124,255,.12); }
+    .file-icon.folder { color: #f2c96d; background: rgba(242,201,109,.1); }
+    .file-name { overflow: hidden; font-size: .88rem; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+    .meta { color: var(--muted); font-size: .79rem; }
+    .more { border: 0; color: #65738e; background: transparent; }
+
+    .veil { position: fixed; inset: 0; z-index: 10; display: grid; place-items: center; padding: 1.2rem; background: rgba(5, 9, 18, .50); backdrop-filter: blur(5px); }
+    .login { width: min(100%, 27rem); padding: 1.65rem; border: 1px solid rgba(255,255,255,.12); border-radius: 1.25rem; background: rgba(16, 23, 41, .95); box-shadow: 0 35px 100px rgba(0,0,0,.5); }
+    .login .brand { padding: 0 0 1.4rem; }
+    .login h2 { margin: .2rem 0 .45rem; font-size: 1.55rem; letter-spacing: -.035em; }
+    .login p { margin: 0 0 1.45rem; color: var(--muted); font-size: .88rem; line-height: 1.55; }
+    label { display: block; margin: .9rem 0 .4rem; color: #b8c2d5; font-size: .76rem; font-weight: 650; }
+    .field { position: relative; }
+    .field svg { position: absolute; top: 50%; left: .9rem; color: #65738e; transform: translateY(-50%); }
+    .field input { width: 100%; padding: .85rem .9rem .85rem 2.75rem; border: 1px solid var(--line); border-radius: .75rem; outline: none; color: white; background: rgba(255,255,255,.035); transition: border-color .2s, box-shadow .2s; }
+    .field input:focus { border-color: rgba(108,124,255,.7); box-shadow: 0 0 0 3px rgba(108,124,255,.12); }
+    .login .primary { width: 100%; margin-top: 1.2rem; }
+    .login-foot { display: flex; align-items: center; justify-content: center; gap: .45rem; margin-top: 1.15rem; color: #6f7d98; font-size: .72rem; }
+    .notice { display: none; margin-top: .85rem; padding: .65rem .75rem; border: 1px solid rgba(255,141,155,.2); border-radius: .6rem; color: #ffc0c8; background: rgba(255,141,155,.07); font-size: .76rem; }
+    .notice.visible { display: block; }
+
+    @media (max-width: 760px) {
+      .shell { grid-template-columns: 1fr; }
+      .sidebar { display: none; }
+      main { padding: 1.1rem; }
+      .topbar .ghost { display: none; }
+      .heading { margin-top: 2rem; }
+      .file-row { grid-template-columns: minmax(0, 1fr) auto 1.5rem; }
+      .file-row > :nth-child(3), .file-row.header { display: none; }
+      .files { border-radius: .85rem; }
+      .meta { padding-left: .5rem; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell" aria-hidden="true">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark"><svg class="icon" viewBox="0 0 24 24"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 19h14"/></svg></span>Vaultdrop</div>
+      <div class="nav-label">Workspace</div>
+      <button class="nav-item active"><svg class="icon" viewBox="0 0 24 24"><path d="M3 7h6l2 2h10v10H3z"/></svg>All files</button>
+      <button class="nav-item"><svg class="icon" viewBox="0 0 24 24"><path d="m12 3 2.7 5.5 6.1.9-4.4 4.3 1 6.1-5.4-2.9-5.4 2.9 1-6.1-4.4-4.3 6.1-.9z"/></svg>Favorites<span class="count">8</span></button>
+      <button class="nav-item"><svg class="icon" viewBox="0 0 24 24"><circle cx="8" cy="8" r="3"/><path d="M2.5 19a5.5 5.5 0 0 1 11 0M16 11h5m-2.5-2.5v5"/></svg>Shared</button>
+      <button class="nav-item"><svg class="icon" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3m-9 0 1 13h10l1-13"/></svg>Deleted</button>
+      <div class="storage"><div class="storage-row"><span>Storage</span><span>37%</span></div><div class="bar"></div><div class="storage-row"><span>18.6 GB used</span><span>50 GB</span></div></div>
+    </aside>
+
+    <main>
+      <div class="topbar">
+        <div class="search"><svg class="icon" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input type="text" placeholder="Search files and folders" tabindex="-1"></div>
+        <button class="ghost"><svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14m-7-7h14"/></svg>New</button>
+      </div>
+      <div class="heading"><div><h1>All files</h1><p class="subtitle">Your files are encrypted and available on all devices.</p></div><div class="view-toggle"><button class="active"><svg class="icon" viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg></button><button><svg class="icon" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg></button></div></div>
+      <section class="files">
+        <div class="file-row header"><span>Name</span><span>Modified</span><span>Size</span><span></span></div>
+        <div class="file-row"><div class="file"><span class="file-icon folder"><svg class="icon" viewBox="0 0 24 24"><path d="M3 7h6l2 2h10v10H3z"/></svg></span><span class="file-name">Project resources</span></div><span class="meta">Today, 09:42</span><span class="meta">—</span><button class="more">•••</button></div>
+        <div class="file-row"><div class="file"><span class="file-icon"><svg class="icon" viewBox="0 0 24 24"><path d="M6 2h8l4 4v16H6zM14 2v5h5"/></svg></span><span class="file-name">Quarterly-report.pdf</span></div><span class="meta">Yesterday</span><span class="meta">3.8 MB</span><button class="more">•••</button></div>
+        <div class="file-row"><div class="file"><span class="file-icon folder"><svg class="icon" viewBox="0 0 24 24"><path d="M3 7h6l2 2h10v10H3z"/></svg></span><span class="file-name">Team uploads</span></div><span class="meta">Aug 11, 2026</span><span class="meta">—</span><button class="more">•••</button></div>
+        <div class="file-row"><div class="file"><span class="file-icon"><svg class="icon" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="m21 15-5-4L5 20"/></svg></span><span class="file-name">Brand-assets.zip</span></div><span class="meta">Aug 8, 2026</span><span class="meta">246 MB</span><button class="more">•••</button></div>
+      </section>
+    </main>
+  </div>
+
+  <div class="veil">
+    <form class="login" id="login-form" autocomplete="off">
+      <div class="brand"><span class="brand-mark"><svg class="icon" viewBox="0 0 24 24"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 19h14"/></svg></span>Vaultdrop</div>
+      <h2>Sign in to your workspace</h2>
+      <p>Enter your workspace credentials to access shared files and secure transfers.</p>
+      <label for="account">Email or workspace ID</label>
+      <div class="field"><svg class="icon" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7 9 6 9-6"/></svg><input id="account" type="text" inputmode="email" placeholder="name@company.com" required></div>
+      <label for="password">Password</label>
+      <div class="field"><svg class="icon" viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg><input id="password" type="password" placeholder="Enter your password" required></div>
+      <button class="primary" type="submit"><svg class="icon" viewBox="0 0 24 24"><path d="M9 5h10v14H9M5 12h10m-3-3 3 3-3 3"/></svg>Continue</button>
+      <div class="notice" id="notice" role="status">Authentication service is temporarily unavailable. Please try again later.</div>
+      <div class="login-foot"><svg class="icon" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>TLS encrypted connection</div>
+    </form>
+  </div>
+
+  <script>
+    document.getElementById('login-form').addEventListener('submit', function (event) {
+      event.preventDefault();
+      document.getElementById('account').value = '';
+      document.getElementById('password').value = '';
+      document.getElementById('notice').classList.add('visible');
+    });
+  </script>
+</body>
+</html>

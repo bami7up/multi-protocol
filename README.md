@@ -1,8 +1,10 @@
 # remnanode-setup
 
-Автоматическая установка **ноды Remnawave** на чистый Debian/Ubuntu-сервер: VLESS (Reality/Vision + XHTTP), Trojan и Hysteria2 за **Caddy L4** с SNI-роутингом. Один запуск — и нода готова к подключению к панели.
+Автоматическая установка **ноды Remnawave** на чистый Debian/Ubuntu-сервер: VLESS (Reality/Vision self-steal + XHTTP), Trojan и Hysteria2 за **Caddy L4** с SNI-роутингом. Один запуск — и нода готова к подключению к панели.
 
 Скрипт идемпотентный: повторный запуск не ломает уже настроенное (сборка Caddy, сертификаты, `.env` — всё пропускается или переиспользуется).
+
+Каждый push и pull request автоматически проверяет Bash/ShellCheck, JSON5-шаблоны и JavaScript веб-фасада через GitHub Actions.
 
 ---
 
@@ -10,18 +12,21 @@
 
 - **Preflight** — проверка ОС, архитектуры, ядра (BBR), RAM и диска.
 - **Docker** — установка через `get.docker.com`, ротация логов, `live-restore`.
-- **Caddy + caddy-l4** — сборка кастомного бинаря через `xcaddy` с модулем [`mholt/caddy-l4`](https://github.com/mholt/caddy-l4), `setcap` на биндинг привилегированных портов.
+- **Caddy + caddy-l4** — воспроизводимая сборка кастомного бинаря через `xcaddy` с зафиксированными стабильными версиями (`xcaddy v0.4.5`, [`caddy-l4 v0.1.2`](https://github.com/mholt/caddy-l4/releases/tag/v0.1.2)), `setcap` на биндинг привилегированных портов.
 - **L4-роутинг по SNI** на `:443/tcp`:
   | SNI | → | Локальный порт | Инбаунд |
   |-----|---|----------------|---------|
-  | `VISION_SNI` (маскировка, напр. `www.google.com`) | → | `127.0.0.1:10443` | VLESS Reality + Vision |
+  | `SELF_STEAL_HOST` (по умолчанию `<prefix>1.<domain>`) | → | `127.0.0.1:10443` | VLESS Reality + Vision |
   | `XHTTP_SNI` | → | `127.0.0.1:10444` | VLESS XHTTP |
   | `TROJAN_HOST` | → | `127.0.0.1:10445` | Trojan (TLS) |
-  | *остальное* | → | `VISION_SNI:443` | self-steal fallback |
+  | *остальное* | → | `127.0.0.1:9443` | локальный TLS-сайт |
+- **Настоящий REALITY self-steal** — target Vision указывает на локальный TLS-сайт Caddy `127.0.0.1:9443`, а не на внешний Google/Cloudflare. Обычный браузер и невалидная REALITY-проба получают ваш реальный сайт и сертификат.
+- **Правдоподобный веб-фасад** — адаптивный интерфейс закрытого файлообменника с формой входа. Форма ничего не отправляет и не сохраняет: после попытки входа показывает временную недоступность авторизации.
+- **XHTTP остаётся с внешним target.** Прямой XHTTP+REALITY self-steal на локальный TLS target имеет [известную несовместимость в актуальных версиях Xray](https://github.com/XTLS/Xray-core/issues/5923); self-steal включён для стабильного Vision/RAW-инбаунда.
 - **Hysteria2** — слушает `:443/udp` напрямую из контейнера (host-network), в обход Caddy.
-- **Сертификаты** — `acme.sh` (Let's Encrypt, EC-256) для `TROJAN_HOST` и `HY_HOST`, установка в `/etc/remna-certs`, автоперевыпуск, reload через `docker restart remnanode`.
+- **Сертификаты** — `acme.sh` (Let's Encrypt, EC-256) для self-steal, `TROJAN_HOST` и `HY_HOST`, установка в `/etc/remna-certs`, автоперевыпуск.
 - **sysctl-тюнинг** — BBR + `fq`, UDP-буферы, backlog, `nofile` до 1 048 576.
-- **Firewall (ufw)** — SSH, `443/tcp`, `443/udp`, `80/tcp` (acme), а API-порт ноды — **только с IP панели**.
+- **Firewall (ufw)** — SSH, `443/tcp`, `443/udp`, `80/tcp` (acme), а API-порт ноды — **только с IP панели**. Существующие правила по умолчанию сохраняются.
 - **Нода Remnawave** — `docker-compose.yml` + `.env` (0600), `network_mode: host`, `NET_ADMIN`, ротация логов, health-poll после старта.
 
 ---
@@ -34,7 +39,7 @@
 
   | Домен | Назначение | Нужен валидный сертификат |
   |-------|-----------|---------------------------|
-  | `<prefix>1.<domain>` | адрес подключения VLESS (SNI подменяется на `VISION_SNI`) | нет (Reality) |
+  | `<prefix>1.<domain>` | адрес и SNI VLESS Reality self-steal | **да** |
   | `<prefix>2.<domain>` | Trojan | **да** |
   | `<prefix>3.<domain>` | Hysteria2 | **да** |
 
@@ -48,18 +53,18 @@
 
 ```bash
 apt-get update && apt-get install -y curl; \
-bash <(curl -fsSL https://raw.githubusercontent.com/1atex/multi-protocol/main/remnanode-setup.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/remnanode-setup.sh)
 ```
 
 Либо скачать, просмотреть и запустить:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/1atex/multi-protocol/main/remnanode-setup.sh -o remnanode-setup.sh
+curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/remnanode-setup.sh -o remnanode-setup.sh
 less remnanode-setup.sh          # инспекция перед запуском
 bash remnanode-setup.sh
 ```
 
-> Скрипт спросит: базовый домен, префикс, маскировочные SNI, путь XHTTP, IP панели, порт API и `SECRET_KEY`. Ответы сохраняются в `/root/remnanode.env` и переиспользуются при следующем запуске.
+> Скрипт спросит: базовый домен, префикс, домен self-steal, маскировочный SNI и путь XHTTP, IP панели, порт API и `SECRET_KEY`. Ответы сохраняются в `/root/remnanode.env` и переиспользуются при следующем запуске.
 
 ### Порядок действий
 
@@ -67,6 +72,7 @@ bash remnanode-setup.sh
 2. В панели: **Nodes → Add** — укажите IP ноды и порт API (по умолчанию `2222`; **советую сменить**), скопируйте `SECRET_KEY`.
 3. Запустите скрипт, вставьте `SECRET_KEY` на **9-м вопросе** интерактива.
 4. Настройте инбаунды в панели на локальные порты `10443` / `10444` / `10445`, Hysteria2 — на `443/udp` (карта портов — в финальном выводе скрипта; пример клиентского шаблона — `Multiselect.json`).
+   Для `REALITY_VISION` обязательно задайте `target: 127.0.0.1:9443`, а в `serverNames` — значение `SELF_STEAL_HOST`.
 5. Дождитесь статуса **online** у ноды.
 6. Создайте шаблон Xray с балансером (см. `Xray_template.json`).
 7. Заведите хосты под инбаунды, проставляя тег балансера ровно тот, что указан в `pattern` шаблона (`^USA$` → тег `USA`).
@@ -112,13 +118,13 @@ bash remnanode-setup.sh
 ```bash
 BASE_DOMAIN=example.com \
 PREFIX=usa \
-VISION_SNI=www.google.com \
+SELF_STEAL_HOST=usa1.example.com \
 XHTTP_SNI=www.gstatic.com \
 XHTTP_PATH=/api/v3/sync/r1 \
 PANEL_IP=203.0.113.10 \
 NODE_API_PORT=2222 \
 SECRET_KEY='eyJ...' \
-bash <(curl -fsSL https://raw.githubusercontent.com/1atex/multi-protocol/main/remnanode-setup.sh) \
+bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/remnanode-setup.sh) \
   --non-interactive --yes
 ```
 
@@ -129,7 +135,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/1atex/multi-protocol/main/re
 ```
 --no-compose          не трогать docker-compose.yml (только .env + up -d)
 --no-firewall         не настраивать ufw
---no-reset-firewall   не делать 'ufw reset' (сохранить существующие правила)
+--reset-firewall      удалить существующие правила ufw перед настройкой
 --force-dns           не прерываться при несовпадении DNS
 --ssh-port N          явно указать SSH-порт для правила ufw
 --node-image REF      образ ноды (по умолчанию remnawave/node:latest)
@@ -138,7 +144,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/1atex/multi-protocol/main/re
 -h | --help           справка
 ```
 
-**Переменные окружения:** `BASE_DOMAIN`, `PREFIX`, `VISION_SNI`, `XHTTP_SNI`, `XHTTP_PATH`, `PANEL_IP`, `NODE_API_PORT`, `SECRET_KEY`, `NODE_IMAGE`, а также пути `NODE_DIR`, `CERT_DIR`, `ENV_STORE`.
+**Переменные окружения:** `BASE_DOMAIN`, `PREFIX`, `SELF_STEAL_HOST`, `XHTTP_SNI`, `XHTTP_PATH`, `PANEL_IP`, `NODE_API_PORT`, `SECRET_KEY`, `NODE_IMAGE`, `SELF_STEAL_TEMPLATE_URL`, `XCADDY_VERSION`, `CADDY_L4_VERSION`, а также пути `NODE_DIR`, `CERT_DIR`, `ENV_STORE`.
+
+Шаблон страницы лежит отдельно в `self-steal-site.html`. Его можно заменить своим файлом, указав публичный HTTPS-адрес в `SELF_STEAL_TEMPLATE_URL`. При ошибке скачивания установщик создаст минимальную локальную страницу входа и не оставит повреждённый файл.
 
 ---
 
@@ -148,14 +156,14 @@ bash <(curl -fsSL https://raw.githubusercontent.com/1atex/multi-protocol/main/re
 docker logs remnanode --tail 120                              # логи ноды
 docker exec -it remnanode tail -f /var/log/xray/current       # логи Xray
 systemctl status caddy --no-pager                             # статус Caddy
-ss -lntup | grep -E ':443|:10443|:10444|:10445'               # слушатели
+ss -lntup | grep -E ':443|:9443|:10443|:10444|:10445'         # слушатели
 ufw status numbered                                           # правила firewall
 ```
 
 Проверка SNI-роутинга вручную:
 
 ```bash
-echo | openssl s_client -connect 127.0.0.1:443 -servername www.google.com -brief
+echo | openssl s_client -connect 127.0.0.1:9443 -servername <prefix>1.<domain> -verify_return_error -brief
 ```
 
 ---
@@ -164,7 +172,7 @@ echo | openssl s_client -connect 127.0.0.1:443 -servername www.google.com -brief
 
 | Симптом | Причина / решение |
 |---------|-------------------|
-| Сертификаты не выпускаются | A-записи `<prefix>2/3` не указывают на ноду, либо `80/tcp` занят. Проверьте `dig`, освободите порт 80. |
+| Сертификаты не выпускаются | A-записи `<prefix>1/2/3` не указывают на ноду, либо `80/tcp` занят. Проверьте `dig`, освободите порт 80. |
 | `UDP/443 не слушается` | В панели у Hysteria2-инбаунда нет привязанных юзеров, либо инбаунд не на `443/udp`. |
 | Caddy не поднимается | `journalctl -u caddy -n 50` — обычно опечатка в SNI или конфликт порта 443 с host-процессом. |
 | Нода `offline` в панели | API-порт закрыт для IP панели, неверный `SECRET_KEY`, либо `PANEL_IP` в ufw не совпадает. |
@@ -178,8 +186,9 @@ echo | openssl s_client -connect 127.0.0.1:443 -servername www.google.com -brief
 
 - `.env` с `SECRET_KEY` создаётся с правами `0600`.
 - Приватные ключи сертификатов — `0600`, в контейнер монтируются **read-only**.
+- Ключ self-steal имеет `0640 root:caddy`, чтобы Caddy мог читать его; наружу порт `9443` не открывается.
 - API-порт ноды доступен только с IP панели (правило ufw `allow from <PANEL_IP>`).
-- `--no-reset-firewall` сохраняет существующие правила ufw, если сервер не «чистый».
+- Повторный запуск не сбрасывает ufw, не перезапускает Docker без изменения его конфигурации и не пересоздаёт контейнер ноды без необходимости.
+- `--reset-firewall` следует применять только на чистом сервере: он удаляет все существующие правила ufw.
 
 ---
-
