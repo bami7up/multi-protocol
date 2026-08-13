@@ -18,10 +18,12 @@ Caddy L4 принимает `443/tcp` и распределяет соедине
 | Компонент | Статус | Что проверено |
 |---|---|---|
 | Panel `3.0.x–3.2.x` | ✅ Совместимо | Config Profiles, Hosts, Internal Squads и XRAY_JSON `injectHosts`; REST API не используется |
-| Node `3.0.0–3.1.1` | ✅ Совместимо | `NODE_PORT`, `SECRET_KEY`, host network, `NET_ADMIN`, сертификаты и Xray-core `v26.7.28` |
+| Node `3.0.0–3.1.1` | ✅ Совместимо | `NODE_PORT`, `SECRET_KEY`, host network, `NET_ADMIN`, сертификаты и Xray-core `v26.7.28`; форк smux не требуется |
 | Remnawave `2.x` | ⚠️ Не целевая ветка | `injectHosts` доступен с `2.6.3`, но инструкция написана для интерфейса 3.x |
 
 Официальный compose Node 3.x использует `NODE_PORT`, `SECRET_KEY`, `network_mode: host` и `NET_ADMIN`. Установщик следует этой схеме, добавляет сертификаты, лимиты и ротацию логов, а образ фиксирует на проверенной версии `remnawave/node:3.1.1`.
+
+Оба REALITY inbound'а содержат `minClientVer: "0.0.0"`. Это сохраняет совместимость с Mihomo и другими клиентами, которые некорректно определялись новым Xray-core. Параметры `smux` и `brutal-opts` в этом профиле не используются, поэтому `remnanode-smux`, модуль `tcp-brutal` и замена штатного ядра для данной конфигурации не нужны.
 
 Полный интеграционный тест требует живой панели, DNS и публичного IP. CI репозитория проверяет Bash/ShellCheck, JSON5-шаблоны, JavaScript фасада и форматирование. После установки на конкретном сервере выполните [проверку](#проверка-после-установки).
 
@@ -31,6 +33,8 @@ Caddy L4 принимает `443/tcp` и распределяет соедине
 - [Config Profiles](https://docs.rw/learn-en/config-profiles)
 - [XRAY_JSON и injectHosts](https://docs.rw/learn/xray-json-advanced)
 - [Образы Remnawave Node](https://github.com/remnawave/node/pkgs/container/node)
+- [Зависимость caddy-l4 v0.1.2 от Caddy v2.11.4](https://github.com/mholt/caddy-l4/blob/v0.1.2/go.mod)
+- [Официальные архивы и SHA256 Go](https://go.dev/dl/)
 
 ## Какой файл куда загружать
 
@@ -63,7 +67,7 @@ Vision использует `target: 127.0.0.1:9443`: REALITY крадёт ру�
 - желательно от 1 GB RAM и 3 GB свободного места;
 - Remnawave Panel 3.x;
 - публичный IPv4 ноды и IP панели;
-- три A-записи на IP ноды.
+- три A-записи на IP ноды и отсутствие AAAA-записей на протокольных доменах.
 
 Пример для префикса `usa`:
 
@@ -75,6 +79,8 @@ Vision использует `target: 127.0.0.1:9443`: REALITY крадёт ру�
 
 > [!IMPORTANT]
 > Все три протокольные записи должны постоянно работать в режиме **DNS only**. Если DNS управляется через Cloudflare, оставьте для них серое облако и не включайте Proxy после выпуска сертификатов. Cloudflare завершает TLS на своей стороне, поэтому исходный TLS ClientHello не доходит до Caddy/Reality и self-steal перестаёт работать. Обычный Cloudflare Proxy также ломает прямой Trojan TLS и не проксирует UDP-трафик Hysteria2. Оранжевое облако допустимо только для отдельного обычного веб-домена, который не используется этими протоколами.
+
+Не создавайте AAAA-записи для этих доменов: Hysteria2 в профиле привязан к `0.0.0.0:443`, то есть только к IPv4. При наличии AAAA часть клиентов выберет IPv6 и получит нестабильное подключение. Установщик проверяет все A/AAAA-записи и предупреждает о лишних адресах.
 
 До запуска проверьте DNS и доступность `80/tcp`, `443/tcp`, `443/udp`. Node Port, например `2222/tcp`, должен быть доступен только с IP панели.
 
@@ -98,8 +104,8 @@ Vision использует `target: 127.0.0.1:9443`: REALITY крадёт ру�
 
 | Tag | Listen | Port | Критичное поле |
 |---|---|---:|---|
-| `REALITY_VISION` | `127.0.0.1` | `10443` | `target: 127.0.0.1:9443`, self-steal-домен в `serverNames` |
-| `REALITY_XHTTP` | `127.0.0.1` | `10444` | внешний SNI в `serverNames` |
+| `REALITY_VISION` | `127.0.0.1` | `10443` | `target: 127.0.0.1:9443`, `minClientVer: "0.0.0"`, self-steal-домен в `serverNames` |
+| `REALITY_XHTTP` | `127.0.0.1` | `10444` | внешний SNI в `serverNames`, `minClientVer: "0.0.0"` |
 | `TROJAN` | `127.0.0.1` | `10445` | сертификаты в `/etc/remna-certs/<домен>/` |
 | `HYSTERIA2` | `0.0.0.0` | `443/udp` | сертификат Hysteria2-домена |
 
@@ -230,7 +236,7 @@ NODE_IMAGE=remnawave/node:3.1.1 \
 bash remnanode-setup.sh
 ```
 
-Без `NODE_IMAGE` используется `remnawave/node:3.1.1`. Версия зафиксирована намеренно: будущий `latest` может перейти на несовместимую major-ветку.
+Без `NODE_IMAGE` используется `remnawave/node:3.1.1`. Версия зафиксирована намеренно: будущий `latest` может перейти на несовместимую major-ветку. Сборка маршрутизатора также воспроизводима: `Caddy v2.11.4`, `caddy-l4 v0.1.2`, `xcaddy v0.4.5` и официальный Go `1.25.1`. Архив Go проверяется по опубликованному SHA256 и ставится отдельно в `/opt/remnanode-toolchains`, не заменяя системный Go.
 
 ## Флаги
 
@@ -246,7 +252,7 @@ bash remnanode-setup.sh
 -h, --help            показать справку
 ```
 
-Переменные: `BASE_DOMAIN`, `PREFIX`, `SELF_STEAL_HOST`, `XHTTP_SNI`, `XHTTP_PATH`, `PANEL_IP`, `NODE_API_PORT`, `SECRET_KEY`, `NODE_IMAGE`, `SELF_STEAL_TEMPLATE_URL`, `XCADDY_VERSION`, `CADDY_L4_VERSION`, `NODE_DIR`, `CERT_DIR`, `ENV_STORE`.
+Переменные: `BASE_DOMAIN`, `PREFIX`, `SELF_STEAL_HOST`, `XHTTP_SNI`, `XHTTP_PATH`, `PANEL_IP`, `NODE_API_PORT`, `SECRET_KEY`, `NODE_IMAGE`, `SELF_STEAL_TEMPLATE_URL`, `XCADDY_VERSION`, `CADDY_VERSION`, `CADDY_L4_VERSION`, `NODE_DIR`, `CERT_DIR`, `ENV_STORE`.
 
 Свой фасад можно передать через публичный HTTPS URL в `SELF_STEAL_TEMPLATE_URL`. При ошибке установщик создаст минимальную локальную страницу.
 
@@ -291,6 +297,7 @@ echo | openssl s_client \
 | Нет виртуального хоста | Видимость ON, Hide host OFF, inbound в Internal Squad |
 | Только один outbound | Рабочие хосты должны быть Hide host ON и иметь тег из `selector.pattern` |
 | XHTTP не работает | Одинаковые `path` и SNI в Profile, Host и установщике |
+| Mihomo не подключается к REALITY | В обоих REALITY inbound'ах должно быть `minClientVer: "0.0.0"`; затем сохраните профиль и дождитесь его применения на ноде |
 | Trojan не стартует | Пути `/etc/remna-certs/<домен>/...` в Config Profile |
 | UDP/443 не слушается | Hysteria2 inbound активен; порт не занят другим сервисом |
 | Caddy не запускается | `journalctl -u caddy -n 100`; конфликт `443/tcp` или неверный SNI |
@@ -303,7 +310,11 @@ echo | openssl s_client \
 - `.env` с секретом создаётся с правами `0600`.
 - Ключи сертификатов монтируются в Node read-only.
 - Node Port разрешается в UFW только с IP панели.
+- При повторном запуске старое управляемое правило Node Port удаляется перед добавлением актуальных IP/порта панели. Остальные пользовательские правила UFW не затрагиваются.
 - Повторный запуск не сбрасывает UFW и не перезапускает Docker без необходимости.
 - Compose не пересоздаёт контейнер принудительно.
+- Если выпуск сертификата или пересборка прерываются, EXIT-обработчик пытается сразу вернуть Caddy в рабочее состояние.
+- Установщик хранит не более трёх резервных бинарников Caddy, пяти копий Caddyfile и десяти установочных логов.
+- Финал считается успешным только после появления всех TCP/UDP-слушателей и прохождения TLS-проверок Vision, XHTTP, Trojan и локального self-steal.
 - `--reset-firewall` применяйте только на чистом сервере: он удаляет существующие правила.
 - Для обновления Node измените `NODE_IMAGE` и повторите запуск. Перед сменой версии проверьте [официальные релизы](https://github.com/remnawave/panel/releases).

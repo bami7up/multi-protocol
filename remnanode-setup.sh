@@ -14,8 +14,12 @@ ENV_STORE="${ENV_STORE:-/root/remnanode.env}"
 NODE_IMAGE="${NODE_IMAGE:-remnawave/node:3.1.1}"
 SELF_STEAL_TEMPLATE_URL="${SELF_STEAL_TEMPLATE_URL:-https://raw.githubusercontent.com/bami7up/multi-protocol/main/self-steal-site.html}"
 XCADDY_VERSION="${XCADDY_VERSION:-v0.4.5}"
+CADDY_VERSION="${CADDY_VERSION:-v2.11.4}"
 CADDY_L4_VERSION="${CADDY_L4_VERSION:-v0.1.2}"
-CADDY_STOPPED_FOR_ACME=0
+GO_VERSION="1.25.1"
+GO_INSTALL_TMP=""
+GO_ARCHIVE_TMP=""
+CADDY_RESTORE_NEEDED=0
 LOG_DIR="/var/log"
 LOG_FILE="${LOG_DIR}/remnanode-setup-$(date +%F-%H%M%S).log"
 
@@ -40,7 +44,7 @@ remnanode-setup.sh — установка ноды Remnawave (VLESS + Trojan + H
 Переменные окружения (для --non-interactive / CI):
   BASE_DOMAIN, PREFIX, SELF_STEAL_HOST, XHTTP_SNI, XHTTP_PATH,
   PANEL_IP, NODE_API_PORT, SECRET_KEY, NODE_IMAGE, SELF_STEAL_TEMPLATE_URL,
-  XCADDY_VERSION, CADDY_L4_VERSION
+  XCADDY_VERSION, CADDY_VERSION, CADDY_L4_VERSION
 USAGE
 }
 
@@ -125,6 +129,79 @@ retry() {
     sleep "$delay"
     n=$((n + 1))
   done
+}
+
+prune_matching_files() {
+  local dir="$1" pattern="$2" keep="$3" i
+  local -a files=()
+  [[ -d "$dir" ]] || return 0
+  mapfile -t files < <(
+    find "$dir" -maxdepth 1 -type f -name "$pattern" -printf '%T@ %p\n' 2>/dev/null \
+      | sort -rn | sed 's/^[^ ]* //'
+  )
+  for ((i = keep; i < ${#files[@]}; i++)); do
+    rm -f -- "${files[$i]}"
+  done
+}
+
+remove_managed_ufw_rules() {
+  local rule_no
+  local -a rule_numbers=()
+  mapfile -t rule_numbers < <(
+    ufw status numbered 2>/dev/null \
+      | sed -n '/Remnawave panel -> node/s/^[[:space:]]*\[[[:space:]]*\([0-9]\+\)\].*/\1/p' \
+      | sort -rn
+  )
+  for rule_no in "${rule_numbers[@]}"; do
+    ufw --force delete "$rule_no" >/dev/null \
+      || warn "Не удалось удалить старое управляемое правило ufw №$rule_no."
+  done
+  if (( ${#rule_numbers[@]} > 0 )); then
+    ok "Старые правила доступа панели к Node API удалены: ${#rule_numbers[@]}"
+  fi
+}
+
+install_go_toolchain() {
+  local go_arch go_sha go_root archive
+  case "$ARCH" in
+    x86_64|amd64)
+      go_arch=amd64
+      go_sha=7716a0d940a0f6ae8e1f3b3f4f36299dc53e31b16840dbd171254312c41ca12e
+      ;;
+    aarch64|arm64)
+      go_arch=arm64
+      go_sha=65a3e34fb2126f55b34e1edfc709121660e1be2dee6bdf405fc399a63a95a87d
+      ;;
+    *) die "Нет Go toolchain для архитектуры $ARCH." ;;
+  esac
+  go_root="/opt/remnanode-toolchains/go${GO_VERSION}"
+  if [[ -x "$go_root/bin/go" ]] \
+      && [[ "$("$go_root/bin/go" version 2>/dev/null)" == "go version go${GO_VERSION} "* ]]; then
+    export PATH="$go_root/bin:$PATH"
+    ok "Go $GO_VERSION уже установлен в $go_root"
+    return
+  fi
+  [[ ! -e "$go_root" ]] \
+    || die "$go_root уже существует, но не содержит исправный Go $GO_VERSION; проверьте каталог вручную."
+
+  mkdir -p /opt/remnanode-toolchains
+  GO_INSTALL_TMP="$(mktemp -d /opt/remnanode-toolchains/.go-install.XXXXXX)"
+  archive="$(mktemp)"
+  GO_ARCHIVE_TMP="$archive"
+  retry 3 10 curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${go_arch}.tar.gz" -o "$archive" \
+    || die "Не удалось скачать Go $GO_VERSION."
+  printf '%s  %s\n' "$go_sha" "$archive" | sha256sum -c - >/dev/null \
+    || die "SHA256 архива Go $GO_VERSION не совпал."
+  tar -xzf "$archive" -C "$GO_INSTALL_TMP" --strip-components=1 \
+    || die "Не удалось распаковать Go $GO_VERSION."
+  rm -f "$archive"
+  GO_ARCHIVE_TMP=""
+  "$GO_INSTALL_TMP/bin/go" version | grep -Fq "go version go${GO_VERSION} " \
+    || die "Распакованный Go toolchain имеет неожиданную версию."
+  mv "$GO_INSTALL_TMP" "$go_root"
+  GO_INSTALL_TMP=""
+  export PATH="$go_root/bin:$PATH"
+  ok "Установлен проверенный Go $GO_VERSION ($go_arch)"
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -228,15 +305,33 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 on_err() {
   local ec=$? line=$1 cmd=$2
-  if [[ "${CADDY_STOPPED_FOR_ACME:-0}" -eq 1 ]]; then
-    systemctl start caddy >/dev/null 2>&1 || true
-  fi
   printf '\n %s✖ НЕПРЕДВИДЕННЫЙ СБОЙ%s код=%s строка=%s\n   %s%s%s\n' \
     "$C_RED$C_B" "$C_RST" "$ec" "$line" "$C_DIM$C_GRY" "$cmd" "$C_RST" >&2
   printf '   Полный лог: %s\n' "$LOG_FILE" >&2
   exit "$ec"
 }
+
+on_exit() {
+  local ec=$?
+  trap - EXIT
+  if [[ -n "${GO_INSTALL_TMP:-}" && -d "$GO_INSTALL_TMP" ]]; then
+    rm -rf -- "$GO_INSTALL_TMP"
+  fi
+  if [[ -n "${GO_ARCHIVE_TMP:-}" && -f "$GO_ARCHIVE_TMP" ]]; then
+    rm -f -- "$GO_ARCHIVE_TMP"
+  fi
+  if [[ "${CADDY_RESTORE_NEEDED:-0}" -eq 1 ]]; then
+    if systemctl start caddy >/dev/null 2>&1; then
+      CADDY_RESTORE_NEEDED=0
+      warn "Caddy восстановлен после прерванной операции."
+    else
+      printf ' Не удалось восстановить Caddy после ACME; проверьте systemctl status caddy.\n' >&2
+    fi
+  fi
+  exit "$ec"
+}
 trap 'on_err "$LINENO" "$BASH_COMMAND"' ERR
+trap on_exit EXIT
 
 echo
 banner
@@ -342,6 +437,14 @@ is_safe_xhttp_path "$XHTTP_PATH" || die "Некорректный XHTTP path: $X
 is_ipv4 "$PANEL_IP"          || die "Некорректный IP панели: $PANEL_IP"
 { [[ "$NODE_API_PORT" =~ ^[0-9]+$ ]] && (( NODE_API_PORT >= 1 && NODE_API_PORT <= 65535 )); } \
   || die "Некорректный порт ноды: $NODE_API_PORT"
+case "$NODE_API_PORT" in
+  80|443|9443|10443|10444|10445)
+    die "Node API port $NODE_API_PORT занят этой схемой; выберите другой, например 2222."
+    ;;
+esac
+ACTIVE_SSH_PORT="${SSH_PORT_OVERRIDE:-$(detect_ssh_port)}"
+[[ "$NODE_API_PORT" != "$ACTIVE_SSH_PORT" ]] \
+  || die "Node API port $NODE_API_PORT совпадает с SSH-портом; выберите другой порт ноды."
 [[ "$SELF_STEAL_HOST" != "$TROJAN_HOST" && "$SELF_STEAL_HOST" != "$HY_HOST" ]] \
   || die "SELF_STEAL_HOST должен отличаться от доменов Trojan/Hysteria2."
 [[ "$XHTTP_SNI" != "$SELF_STEAL_HOST" && "$XHTTP_SNI" != "$TROJAN_HOST" ]] \
@@ -350,6 +453,7 @@ is_ipv4 "$PANEL_IP"          || die "Некорректный IP панели: $
   || die "SELF_STEAL_TEMPLATE_URL должен начинаться с https://"
 [[ "$NODE_IMAGE" =~ ^[a-zA-Z0-9][a-zA-Z0-9._/:@-]+$ ]] || die "Некорректная ссылка на образ: $NODE_IMAGE"
 [[ "$XCADDY_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Некорректная версия xcaddy: $XCADDY_VERSION"
+[[ "$CADDY_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Некорректная версия Caddy: $CADDY_VERSION"
 [[ "$CADDY_L4_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Некорректная версия caddy-l4: $CADDY_L4_VERSION"
 
 export SERVER_IP BASE_DOMAIN PREFIX VLESS_HOST TROJAN_HOST HY_HOST ACME_EMAIL \
@@ -392,14 +496,25 @@ confirm "Всё верно, продолжаем?" "y" || die "Отменено 
 
 step 2 "Проверка DNS и SNI"
 DNS_OK=1
+declare -A DNS_SEEN=()
 for d in "$VLESS_HOST" "$TROJAN_HOST" "$HY_HOST" "$SELF_STEAL_HOST"; do
-  resolved="$(dig +short "$d" A 2>/dev/null | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/{print; exit}' || true)"
-  if [[ -z "$SERVER_IP" ]]; then
-    note "$d -> ${resolved:-<нет A-записи>}"
-  elif [[ "$resolved" == "$SERVER_IP" ]]; then
-    ok "$d -> $resolved"
+  [[ "${DNS_SEEN[$d]:-0}" -eq 0 ]] || continue
+  DNS_SEEN[$d]=1
+  mapfile -t resolved_a < <(dig +short "$d" A 2>/dev/null | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/' | sort -u)
+  mapfile -t resolved_aaaa < <(dig +short "$d" AAAA 2>/dev/null | awk '/:/' | sort -u)
+  resolved_a_text="$(IFS=,; printf '%s' "${resolved_a[*]:-<нет A-записи>}")"
+  resolved_aaaa_text="$(IFS=,; printf '%s' "${resolved_aaaa[*]:-}")"
+  if (( ${#resolved_a[@]} == 0 )); then
+    warn "$d -> <нет A-записи>"; DNS_OK=0
+  elif [[ -z "$SERVER_IP" ]]; then
+    note "$d -> $resolved_a_text"
+  elif (( ${#resolved_a[@]} == 1 )) && [[ "${resolved_a[0]}" == "$SERVER_IP" ]]; then
+    ok "$d -> ${resolved_a[0]}"
   else
-    warn "$d -> ${resolved:-<нет A-записи>} (ожидался $SERVER_IP)"; DNS_OK=0
+    warn "$d -> $resolved_a_text (должна быть единственная A-запись $SERVER_IP)"; DNS_OK=0
+  fi
+  if (( ${#resolved_aaaa[@]} > 0 )); then
+    warn "$d имеет AAAA: $resolved_aaaa_text. Hysteria2 слушает только IPv4; удалите AAAA."; DNS_OK=0
   fi
 done
 if [[ "$DNS_OK" -eq 0 && "$FORCE_DNS" -eq 0 ]]; then
@@ -460,7 +575,7 @@ if [[ "$MANAGE_FIREWALL" -eq 1 ]]; then
   if [[ -n "$SSH_PORT_OVERRIDE" ]]; then
     SSH_PORT="$SSH_PORT_OVERRIDE"
   else
-    SSH_PORT="$(detect_ssh_port)"
+    SSH_PORT="$ACTIVE_SSH_PORT"
   fi
   ok "SSH-порт для ufw: $SSH_PORT (переопределить: --ssh-port N)"
 
@@ -472,6 +587,7 @@ if [[ "$MANAGE_FIREWALL" -eq 1 ]]; then
   fi
   ufw default deny incoming  >/dev/null
   ufw default allow outgoing >/dev/null
+  remove_managed_ufw_rules
   ufw allow "${SSH_PORT}/tcp" comment 'SSH'                        >/dev/null
   ufw allow 443/tcp           comment 'VLESS/Trojan via Caddy L4'  >/dev/null
   ufw allow 443/udp           comment 'Hysteria2 QUIC'             >/dev/null
@@ -485,8 +601,16 @@ else
   warn "--no-firewall: убедитесь, что 443 tcp/udp, 80/tcp открыты, а $NODE_API_PORT доступен только панели."
 fi
 
+caddy_build_matches() {
+  have caddy \
+    && [[ "$(caddy version 2>/dev/null | awk '{print $1}')" == "$CADDY_VERSION" ]] \
+    && caddy list-modules 2>/dev/null | grep -qE 'layer4' \
+    && caddy build-info 2>/dev/null | tr '\t' ' ' \
+      | grep -Fq "github.com/mholt/caddy-l4 $CADDY_L4_VERSION"
+}
+
 step 5 "Сборка Caddy с модулем layer4"
-if ! caddy list-modules 2>/dev/null | grep -qE 'layer4'; then
+if ! caddy_build_matches; then
   if [[ ! -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg ]]; then
     retry 3 5 bash -c "curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
       | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg" \
@@ -498,28 +622,39 @@ if ! caddy list-modules 2>/dev/null | grep -qE 'layer4'; then
       || die "Не удалось получить apt-репозиторий Caddy."
   fi
   retry 3 5 apt_get update -y || warn "apt-get update (caddy repo) с ошибкой — продолжаю."
-  apt-mark unhold caddy >/dev/null 2>&1 || true
-  retry 3 5 apt_get install -y caddy golang-go build-essential libcap2-bin \
-    || die "Не удалось установить caddy/golang/build-essential."
+  if have caddy; then
+    retry 3 5 apt_get install -y build-essential libcap2-bin \
+      || die "Не удалось установить build-essential/libcap2-bin."
+  else
+    apt-mark unhold caddy >/dev/null 2>&1 || true
+    retry 3 5 apt_get install -y caddy build-essential libcap2-bin \
+      || die "Не удалось установить caddy/build-essential."
+  fi
 
+  install_go_toolchain
   retry 3 10 env GOBIN=/usr/local/bin go install "github.com/caddyserver/xcaddy/cmd/xcaddy@$XCADDY_VERSION" \
     || die "Не удалось установить xcaddy."
   mkdir -p /root/build-caddy-l4
-  ( cd /root/build-caddy-l4 && retry 2 10 xcaddy build --with "github.com/mholt/caddy-l4@$CADDY_L4_VERSION" --output ./caddy ) \
+  ( cd /root/build-caddy-l4 && retry 2 10 xcaddy build "$CADDY_VERSION" \
+      --with "github.com/mholt/caddy-l4@$CADDY_L4_VERSION" --output ./caddy ) \
     || die "xcaddy build не удался."
   /root/build-caddy-l4/caddy list-modules 2>/dev/null | grep -qE 'layer4' \
     || die "В собранном бинаре нет модулей layer4."
 
-  systemctl stop caddy 2>/dev/null || true
+  if systemctl is-active --quiet caddy; then
+    systemctl stop caddy || die "Не удалось остановить Caddy перед заменой бинарника."
+    CADDY_RESTORE_NEEDED=1
+  fi
   cp -a /usr/bin/caddy "/usr/bin/caddy.stock-$(date +%F-%H%M%S)" 2>/dev/null || true
+  prune_matching_files /usr/bin 'caddy.stock-*' 3
   install -m 755 /root/build-caddy-l4/caddy /usr/bin/caddy
   setcap cap_net_bind_service=+ep /usr/bin/caddy || warn "setcap не удался — Caddy может не занять :80/:443 без root."
   apt-mark hold caddy >/dev/null 2>&1 || true
   systemctl enable caddy >/dev/null 2>&1 || true
   L4_COUNT="$(caddy list-modules 2>/dev/null | grep -c layer4 || true)"
-  ok "Кастомный Caddy собран (${L4_COUNT:-0} L4-модулей)"
+  ok "Кастомный Caddy $CADDY_VERSION собран (${L4_COUNT:-0} L4-модулей)"
 else
-  ok "Caddy c layer4 уже установлен — сборку пропускаю"
+  ok "Caddy $CADDY_VERSION + caddy-l4 $CADDY_L4_VERSION уже установлены — сборку пропускаю"
 fi
 caddy version || true
 
@@ -544,7 +679,7 @@ issue_cert() {
   else
     if systemctl is-active --quiet caddy; then
       systemctl stop caddy || die "Не удалось освободить порт 80 для ACME."
-      CADDY_STOPPED_FOR_ACME=1
+      CADDY_RESTORE_NEEDED=1
       note "Caddy временно остановлен для ACME standalone challenge."
     fi
     if ss -H -lnt 'sport = :80' 2>/dev/null | grep -q .; then
@@ -610,6 +745,7 @@ rm -f "$SELF_STEAL_TEMPLATE_TMP"
 chmod -R a=rX "$SELF_STEAL_ROOT"
 
 cp -a /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.backup-$(date +%F-%H%M%S)" 2>/dev/null || true
+prune_matching_files /etc/caddy 'Caddyfile.backup-*' 5
 cat > /etc/caddy/Caddyfile <<EOF
 {
   auto_https disable_redirects
@@ -653,7 +789,7 @@ caddy validate --config /etc/caddy/Caddyfile || die "Caddyfile невалиде�
 systemctl restart caddy || die "Не удалось перезапустить Caddy."
 sleep 1
 if systemctl is-active --quiet caddy; then
-  CADDY_STOPPED_FOR_ACME=0
+  CADDY_RESTORE_NEEDED=0
   ok "Caddy запущен: :443 L4 и локальный TLS-сайт 127.0.0.1:9443"
 else
   die "Caddy не поднялся. journalctl -u caddy -n 50"
@@ -787,18 +923,91 @@ docker exec remnanode sh -lc \
 ok "Контейнер remnanode запущен"
 
 step 10 "Проверка слушателей и маршрутизации"
+
+has_tcp_listener() {
+  ss -H -lnt "sport = :$1" 2>/dev/null | grep -q .
+}
+
+has_tcp_listener_at() {
+  local address="$1" port="$2"
+  ss -H -lnt "sport = :$port" 2>/dev/null | awk '{print $4}' | grep -Fqx "$address:$port"
+}
+
+has_udp_listener() {
+  ss -H -lnu "sport = :$1" 2>/dev/null | grep -q .
+}
+
+all_protocol_listeners_ready() {
+  has_tcp_listener 443 \
+    && has_tcp_listener_at 127.0.0.1 9443 \
+    && has_tcp_listener_at 127.0.0.1 10443 \
+    && has_tcp_listener_at 127.0.0.1 10444 \
+    && has_tcp_listener_at 127.0.0.1 10445 \
+    && has_tcp_listener "$NODE_API_PORT" \
+    && has_udp_listener 443
+}
+
+log "Жду все протокольные слушатели после получения конфигурации от панели (до 60s)..."
+listeners_ready=0
+for _ in $(seq 1 30); do
+  if all_protocol_listeners_ready; then
+    listeners_ready=1
+    break
+  fi
+  sleep 2
+done
+
 printf '   %s%sTCP listeners%s\n' "$C_B" "$C_MAG" "$C_RST"
 ss -lntup 2>/dev/null | grep -E ':443|:9443|:10443|:10444|:10445|:'"$NODE_API_PORT" | sed 's/^/     /' || true
 printf '   %s%sUDP listeners (Hysteria2)%s\n' "$C_B" "$C_MAG" "$C_RST"
-ss -lnuap 2>/dev/null | grep ':443' | sed 's/^/     /' || warn "UDP/443 не слушается — проверьте Hysteria2 inbound в панели."
+ss -lnuap 2>/dev/null | grep ':443' | sed 's/^/     /' || true
+
+if [[ "$listeners_ready" -ne 1 ]]; then
+  has_tcp_listener 443 || warn "Caddy L4 не слушает TCP/443."
+  has_tcp_listener_at 127.0.0.1 9443 || warn "Self-steal сайт не слушает 127.0.0.1:9443."
+  has_tcp_listener_at 127.0.0.1 10443 || warn "Vision inbound не слушает 127.0.0.1:10443."
+  has_tcp_listener_at 127.0.0.1 10444 || warn "XHTTP inbound не слушает 127.0.0.1:10444."
+  has_tcp_listener_at 127.0.0.1 10445 || warn "Trojan inbound не слушает 127.0.0.1:10445."
+  has_tcp_listener "$NODE_API_PORT" || warn "Node API не слушает порт $NODE_API_PORT."
+  has_udp_listener 443 || warn "Hysteria2 не слушает UDP/443."
+  docker logs remnanode --tail 120 2>&1 | sed 's/^/   /' || true
+  die "Не все inbound'ы поднялись за 60s. Проверьте назначенный Config Profile в Remnawave."
+fi
+ok "Все TCP/UDP-слушатели активны"
+
+check_tls_route() {
+  local name="$1" sni="$2" output
+  printf '   %s%s%s (%s)%s\n' "$C_B" "$C_MAG" "$name" "$sni" "$C_RST"
+  if output="$(timeout 12 openssl s_client -connect 127.0.0.1:443 -servername "$sni" \
+      -verify_hostname "$sni" -verify_return_error -brief </dev/null 2>&1)" \
+      && grep -Eq 'CONNECTION ESTABLISHED|Protocol version:' <<<"$output"; then
+    printf '%s\n' "$output" | head -8 | sed 's/^/     /'
+    return 0
+  fi
+  printf '%s\n' "$output" | head -8 | sed 's/^/     /'
+  warn "$name: TLS-маршрут для SNI $sni не прошёл проверку."
+  return 1
+}
+
+tls_failures=0
 for pair in "Vision:$VISION_SNI" "XHTTP:$XHTTP_SNI" "Trojan:$TROJAN_HOST"; do
   name="${pair%%:*}"; sni="${pair#*:}"
-  printf '   %s%s%s (%s)%s\n' "$C_B" "$C_MAG" "$name" "$sni" "$C_RST"
-  echo | timeout 8 openssl s_client -connect 127.0.0.1:443 -servername "$sni" -brief 2>&1 | head -6 | sed 's/^/     /' || true
+  check_tls_route "$name" "$sni" || tls_failures=$((tls_failures + 1))
 done
 printf '   %s%sSelf-steal target (%s)%s\n' "$C_B" "$C_MAG" "$SELF_STEAL_HOST" "$C_RST"
-echo | timeout 8 openssl s_client -connect 127.0.0.1:9443 -servername "$SELF_STEAL_HOST" -verify_return_error -brief 2>&1 \
-  | head -8 | sed 's/^/     /' || die "Локальный TLS-сайт self-steal не прошёл проверку."
+if self_steal_output="$(timeout 12 openssl s_client -connect 127.0.0.1:9443 \
+    -servername "$SELF_STEAL_HOST" -verify_hostname "$SELF_STEAL_HOST" \
+    -verify_return_error -brief </dev/null 2>&1)" \
+    && grep -Eq 'CONNECTION ESTABLISHED|Protocol version:' <<<"$self_steal_output"; then
+  printf '%s\n' "$self_steal_output" | head -8 | sed 's/^/     /'
+else
+  printf '%s\n' "$self_steal_output" | head -8 | sed 's/^/     /'
+  die "Локальный TLS-сайт self-steal не прошёл проверку."
+fi
+(( tls_failures == 0 )) || die "Не прошли TLS-проверку маршруты: $tls_failures. Установка не считается завершённой."
+ok "Все SNI/TLS-маршруты прошли проверку"
+
+prune_matching_files "$LOG_DIR" 'remnanode-setup-*.log' 10
 
 echo
 printf '%s%s╭──────────────────────────────────────────────────────────────╮%s\n' "$C_B" "$C_GRN" "$C_RST"

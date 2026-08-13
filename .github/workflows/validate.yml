@@ -14,7 +14,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install validators
         run: |
@@ -36,9 +36,11 @@ jobs:
             [.inbounds[].tag] == ["REALITY_VISION", "REALITY_XHTTP", "TROJAN", "HYSTERIA2"] and
             (.inbounds[0].listen == "127.0.0.1") and
             (.inbounds[0].port == 10443) and
+            (.inbounds[0].streamSettings.realitySettings.minClientVer == "0.0.0") and
             (.inbounds[0].streamSettings.realitySettings.target == "127.0.0.1:9443") and
             (.inbounds[1].listen == "127.0.0.1") and
             (.inbounds[1].port == 10444) and
+            (.inbounds[1].streamSettings.realitySettings.minClientVer == "0.0.0") and
             (.inbounds[2].listen == "127.0.0.1") and
             (.inbounds[2].port == 10445) and
             (.inbounds[3].listen == "0.0.0.0") and
