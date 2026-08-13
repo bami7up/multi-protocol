@@ -40,6 +40,7 @@
         "realitySettings": {
           "show": false,
           "xver": 0,
+          "minClientVer": "0.0.0", // Совместимость с Mihomo, sing-box и старыми Xray-клиентами
           "target": "127.0.0.1:9443", // Self-steal: локальный TLS-сайт Caddy, созданный установщиком
           "shortIds": [
             ""
@@ -79,6 +80,7 @@
         "realitySettings": {
           "show": false,
           "xver": 0,
+          "minClientVer": "0.0.0", // Совместимость с Mihomo, sing-box и старыми Xray-клиентами
           "target": "www.gstatic.com:443",
           "shortIds": [
             ""

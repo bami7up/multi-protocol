@@ -14,7 +14,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install validators
         run: |
@@ -29,8 +29,43 @@ jobs:
       - name: Validate JSON5 templates
         run: |
           npx --yes json5@2.2.3 -s 2 Multiselect.json > /tmp/multiselect.json
-          tail -n +2 Xray_template.json | npx --yes json5@2.2.3 -s 2 > /tmp/xray-template.json
-          jq -e . /tmp/multiselect.json /tmp/xray-template.json >/dev/null
+          npx --yes json5@2.2.3 -s 2 Xray_template.json > /tmp/xray-template.json
+          npx --yes json5@2.2.3 -s 2 Xray_template_split.json > /tmp/xray-template-split.json
+          jq -e . /tmp/multiselect.json /tmp/xray-template.json /tmp/xray-template-split.json >/dev/null
+          jq -e '
+            [.inbounds[].tag] == ["REALITY_VISION", "REALITY_XHTTP", "TROJAN", "HYSTERIA2"] and
+            (.inbounds[0].listen == "127.0.0.1") and
+            (.inbounds[0].port == 10443) and
+            (.inbounds[0].streamSettings.realitySettings.minClientVer == "0.0.0") and
+            (.inbounds[0].streamSettings.realitySettings.target == "127.0.0.1:9443") and
+            (.inbounds[1].listen == "127.0.0.1") and
+            (.inbounds[1].port == 10444) and
+            (.inbounds[1].streamSettings.realitySettings.minClientVer == "0.0.0") and
+            (.inbounds[2].listen == "127.0.0.1") and
+            (.inbounds[2].port == 10445) and
+            (.inbounds[3].listen == "0.0.0.0") and
+            (.inbounds[3].port == 443)
+          ' /tmp/multiselect.json >/dev/null
+          jq -e '
+            (.remnawave.injectHosts[0].selector.type == "tagRegex") and
+            (.remnawave.injectHosts[0].selectFrom == "HIDDEN") and
+            (.remnawave.injectHosts[0].tagPrefix == "proxy") and
+            (.dns.servers == ["94.140.14.14", "94.140.15.15"]) and
+            (.routing.balancers[0].selector == ["proxy"]) and
+            (.burstObservatory.subjectSelector == ["proxy"])
+          ' /tmp/xray-template.json >/dev/null
+          jq -e '
+            (.remnawave.injectHosts[0].selector.pattern == "^USA$") and
+            (.dns.servers == ["94.140.14.14", "94.140.15.15"]) and
+            ([.. | strings] | any(. == "geosite:category-ads-all") | not) and
+            (.routing.rules | map(select(.ruleTag == "BITTORRENT_BLOCK" and .protocol == ["bittorrent"] and .outboundTag == "block")) | length == 1) and
+            (.routing.rules | map(select(.ruleTag == "ADGUARD_DNS_PROXY" and .ip == ["94.140.14.14", "94.140.15.15"] and .port == "53" and .balancerTag == "USA")) | length == 1) and
+            (.routing.rules | map(select(.ruleTag == "SERVICE_IP_PROXY" and (.ip | length > 100) and .balancerTag == "USA")) | length == 1) and
+            (.routing.rules | map(select(.ruleTag == "RU_SPLIT_PROXY" and (.domain | length > 1200) and .balancerTag == "USA")) | length == 1) and
+            (.routing.rules[-1].ruleTag == "DEFAULT_DIRECT") and
+            (.routing.rules[-1].network == "tcp,udp") and
+            (.routing.rules[-1].outboundTag == "direct")
+          ' /tmp/xray-template-split.json >/dev/null
 
       - name: Validate facade JavaScript
         run: |
