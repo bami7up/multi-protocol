@@ -54,7 +54,8 @@ jobs:
           jq -e '
             (.remnawave.injectHosts[0].selector.pattern == "^USA$") and
             (.routing.rules | map(select(.ruleTag == "BITTORRENT_BLOCK" and .protocol == ["bittorrent"] and .outboundTag == "block")) | length == 1) and
-            (.routing.rules | map(select(.ruleTag == "RU_SPLIT_PROXY" and (.domain | length > 1000) and .balancerTag == "USA")) | length == 1) and
+            (.routing.rules | map(select(.ruleTag == "SERVICE_IP_PROXY" and (.ip | length > 100) and .balancerTag == "USA")) | length == 1) and
+            (.routing.rules | map(select(.ruleTag == "RU_SPLIT_PROXY" and (.domain | length > 1200) and .balancerTag == "USA")) | length == 1) and
             (.routing.rules[-1].ruleTag == "DEFAULT_DIRECT") and
             (.routing.rules[-1].network == "tcp,udp") and
             (.routing.rules[-1].outboundTag == "direct")
