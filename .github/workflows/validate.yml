@@ -172,3 +172,45 @@ jobs:
             || fail "tests/installer-funcs-checks.sh не прошёл"
 
           echo "✔ инварианты P2 на месте"
+
+          # Проверки находок уровня P3 (надёжность и полировка).
+
+          # 15. .env ноды принудительно приводится к 0600: перезапись через
+          #     redirection не меняет права файла, созданного старой версией.
+          grep -qF 'chmod 600 "$NODE_DIR/.env"' remnanode-setup.sh \
+            || fail ".env ноды не приводится к 0600 при повторном запуске"
+
+          # 16. Подхват переменных в .bashrc ищется фиксированной строкой (-F),
+          #     а не как regex, и записывается с кавычками.
+          grep -qF 'grep -qF "source $ENV_STORE"' remnanode-setup.sh \
+            || fail "поиск строки в .bashrc не использует фиксированные строки (-F)"
+
+          # 17. Отсутствие dig — явное предупреждение, а не ложное «нет A-записи».
+          grep -q 'dig не установлен' remnanode-setup.sh \
+            || fail "пропуск проверки DNS без dig не предупреждается явно"
+
+          # 18. Приватный адрес сервера (NAT/CGNAT) предупреждается.
+          grep -q '^is_private_ipv4() {' remnanode-setup.sh \
+            || fail "нет is_private_ipv4 для предупреждения о приватном IP сервера"
+
+          # 19. PANEL_IP, совпадающий с адресом самого сервера, предупреждается.
+          grep -qF 'совпадает с адресом самого сервера' remnanode-setup.sh \
+            || fail "совпадение PANEL_IP с адресом сервера не предупреждается"
+
+          # 20. docker compose up запускается с повторами: транзиентный сбой
+          #     dockerd не должен ронять установку.
+          grep -qF 'retry 3 10 docker compose up -d' remnanode-setup.sh \
+            || fail "docker compose up запускается без повторов"
+
+          # 21. Задание автопродления acme.sh проверяется в crontab и чинится,
+          #     иначе сертификаты протухли бы молча через ~90 дней.
+          grep -qF -- '--install-cronjob' remnanode-setup.sh \
+            || fail "отсутствующее задание автопродления в crontab не восстанавливается"
+          grep -qF 'acme.sh --cron' remnanode-setup.sh \
+            || fail "crontab с заданием автопродления не проверяется"
+
+          # 22. --no-reset-firewall описан в usage().
+          grep -qF '  --no-reset-firewall   не сбрасывать' remnanode-setup.sh \
+            || fail "--no-reset-firewall не описан в usage()"
+
+          echo "✔ инварианты P3 на месте"

@@ -34,6 +34,7 @@ remnanode-setup.sh — установка ноды Remnawave (VLESS + Hysteria2 
   --no-compose          не трогать docker-compose.yml (только .env + up -d)
   --no-firewall         не настраивать ufw
   --reset-firewall      сбросить существующие правила ufw перед настройкой
+  --no-reset-firewall   не сбрасывать ufw (значение по умолчанию; флаг для совместимости)
   --force-dns           не прерываться при несовпадении DNS
   --ssh-port N          явно указать SSH-порт для правила ufw
   --node-image REF      образ ноды (по умолчанию latest)
@@ -247,6 +248,17 @@ is_ipv6() {
     (( ${#parts[@]} == 8 )) || return 1
     [[ "$ip" != :* && "$ip" != *: ]] || return 1
   fi
+}
+
+is_private_ipv4() {
+  # Локальные, loopback, link-local и CGNAT-адреса: публичный IP, определённый
+  # как один из них, означает сервер за NAT — сравнение с DNS будет неверным.
+  local ip="$1"
+  [[ "$ip" == 10.* || "$ip" == 127.* || "$ip" == 192.168.* \
+      || "$ip" == 169.254.* || "$ip" == 0.* ]] && return 0
+  [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ]] && return 0
+  [[ "$ip" =~ ^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\. ]] && return 0
+  return 1
 }
 
 is_fqdn() {
@@ -467,6 +479,9 @@ if have curl; then
 fi
 if is_ipv4 "$SERVER_IP"; then
   ok "Публичный IPv4: $SERVER_IP"
+  if is_private_ipv4 "$SERVER_IP"; then
+    warn "Определённый адрес $SERVER_IP выглядит приватным — вероятно, сервер за NAT. Сравнение A-записей с ним будет непоказательным; сверяйте DNS вручную или продолжайте с --force-dns."
+  fi
 else
   SERVER_IP=""
   warn "Не удалось определить IP (проверка DNS будет мягкой)."
@@ -508,6 +523,9 @@ esac
 ACTIVE_SSH_PORT="${SSH_PORT_OVERRIDE:-$(detect_ssh_port)}"
 [[ "$NODE_API_PORT" != "$ACTIVE_SSH_PORT" ]] \
   || die "Node API port $NODE_API_PORT совпадает с SSH-портом; выберите другой порт ноды."
+if [[ -n "$SERVER_IP" && "$PANEL_IP" == "$SERVER_IP" ]]; then
+  warn "PANEL_IP ($PANEL_IP) совпадает с адресом самого сервера: так бывает, если панель работает на той же машине. Убедитесь, что это именно то, что нужно."
+fi
 [[ "$SELF_STEAL_HOST" != "$HY_HOST" ]] \
   || die "SELF_STEAL_HOST должен отличаться от доменов Hysteria2."
 [[ "$XHTTP_SNI" != "$SELF_STEAL_HOST" && "$XHTTP_SNI" != "$HY_HOST" ]] \
@@ -538,8 +556,10 @@ export SERVER_IP BASE_DOMAIN PREFIX VLESS_HOST HY_HOST ACME_EMAIL \
     printf 'export NODE_API_PORT=%q\n' "$NODE_API_PORT"
   } > "$ENV_STORE"
 )
-grep -q "source $ENV_STORE" /root/.bashrc 2>/dev/null \
-  || echo "[ -f $ENV_STORE ] && source $ENV_STORE" >> /root/.bashrc
+# -F: путь ищется фиксированной строкой, а не как regex (точки в пути не
+# должны совпадать с любым символом); %q корректно кавычивает записываемую строку.
+grep -qF "source $ENV_STORE" /root/.bashrc 2>/dev/null \
+  || printf '[ -f %q ] && source %q\n' "$ENV_STORE" "$ENV_STORE" >> /root/.bashrc
 ok "Переменные сохранены в $ENV_STORE (0600, подхват в .bashrc)"
 
 echo
@@ -558,26 +578,32 @@ confirm "Всё верно, продолжаем?" "y" || die "Отменено 
 step 2 "Проверка DNS и SNI"
 DNS_OK=1
 declare -A DNS_SEEN=()
-for d in "$VLESS_HOST" "$HY_HOST" "$SELF_STEAL_HOST"; do
-  [[ "${DNS_SEEN[$d]:-0}" -eq 0 ]] || continue
-  DNS_SEEN[$d]=1
-  mapfile -t resolved_a < <(dig +short "$d" A 2>/dev/null | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/' | sort -u)
-  mapfile -t resolved_aaaa < <(dig +short "$d" AAAA 2>/dev/null | awk '/:/' | sort -u)
-  resolved_a_text="$(IFS=,; printf '%s' "${resolved_a[*]:-<нет A-записи>}")"
-  resolved_aaaa_text="$(IFS=,; printf '%s' "${resolved_aaaa[*]:-}")"
-  if (( ${#resolved_a[@]} == 0 )); then
-    warn "$d -> <нет A-записи>"; DNS_OK=0
-  elif [[ -z "$SERVER_IP" ]]; then
-    note "$d -> $resolved_a_text"
-  elif (( ${#resolved_a[@]} == 1 )) && [[ "${resolved_a[0]}" == "$SERVER_IP" ]]; then
-    ok "$d -> ${resolved_a[0]}"
-  else
-    warn "$d -> $resolved_a_text (должна быть единственная A-запись $SERVER_IP)"; DNS_OK=0
-  fi
-  if (( ${#resolved_aaaa[@]} > 0 )); then
-    warn "$d имеет AAAA: $resolved_aaaa_text. Hysteria2 слушает только IPv4; удалите AAAA."; DNS_OK=0
-  fi
-done
+if ! have dig; then
+  # Раньше отсутствие dig выглядело как «нет A-записи» и путало пользователя
+  # ложным предупреждением — теперь о пропуске сообщается явно.
+  warn "dig не установлен — проверка A/AAAA-записей пропущена; при неверном DNS сам выпуск сертификата acme.sh упадёт с понятной ошибкой."
+else
+  for d in "$VLESS_HOST" "$HY_HOST" "$SELF_STEAL_HOST"; do
+    [[ "${DNS_SEEN[$d]:-0}" -eq 0 ]] || continue
+    DNS_SEEN[$d]=1
+    mapfile -t resolved_a < <(dig +short "$d" A 2>/dev/null | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/' | sort -u)
+    mapfile -t resolved_aaaa < <(dig +short "$d" AAAA 2>/dev/null | awk '/:/' | sort -u)
+    resolved_a_text="$(IFS=,; printf '%s' "${resolved_a[*]:-<нет A-записи>}")"
+    resolved_aaaa_text="$(IFS=,; printf '%s' "${resolved_aaaa[*]:-}")"
+    if (( ${#resolved_a[@]} == 0 )); then
+      warn "$d -> <нет A-записи>"; DNS_OK=0
+    elif [[ -z "$SERVER_IP" ]]; then
+      note "$d -> $resolved_a_text"
+    elif (( ${#resolved_a[@]} == 1 )) && [[ "${resolved_a[0]}" == "$SERVER_IP" ]]; then
+      ok "$d -> ${resolved_a[0]}"
+    else
+      warn "$d -> $resolved_a_text (должна быть единственная A-запись $SERVER_IP)"; DNS_OK=0
+    fi
+    if (( ${#resolved_aaaa[@]} > 0 )); then
+      warn "$d имеет AAAA: $resolved_aaaa_text. Hysteria2 слушает только IPv4; удалите AAAA."; DNS_OK=0
+    fi
+  done
+fi
 if [[ "$DNS_OK" -eq 0 && "$FORCE_DNS" -eq 0 ]]; then
   confirm "DNS не совпадает — сертификаты могут не выпуститься. Продолжить?" "n" \
     || die "Прервано из-за DNS. Поправьте A-записи или запустите с --force-dns."
@@ -769,6 +795,21 @@ ACME=/root/.acme.sh/acme.sh
 [[ -x "$ACME" ]] || die "acme.sh не найден по пути $ACME."
 "$ACME" --upgrade --auto-upgrade >/dev/null 2>&1 || true
 "$ACME" --set-default-ca --server letsencrypt >/dev/null 2>&1 || warn "Не удалось выставить CA по умолчанию."
+
+# Автопродление работает из crontab root: если задания нет (crontab чистили
+# или установка acme.sh оборвалась), сертификаты молча протухнут через ~90 дней.
+# --install-cronjob идемпотентен — добавляет запись только при её отсутствии.
+if crontab -l 2>/dev/null | grep -qF 'acme.sh --cron'; then
+  ok "Задание автопродления acme.sh есть в crontab"
+else
+  warn "В crontab нет задания автопродления acme.sh — восстанавливаю."
+  "$ACME" --install-cronjob >/dev/null 2>&1 || true
+  if crontab -l 2>/dev/null | grep -qF 'acme.sh --cron'; then
+    ok "Задание автопродления добавлено в crontab"
+  else
+    warn "Не удалось добавить задание автопродления: выполните вручную — $ACME --install-cronjob."
+  fi
+fi
 
 # Caddy занимает :80 ради HTTP->HTTPS 301, поэтому standalone challenge требует
 # временно остановить Caddy. Хуки сохраняются в конфиг сертификата acme.sh и
@@ -986,6 +1027,9 @@ SECRET_KEY=$SECRET_VALUE
 NODE_IMAGE=$NODE_IMAGE
 EOF
   )
+  # Файл от старой версии мог остаться с другими правами: перезапись через
+  # redirection права не меняет, поэтому приводим к 0600 явно.
+  chmod 600 "$NODE_DIR/.env"
   cat > "$NODE_DIR/docker-compose.yml" <<'EOF'
 services:
   remnanode:
@@ -1023,11 +1067,12 @@ else
       echo "NODE_IMAGE=$NODE_IMAGE"
     } > "$NODE_DIR/.env"
   )
+  chmod 600 "$NODE_DIR/.env"
   ok "Обновлён $NODE_DIR/.env (compose оставлен как есть)"
 fi
 
 ( cd "$NODE_DIR" && retry 3 10 docker compose pull ) || die "docker compose pull не удался."
-( cd "$NODE_DIR" && docker compose up -d --remove-orphans ) || die "docker compose up не удался."
+( cd "$NODE_DIR" && retry 3 10 docker compose up -d --remove-orphans ) || die "docker compose up не удался."
 
 log "Жду готовности ноды (до 30s)..."
 node_ready=0

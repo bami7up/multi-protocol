@@ -15,7 +15,7 @@ ok()   { printf '✔ %s\n' "$*"; }
 
 [[ -r "$SETUP" ]] || fail "не найден $SETUP"
 
-for fn in is_ipv4 is_ipv6 is_fqdn is_safe_xhttp_path acme_cert_days_left; do
+for fn in is_ipv4 is_ipv6 is_private_ipv4 is_fqdn is_safe_xhttp_path acme_cert_days_left; do
   sed -n "/^${fn}() {\$/,/^}\$/p" "$SETUP" > "$WORK/$fn.sh"
   grep -q "^${fn}() {" "$WORK/$fn.sh" || fail "не удалось извлечь $fn из установщика"
   grep -q '^}$' "$WORK/$fn.sh" || fail "тело $fn обрезано (нет закрывающей скобки)"
@@ -58,6 +58,27 @@ expect_invalid is_ipv6 ':::'
 expect_invalid is_ipv6 '1.2.3.4'
 expect_invalid is_ipv6 ''
 ok "is_ipv6"
+
+# --- is_private_ipv4: сервер за NAT должен быть предупреждён (P3-4) ---
+expect_valid   is_private_ipv4 '10.0.0.1'
+expect_valid   is_private_ipv4 '10.255.255.255'
+expect_valid   is_private_ipv4 '192.168.1.1'
+expect_valid   is_private_ipv4 '172.16.0.1'
+expect_valid   is_private_ipv4 '172.31.255.255'
+expect_valid   is_private_ipv4 '127.0.0.1'
+expect_valid   is_private_ipv4 '169.254.1.1'
+expect_valid   is_private_ipv4 '0.0.0.0'
+expect_valid   is_private_ipv4 '100.64.0.1'
+expect_valid   is_private_ipv4 '100.127.255.255'
+expect_invalid is_private_ipv4 '8.8.8.8'
+expect_invalid is_private_ipv4 '11.0.0.1'
+expect_invalid is_private_ipv4 '172.15.255.255'
+expect_invalid is_private_ipv4 '172.32.0.1'
+expect_invalid is_private_ipv4 '100.63.0.1'
+expect_invalid is_private_ipv4 '100.128.0.1'
+expect_invalid is_private_ipv4 '192.169.0.1'
+expect_invalid is_private_ipv4 ''
+ok "is_private_ipv4"
 
 # --- is_fqdn, включая punycode TLD (регрессия P2-8) ---
 expect_valid   is_fqdn 'example.com'
