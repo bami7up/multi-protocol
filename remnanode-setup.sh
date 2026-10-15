@@ -727,6 +727,13 @@ ask SELF_STEAL_HOST "Домен self-steal для Vision/Reality" "${SELF_STEAL_
 VISION_SNI="$SELF_STEAL_HOST"
 ask XHTTP_SNI  "Маскировочный SNI для XHTTP"          "${XHTTP_SNI:-www.gstatic.com}"
 ask XHTTP_PATH "Путь XHTTP"                           "${XHTTP_PATH:-/api/v3/sync/r1}"
+ask ENABLE_XHTTP "Включить XHTTP в selfsteal?"         "${ENABLE_XHTTP:-y}"
+if [[ "${ENABLE_XHTTP,,}" != y* ]]; then
+  warn "XHTTP в selfsteal отключён — будет использован режим только Vision (Reality)."
+  ENABLE_XHTTP=0
+else
+  ENABLE_XHTTP=1
+fi
 ask PANEL_IP   "IP панели Remnawave (IPv4 или IPv6)"  "${PANEL_IP:-}"
 ask NODE_API_PORT "Порт ноды для связи с панелью"     "${NODE_API_PORT:-2222}"
 
@@ -734,8 +741,10 @@ is_fqdn "$BASE_DOMAIN"       || die "Некорректный домен: $BASE_
 [[ "$PREFIX" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ && ${#PREFIX} -le 50 ]] \
   || die "Некорректный префикс: $PREFIX"
 is_fqdn "$SELF_STEAL_HOST"   || die "Некорректный self-steal домен: $SELF_STEAL_HOST"
-is_fqdn "$XHTTP_SNI"         || die "Некорректный XHTTP SNI: $XHTTP_SNI"
-is_safe_xhttp_path "$XHTTP_PATH" || die "Некорректный XHTTP path: $XHTTP_PATH"
+if (( ENABLE_XHTTP )); then
+  is_fqdn "$XHTTP_SNI"         || die "Некорректный XHTTP SNI: $XHTTP_SNI"
+  is_safe_xhttp_path "$XHTTP_PATH" || die "Некорректный XHTTP path: $XHTTP_PATH"
+  fi
 { is_ipv4 "$PANEL_IP" || is_ipv6 "$PANEL_IP"; } \
   || die "Некорректный IP панели: $PANEL_IP (нужен IPv4 или IPv6)"
 { [[ "$NODE_API_PORT" =~ ^[0-9]+$ ]] && (( NODE_API_PORT >= 1 && NODE_API_PORT <= 65535 )); } \
@@ -775,8 +784,10 @@ export SERVER_IP BASE_DOMAIN PREFIX VLESS_HOST HY_HOST ACME_EMAIL \
     printf 'export ACME_EMAIL=%q\n' "$ACME_EMAIL"
     printf 'export SELF_STEAL_HOST=%q\n' "$SELF_STEAL_HOST"
     printf 'export VISION_SNI=%q\n' "$VISION_SNI"
+    if (( ENABLE_XHTTP )); then
     printf 'export XHTTP_SNI=%q\n' "$XHTTP_SNI"
     printf 'export XHTTP_PATH=%q\n' "$XHTTP_PATH"
+    fi
     printf 'export PANEL_IP=%q\n' "$PANEL_IP"
     printf 'export NODE_API_PORT=%q\n' "$NODE_API_PORT"
   } > "$ENV_STORE"
@@ -793,7 +804,13 @@ kv "SERVER_IP"     "$SERVER_IP"
 kv "VLESS"         "$VLESS_HOST"
 kv "HYSTERIA2"     "$HY_HOST"
 kv "SELF_STEAL"    "$SELF_STEAL_HOST -> 127.0.0.1:9443"
-kv "XHTTP_SNI"     "$XHTTP_SNI"
+if (( ENABLE_XHTTP )); then
+  kv "XHTTP_SNI"     "$XHTTP_SNI"
+  kv "XHTTP_PATH"    "$XHTTP_PATH"
+  else
+  kv "XHTTP_SNI"     "(отключено)"
+  kv "XHTTP_PATH"    "(отключено)"
+  fi
 kv "PANEL_IP"      "$PANEL_IP"
 kv "NODE_API_PORT" "$NODE_API_PORT"
 if (( CF_MODE )); then
