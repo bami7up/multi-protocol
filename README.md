@@ -61,7 +61,7 @@ Vision использует `target: 127.0.0.1:9443`: REALITY крадёт ру�
 
 ## Требования
 
-- отдельный сервер ноды с Debian 11/12 или Ubuntu 20.04+;
+- отдельный сервер ноды с Debian 11/12 или Ubuntu 20.04+ (на более старых версиях установщик предупредит о несоответствии минимума);
 - `amd64` или `arm64`, root-доступ;
 - желательно от 1 GB RAM и 3 GB свободного места;
 - Remnawave Panel 3.x;
@@ -239,6 +239,7 @@ bash remnanode-setup.sh
 --no-compose          не заменять docker-compose.yml; обновить только .env
 --no-firewall         не настраивать ufw
 --reset-firewall      удалить существующие правила ufw
+--no-reset-firewall   не сбрасывать ufw (по умолчанию; для совместимости)
 --force-dns           продолжить при несовпадении DNS и IP ноды
 --ssh-port N          явно указать SSH-порт для UFW
 --node-image REF      образ ноды; по умолчанию latest

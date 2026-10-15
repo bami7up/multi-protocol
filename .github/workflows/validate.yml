@@ -214,3 +214,25 @@ jobs:
             || fail "--no-reset-firewall не описан в usage()"
 
           echo "✔ инварианты P3 на месте"
+
+          # Проверки находок уровня P4 (полировка).
+
+          # 23. Разбор срока действия сертификата не зависит от локали сервера:
+          #     notAfter всегда на английских месяцах.
+          grep -qF 'LC_ALL=C date -d' remnanode-setup.sh \
+            || fail "разбор notAfter зависит от локали (нет LC_ALL=C)"
+
+          # 24. usage() документирует NODE_DIR/CERT_DIR/ENV_STORE — как README.
+          grep -qF 'NODE_DIR, CERT_DIR, ENV_STORE' remnanode-setup.sh \
+            || fail "usage() не документирует NODE_DIR/CERT_DIR/ENV_STORE"
+
+          # 25. README и usage() описывают одинаковый набор флагов.
+          grep -qF -- '--no-reset-firewall   не сбрасывать' README.md \
+            || fail "README не описывает флаг --no-reset-firewall"
+
+          # 26. Минимум ОС из документации (Debian 11 / Ubuntu 20.04)
+          #     проверяется установщиком с предупреждением.
+          grep -qF 'dpkg --compare-versions' remnanode-setup.sh \
+            || fail "минимум версии ОС из документации не проверяется"
+
+          echo "✔ инварианты P4 на месте"

@@ -34,7 +34,7 @@ remnanode-setup.sh — установка ноды Remnawave (VLESS + Hysteria2 
   --no-compose          не трогать docker-compose.yml (только .env + up -d)
   --no-firewall         не настраивать ufw
   --reset-firewall      сбросить существующие правила ufw перед настройкой
-  --no-reset-firewall   не сбрасывать ufw (значение по умолчанию; флаг для совместимости)
+  --no-reset-firewall   не сбрасывать ufw (по умолчанию; для совместимости)
   --force-dns           не прерываться при несовпадении DNS
   --ssh-port N          явно указать SSH-порт для правила ufw
   --node-image REF      образ ноды (по умолчанию latest)
@@ -45,7 +45,8 @@ remnanode-setup.sh — установка ноды Remnawave (VLESS + Hysteria2 
 Переменные окружения (для --non-interactive / CI):
   BASE_DOMAIN, PREFIX, SELF_STEAL_HOST, XHTTP_SNI, XHTTP_PATH,
   PANEL_IP, NODE_API_PORT, SECRET_KEY, NODE_IMAGE, SELF_STEAL_TEMPLATE_URL,
-  XCADDY_VERSION, CADDY_VERSION, CADDY_L4_VERSION
+  XCADDY_VERSION, CADDY_VERSION, CADDY_L4_VERSION,
+  NODE_DIR, CERT_DIR, ENV_STORE
 USAGE
 }
 
@@ -423,6 +424,15 @@ case "${ID:-}" in
   debian|ubuntu) ok "ОС: ${PRETTY_NAME:-$ID}" ;;
   *) die "Поддерживаются только Debian/Ubuntu (обнаружено: ${ID:-неизвестно})." ;;
 esac
+
+# Документированный минимум — Debian 11 / Ubuntu 20.04: на более старых
+# установщик формально запустится, но пакеты и репозитории могут отказать —
+# предупреждаем вместо молчаливого отказа на середине шага.
+if [[ "${ID:-}" == debian ]] && dpkg --compare-versions "${VERSION_ID:-0}" lt 11 2>/dev/null; then
+  warn "Debian ${VERSION_ID} ниже поддерживаемого минимума (11) — некоторые шаги могут отказать."
+elif [[ "${ID:-}" == ubuntu ]] && dpkg --compare-versions "${VERSION_ID:-0}" lt 20.04 2>/dev/null; then
+  warn "Ubuntu ${VERSION_ID} ниже поддерживаемого минимума (20.04) — некоторые шаги могут отказать."
+fi
 
 ARCH="$(uname -m)"
 case "$ARCH" in
@@ -827,7 +837,7 @@ acme_cert_days_left() {
     [[ -s "$crt" ]] || continue
     end="$(openssl x509 -in "$crt" -noout -enddate 2>/dev/null | cut -d= -f2-)" || return 1
     [[ -n "$end" ]] || return 1
-    end_epoch="$(date -d "$end" +%s 2>/dev/null)" || return 1
+    end_epoch="$(LC_ALL=C date -d "$end" +%s 2>/dev/null)" || return 1
     printf '%s' $((( end_epoch - $(date +%s) ) / 86400 ))
     return 0
   done
