@@ -205,6 +205,8 @@ install_go_toolchain() {
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+# has_tty: есть ли управляющий терминал для интерактивных вопросов
+has_tty() { { : >/dev/tty; } 2>/dev/null; }
 require_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Запускать нужно от root (sudo -i)."; }
 
 is_ipv4() {
@@ -215,6 +217,28 @@ is_ipv4() {
     [[ "$octet" =~ ^[0-9]{1,3}$ ]] || return 1
     (( 10#$octet <= 255 )) || return 1
   done
+}
+
+is_ipv6() {
+  local ip="$1" part rest
+  local -a parts=()
+  [[ "$ip" == *:* ]] || return 1
+  [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]] || return 1
+  [[ "$ip" != *:::* ]] || return 1
+  # сжатие "::" допустимо только один раз
+  if [[ "$ip" == *"::"* ]]; then
+    rest="${ip#*::}"
+    [[ "$rest" != *"::"* ]] || return 1
+  fi
+  IFS=: read -r -a parts <<<"$ip"
+  (( ${#parts[@]} <= 8 )) || return 1
+  for part in "${parts[@]}"; do
+    [[ ${#part} -le 4 ]] || return 1
+  done
+  # без сжатия "::" адрес обязан состоять ровно из 8 групп
+  if [[ "$ip" != *"::"* ]]; then
+    (( ${#parts[@]} == 8 )) || return 1
+  fi
 }
 
 is_fqdn() {
@@ -257,6 +281,7 @@ ask() {
     note "(auto) $__prompt = $__default"
     return
   fi
+  has_tty || die "Нет /dev/tty для вопроса «$__prompt». Запустите с --non-interactive и переменными окружения."
   if [[ -n "$__default" ]]; then
     printf ' %s?%s %s %s[%s]%s: ' "$C_MAG$C_B" "$C_RST" "$__prompt" "$C_DIM$C_GRY" "$__default" "$C_RST" > /dev/tty
     IFS= read -r __input < /dev/tty || true
@@ -281,6 +306,7 @@ ask_secret() {
     note "(auto) $__prompt = <скрыто, символов: ${#__default}>"
     return
   fi
+  has_tty || die "Нет /dev/tty для ввода «$__prompt». Запустите с --non-interactive и переменными окружения."
   while [[ -z "$__input" ]]; do
     printf ' %s?%s %s (ввод скрыт): ' "$C_MAG$C_B" "$C_RST" "$__prompt" > /dev/tty
     IFS= read -rs __input < /dev/tty || true
@@ -442,7 +468,7 @@ ask SELF_STEAL_HOST "Домен self-steal для Vision/Reality" "${SELF_STEAL_
 VISION_SNI="$SELF_STEAL_HOST"
 ask XHTTP_SNI  "Маскировочный SNI для XHTTP"          "${XHTTP_SNI:-www.gstatic.com}"
 ask XHTTP_PATH "Путь XHTTP"                           "${XHTTP_PATH:-/api/v3/sync/r1}"
-ask PANEL_IP   "IP панели Remnawave"                  "${PANEL_IP:-}"
+ask PANEL_IP   "IP панели Remnawave (IPv4 или IPv6)"  "${PANEL_IP:-}"
 ask NODE_API_PORT "Порт ноды для связи с панелью"     "${NODE_API_PORT:-2222}"
 
 is_fqdn "$BASE_DOMAIN"       || die "Некорректный домен: $BASE_DOMAIN"
@@ -451,7 +477,8 @@ is_fqdn "$BASE_DOMAIN"       || die "Некорректный домен: $BASE_
 is_fqdn "$SELF_STEAL_HOST"   || die "Некорректный self-steal домен: $SELF_STEAL_HOST"
 is_fqdn "$XHTTP_SNI"         || die "Некорректный XHTTP SNI: $XHTTP_SNI"
 is_safe_xhttp_path "$XHTTP_PATH" || die "Некорректный XHTTP path: $XHTTP_PATH"
-is_ipv4 "$PANEL_IP"          || die "Некорректный IP панели: $PANEL_IP"
+{ is_ipv4 "$PANEL_IP" || is_ipv6 "$PANEL_IP"; } \
+  || die "Некорректный IP панели: $PANEL_IP (нужен IPv4 или IPv6)"
 { [[ "$NODE_API_PORT" =~ ^[0-9]+$ ]] && (( NODE_API_PORT >= 1 && NODE_API_PORT <= 65535 )); } \
   || die "Некорректный порт ноды: $NODE_API_PORT"
 case "$NODE_API_PORT" in
@@ -607,8 +634,20 @@ if [[ "$MANAGE_FIREWALL" -eq 1 ]]; then
   ufw allow 443/tcp           comment 'VLESS via Caddy L4'  >/dev/null
   ufw allow 443/udp           comment 'Hysteria2 QUIC'             >/dev/null
   ufw allow 80/tcp            comment 'acme.sh standalone'         >/dev/null
+  if is_ipv6 "$PANEL_IP" && [[ -f /etc/default/ufw ]] \
+      && grep -qE '^[[:space:]]*IPV6=no' /etc/default/ufw; then
+    warn "Панель задана IPv6-адресом, а в /etc/default/ufw стоит IPV6=no: правило не сработает. Поставьте IPV6=yes и выполните ufw reload."
+  fi
   ufw allow from "$PANEL_IP" to any port "$NODE_API_PORT" proto tcp comment 'Remnawave panel -> node' >/dev/null
   ufw --force enable >/dev/null || die "Не удалось включить ufw."
+  # Проверяем и активные правила, и список добавленных: правило должно связывать панель с портом ноды.
+  if ufw status 2>/dev/null | grep -F "$NODE_API_PORT" | grep -Fq "$PANEL_IP" \
+      || ufw show added 2>/dev/null | grep -F "port $NODE_API_PORT " | grep -Fq "$PANEL_IP"; then
+    ok "Правило «панель $PANEL_IP → Node API $NODE_API_PORT» есть в ufw"
+  else
+    ufw status numbered 2>/dev/null | sed 's/^/   /' || true
+    die "В ufw нет правила для $PANEL_IP: Node API остался бы открытым. Проверьте IP панели."
+  fi
   ok "ufw включён. API-порт $NODE_API_PORT доступен только с $PANEL_IP."
   ufw status numbered | sed 's/^/   /' || true
 else
@@ -675,8 +714,15 @@ caddy version || true
 
 step 6 "Сертификаты acme.sh (self-steal + Hysteria2)"
 if ss -lntup 2>/dev/null | grep -q ':80 '; then
-  warn "Порт 80 занят — acme.sh standalone может не выпустить сертификаты:"
-  ss -lntup 2>/dev/null | grep ':80 ' | sed 's/^/   /' || true
+  port80_other="$(ss -lntup 2>/dev/null | grep ':80 ' | grep -v caddy || true)"
+  if [[ -z "$port80_other" ]]; then
+    note "Порт 80 слушает Caddy: на время ACME standalone challenge он будет остановлен."
+  else
+    warn "Порт 80 занят посторонним процессом — acme.sh standalone может не выпустить сертификаты:"
+    printf '%s\n' "$port80_other" | sed 's/^/   /'
+  fi
+else
+  note "Порт 80 свободен — challenge пройдёт без остановки Caddy."
 fi
 if [[ ! -x /root/.acme.sh/acme.sh ]]; then
   retry 3 10 bash -c "curl -fsSL https://get.acme.sh | sh -s email='$ACME_EMAIL'" \
@@ -789,7 +835,9 @@ http://$SELF_STEAL_HOST {
 
 https://$SELF_STEAL_HOST:9443 {
   bind 127.0.0.1
-  tls $CERT_DIR/$SELF_STEAL_HOST/fullchain.pem $CERT_DIR/$SELF_STEAL_HOST/key.pem
+  tls $CERT_DIR/$SELF_STEAL_HOST/fullchain.pem $CERT_DIR/$SELF_STEAL_HOST/key.pem {
+    protocols tls1.2 tls1.3
+  }
   root * $SELF_STEAL_ROOT
   header {
     -Server
@@ -1020,6 +1068,44 @@ else
   printf '%s\n' "$self_steal_output" | head -8 | sed 's/^/     /'
   die "Локальный TLS-сайт self-steal не прошёл проверку."
 fi
+
+verify_http_layer() {
+  local tmp
+  tmp="$(mktemp)"
+  if curl -sS -o /dev/null -D "$tmp" --max-time 10 \
+      --resolve "$SELF_STEAL_HOST:80:127.0.0.1" \
+      "http://$SELF_STEAL_HOST/probe/path?probe=1" 2>/dev/null \
+      && head -1 "$tmp" | grep -q ' 301' \
+      && grep -qi "^location: https://$SELF_STEAL_HOST/probe/path?probe=1" "$tmp"; then
+    ok "Порт 80 отдаёт постоянный 301 с сохранением пути и query"
+  else
+    sed 's/^/     /' "$tmp" | head -8
+    rm -f "$tmp"
+    die "Порт 80 не отдаёт 301 на HTTPS с сохранением URI (см. вывод выше)."
+  fi
+  if curl -sS -o /dev/null -D "$tmp" --max-time 10 \
+      --resolve "$SELF_STEAL_HOST:9443:127.0.0.1" \
+      "https://$SELF_STEAL_HOST:9443/" 2>/dev/null \
+      && grep -qi '^strict-transport-security: max-age=31536000' "$tmp"; then
+    ok "Локальный TLS-сайт: сертификат валиден и отдаёт HSTS max-age=31536000"
+  else
+    sed 's/^/     /' "$tmp" | head -8
+    rm -f "$tmp"
+    die "Self-steal сайт не отдал HSTS или сертификат не прошёл проверку."
+  fi
+  rm -f "$tmp"
+  local tls_ver
+  for tls_ver in tls1_2 tls1_3; do
+    echo | timeout 10 openssl s_client -connect 127.0.0.1:9443 \
+      -servername "$SELF_STEAL_HOST" -"$tls_ver" -brief >/dev/null 2>&1 \
+      || die "Локальный TLS-сайт не принимает $tls_ver — проверьте tls protocols в Caddyfile."
+  done
+  ok "Локальный TLS-сайт принимает TLS 1.2 и TLS 1.3"
+}
+
+printf '   %s%sHTTP-слой: :80 и локальный TLS-сайт%s\n' "$C_B" "$C_MAG" "$C_RST"
+verify_http_layer
+
 (( tls_failures == 0 )) || die "Не прошли TLS-проверку маршруты: $tls_failures. Установка не считается завершённой."
 ok "Все SNI/TLS-маршруты прошли проверку"
 
@@ -1036,6 +1122,7 @@ kv "Vision/Reality" "SNI $SELF_STEAL_HOST  →  127.0.0.1:10443  (target: 127.0.
 kv "XHTTP"          "SNI $XHTTP_SNI  path $XHTTP_PATH  →  127.0.0.1:10444"
 kv "Hysteria2"      "UDP/443 напрямую  (cert $CERT_DIR/$HY_HOST)"
 kv "HTTP 301"       "TCP/80  →  https://$SELF_STEAL_HOST  (путь и query сохраняются)"
+kv "TLS"            "1.2/1.3 + HSTS max-age=31536000 на self-steal сайте"
 kv "Node API"       "$SERVER_IP:$NODE_API_PORT  (только с панели $PANEL_IP)"
 kv "Образ ноды"     "$NODE_IMAGE"
 echo
