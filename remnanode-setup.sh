@@ -235,9 +235,17 @@ is_ipv6() {
   for part in "${parts[@]}"; do
     [[ ${#part} -le 4 ]] || return 1
   done
-  # без сжатия "::" адрес обязан состоять ровно из 8 групп
-  if [[ "$ip" != *"::"* ]]; then
+  if [[ "$ip" == *"::"* ]]; then
+    # Одинарный ":" не может ни начинать, ни заканчивать адрес: единственное
+    # допустимое сжатие — "::" (сам адрес "::" проходит обе проверки).
+    [[ "$ip" == ::* || "$ip" != :* ]] || return 1
+    [[ "$ip" == *:: || "$ip" != *: ]] || return 1
+  else
+    # Без сжатия "::" адрес обязан состоять ровно из 8 групп и не начинаться
+    # либо заканчиваться двоеточием — иначе «висячие» одинарные двоеточия
+    # (":1:2:3:4:5:6:7" и "1:2:3:4:5:6:7:") ошибочно проходили бы валидацию.
     (( ${#parts[@]} == 8 )) || return 1
+    [[ "$ip" != :* && "$ip" != *: ]] || return 1
   fi
 }
 
@@ -251,7 +259,9 @@ is_fqdn() {
     [[ ${#label} -ge 1 && ${#label} -le 63 ]] || return 1
     [[ "$label" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]] || return 1
   done
-  [[ "${labels[-1]}" =~ ^[a-zA-Z]{2,63}$ ]]
+  # TLD — только буквами либо в punycode (xn--...): иначе домены вроде
+  # example.xn--p1ai отвергались бы как некорректные.
+  [[ "${labels[-1]}" =~ ^([a-zA-Z]{2,63}|xn--[a-zA-Z0-9-]{2,59})$ ]]
 }
 
 is_safe_xhttp_path() {
@@ -344,7 +354,16 @@ detect_ssh_port() {
 
 require_root
 
+# Один экземпляр установщика: параллельный запуск мог бы одновременно
+# переписывать Caddyfile, .env и правила ufw.
+mkdir -p /run/lock
+exec 9>/run/lock/remnanode-setup.lock
+flock -n 9 || die "Установщик уже запущен другим процессом (лок: /run/lock/remnanode-setup.lock)."
+
 mkdir -p "$LOG_DIR"
+# В логе — адреса и детали инфраструктуры, поэтому файл создаётся сразу с 0600:
+# без umask tee создал бы его читаемым для всех (umask по умолчанию 022).
+( umask 077; : > "$LOG_FILE" )
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 on_err() {
@@ -663,7 +682,21 @@ caddy_build_matches() {
       | grep -Fq "github.com/mholt/caddy-l4 $CADDY_L4_VERSION"
 }
 
+# Ранний fail-fast: если 443/tcp уже держит посторонний процесс (nginx,
+# apache…), Caddy не сможет занять порт — об этом лучше сказать до
+# многоминутной сборки, а не после неё.
+assert_port443_free() {
+  local line holder
+  have ss || return 0
+  line="$(ss -H -lntp 'sport = :443' 2>/dev/null | grep -vi caddy | head -1 || true)"
+  [[ -n "$line" ]] || return 0
+  holder="$(sed -n 's/.*users:(("\([^"]*\)".*/\1/p' <<<"$line")"
+  holder="${holder:-неизвестный процесс}"
+  die "Порт 443/tcp занят процессом «$holder»: остановите его (systemctl stop <сервис>), иначе Caddy не сможет слушать 443."
+}
+
 step 5 "Сборка Caddy с модулем layer4"
+assert_port443_free
 if ! caddy_build_matches; then
   if [[ ! -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg ]]; then
     retry 3 5 bash -c "curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
@@ -704,6 +737,10 @@ if ! caddy_build_matches; then
   install -m 755 /root/build-caddy-l4/caddy /usr/bin/caddy
   setcap cap_net_bind_service=+ep /usr/bin/caddy || warn "setcap не удался — Caddy может не занять :80/:443 без root."
   apt-mark hold caddy >/dev/null 2>&1 || true
+  # Сборка кэширует гигабайты объектов в ~/.cache/go-build; пересборка нужна
+  # редко, а диск на малых VPS ценен — чистим кэш после успешной установки.
+  go clean -cache >/dev/null 2>&1 || true
+  note "Кэш сборки Go очищен"
   systemctl enable caddy >/dev/null 2>&1 || true
   L4_COUNT="$(caddy list-modules 2>/dev/null | grep -c layer4 || true)"
   ok "Кастомный Caddy $CADDY_VERSION собран (${L4_COUNT:-0} L4-модулей)"
@@ -739,25 +776,50 @@ ACME=/root/.acme.sh/acme.sh
 ACME_PRE_HOOK='systemctl stop caddy >/dev/null 2>&1 || true'
 ACME_POST_HOOK='systemctl start caddy >/dev/null 2>&1 || true'
 
+# Сколько дней осталось у уже выпущенного сертификата acme.sh; возвращает 1,
+# если файла нет или он нечитаем. Без этой проверки повторный запуск «пропускал»
+# бы выпуск, и просроченный сертификат продолжал бы работать до ручного
+# вмешательства. ACME_HOME переопределяется в tests/installer-funcs-checks.sh.
+acme_cert_days_left() {
+  local d="$1" home="${ACME_HOME:-/root/.acme.sh}" crt end end_epoch
+  for crt in "$home/${d}_ecc/${d}.crt" "$home/${d}/${d}.crt"; do
+    [[ -s "$crt" ]] || continue
+    end="$(openssl x509 -in "$crt" -noout -enddate 2>/dev/null | cut -d= -f2-)" || return 1
+    [[ -n "$end" ]] || return 1
+    end_epoch="$(date -d "$end" +%s 2>/dev/null)" || return 1
+    printf '%s' $((( end_epoch - $(date +%s) ) / 86400 ))
+    return 0
+  done
+  return 1
+}
+
 issue_cert() {
-  local d="$1"
+  local d="$1" listed=0 days
+  local -a issue_args=(--issue --standalone -d "$d" --keylength ec-256 \
+                        --pre-hook "$ACME_PRE_HOOK" --post-hook "$ACME_POST_HOOK")
   if "$ACME" --list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$d"; then
-    ok "Сертификат для $d уже выпущен — пропускаю issue"
-  else
-    if systemctl is-active --quiet caddy; then
-      systemctl stop caddy || die "Не удалось освободить порт 80 для ACME."
-      CADDY_RESTORE_NEEDED=1
-      note "Caddy временно остановлен для ACME standalone challenge."
+    listed=1
+  fi
+  if (( listed )); then
+    if days="$(acme_cert_days_left "$d")" && (( days > 7 )); then
+      ok "Сертификат для $d уже выпущен (осталось ${days} дн.) — пропускаю issue"
+      return 0
     fi
-    if ss -H -lnt 'sport = :80' 2>/dev/null | grep -q .; then
-      ss -H -lntp 'sport = :80' 2>/dev/null | sed 's/^/   /' || true
-      die "Порт 80 занят другим процессом — ACME standalone challenge невозможен."
-    fi
-    if ! "$ACME" --issue --standalone -d "$d" --keylength ec-256 \
-        --pre-hook "$ACME_PRE_HOOK" --post-hook "$ACME_POST_HOOK"; then
-      warn "Не удалось выпустить сертификат для $d (проверьте DNS/порт 80)."
-      return 1
-    fi
+    warn "Сертификат для $d отсутствует, нечитаем или истекает менее чем через 7 дней — перевыпускаю."
+    issue_args+=(--force)
+  fi
+  if systemctl is-active --quiet caddy; then
+    systemctl stop caddy || die "Не удалось освободить порт 80 для ACME."
+    CADDY_RESTORE_NEEDED=1
+    note "Caddy временно остановлен для ACME standalone challenge."
+  fi
+  if ss -H -lnt 'sport = :80' 2>/dev/null | grep -q .; then
+    ss -H -lntp 'sport = :80' 2>/dev/null | sed 's/^/   /' || true
+    die "Порт 80 занят другим процессом — ACME standalone challenge невозможен."
+  fi
+  if ! "$ACME" "${issue_args[@]}"; then
+    warn "Не удалось выпустить сертификат для $d (проверьте DNS/порт 80)."
+    return 1
   fi
 }
 issue_cert "$SELF_STEAL_HOST" || die "Без сертификата $SELF_STEAL_HOST настоящий self-steal невозможен."
@@ -983,9 +1045,18 @@ else
   die "Нода не подтвердила готовность за 30s (state=${state:-?})."
 fi
 docker ps --filter name=remnanode --format 'table {{.Names}}\t{{.Status}}' | sed 's/^/   /' || true
-docker exec remnanode sh -lc \
-  'find /etc/remna-certs -type f \( -name "key.pem" -o -name "fullchain.pem" \) -printf "%M %u:%g %p\n" | sort' \
-  2>/dev/null | sed 's/^/   /' || warn "Не удалось прочитать сертификаты внутри контейнера (docker logs remnanode)."
+# В образе ноды busybox: GNU find с -printf там не работает, поэтому
+# перечисляем файлы через ls. Если сертификаты вообще не найдены (например,
+# том не смонтирован) — получаем ненулевой код и предупреждение.
+docker exec -i remnanode sh -s <<'SH' 2>/dev/null | sed 's/^/   /' \
+  || warn "Не удалось прочитать сертификаты внутри контейнера (docker logs remnanode)."
+files=$(ls -1 /etc/remna-certs/*/key.pem /etc/remna-certs/*/fullchain.pem 2>/dev/null)
+if [ -z "$files" ]; then
+  echo "сертификаты не найдены в /etc/remna-certs"
+  exit 1
+fi
+ls -l $files | sort
+SH
 ok "Контейнер remnanode запущен"
 
 step 10 "Проверка слушателей и маршрутизации"

@@ -27,6 +27,11 @@ jobs:
           shellcheck -x remnanode-setup.sh
           bash -n tests/caddy-http-checks.sh
           shellcheck -x tests/caddy-http-checks.sh
+          bash -n tests/installer-funcs-checks.sh
+          shellcheck -x tests/installer-funcs-checks.sh
+
+      - name: Unit-test installer validation functions
+        run: bash tests/installer-funcs-checks.sh
 
       - name: Validate JSON5 templates
         run: |
@@ -128,3 +133,42 @@ jobs:
             || fail "правило ufw для панели не проверяется (нет сверки ufw show added)"
 
           echo "✔ инварианты P0 на месте"
+
+          # Проверки багов среднего приоритета (P2): те же правила — регресс
+          # должен ломать CI, а не сервер.
+
+          # 8. Установочный лог содержит адреса инфраструктуры и обязан быть 0600.
+          grep -qF '( umask 077; : > "$LOG_FILE" )' remnanode-setup.sh \
+            || fail "установочный лог не создаётся с правами 0600"
+
+          # 9. Повторный запуск не «пропускает» выпуск битого/просроченного сертификата.
+          grep -q '^acme_cert_days_left() {' remnanode-setup.sh \
+            || fail "нет проверки срока действия существующего сертификата"
+          grep -qF 'issue_args+=(--force)' remnanode-setup.sh \
+            || fail "нет форс-перевыпуска невалидного сертификата"
+
+          # 10. Занятый 443/tcp диагностируется до многоминутной сборки Caddy.
+          grep -q 'Порт 443/tcp занят' remnanode-setup.sh \
+            || fail "занятый 443/tcp не диагностируется заранее"
+
+          # 11. Кэш сборки Go не остаётся на диске после xcaddy build.
+          grep -qF 'go clean -cache' remnanode-setup.sh \
+            || fail "кэш сборки Go не очищается после сборки"
+
+          # 12. Только один экземпляр установщика может работать одновременно.
+          grep -qF 'flock -n' remnanode-setup.sh || fail "нет flock от параллельного запуска"
+
+          # 13. Сертификаты внутри контейнера перечисляются busybox-совместимо:
+          #     в образе ноды нет GNU find и его -printf.
+          grep -qF 'files=$(ls -1 /etc/remna-certs' remnanode-setup.sh \
+            || fail "просмотр сертификатов в контейнере не busybox-совместим"
+          if grep -q 'find /etc/remna-certs.*-printf' remnanode-setup.sh; then
+            fail "в контейнере используется GNU find -printf, которого нет в busybox"
+          fi
+
+          # 14. Валидаторы покрыты юнит-тестом: он обязан падать на старых багах
+          #     (висячие двоеточия в is_ipv6, punycode TLD в is_fqdn).
+          bash tests/installer-funcs-checks.sh >/dev/null \
+            || fail "tests/installer-funcs-checks.sh не прошёл"
+
+          echo "✔ инварианты P2 на месте"
