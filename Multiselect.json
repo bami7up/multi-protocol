@@ -1,6 +1,3 @@
-// Это самый бомжатский конфиг, на котором все минимально работает. При необходимости можете сами все доделать как захотите.
-// #TODO я бы рекомендовал реализовать касмтомный кфг для подключения многих нод к одним инбаундам
-
 {
   "log": {
     "loglevel": "warning"
@@ -40,14 +37,14 @@
         "realitySettings": {
           "show": false,
           "xver": 0,
-          "minClientVer": "0.0.0", // Совместимость с Mihomo, sing-box и старыми Xray-клиентами
-          "target": "127.0.0.1:9443", // Self-steal: локальный TLS-сайт Caddy, созданный установщиком
+          "minClientVer": "0.0.0",
+          "target": "127.0.0.1:9443",
           "shortIds": [
             ""
           ],
           "privateKey": "",
           "serverNames": [
-            "<prefix>1.<domain>" // Тот же домен, что SELF_STEAL_HOST
+            "<prefix>1.<domain>"
           ]
         }
       }
@@ -75,12 +72,12 @@
         "security": "reality",
         "xhttpSettings": {
           "mode": "auto",
-          "path": "/api/v3/sync/r1" // Дефолт - r1 из установщика
+          "path": "/api/v3/sync/r1"
         },
         "realitySettings": {
           "show": false,
           "xver": 0,
-          "minClientVer": "0.0.0", // Совместимость с Mihomo, sing-box и старыми Xray-клиентами
+          "minClientVer": "0.0.0",
           "target": "www.gstatic.com:443",
           "shortIds": [
             ""
@@ -88,45 +85,6 @@
           "privateKey": "",
           "serverNames": [
             "www.gstatic.com"
-          ]
-        }
-      }
-    },
-    {
-      "tag": "TROJAN",
-      "port": 10445,
-      "listen": "127.0.0.1",
-      "protocol": "trojan",
-      "settings": {
-        "clients": [],
-        "fallbacks": []
-      },
-      "sniffing": {
-        "enabled": true,
-        "routeOnly": true,
-        "destOverride": [
-          "http",
-          "tls",
-          "quic"
-        ]
-      },
-      "streamSettings": {
-        "network": "raw",
-        "security": "tls",
-        "rawSettings": {
-          "acceptProxyProtocol": false
-        },
-        "tlsSettings": {
-          "alpn": [
-            "h2",
-            "http/1.1"
-          ],
-          "serverName": "<prefix>2.<domain>",
-          "certificates": [
-            {
-              "keyFile": "/etc/remna-certs/<prefix>2.<domain>/key.pem",
-              "certificateFile": "/etc/remna-certs/<prefix>2.<domain>/fullchain.pem"
-            }
           ]
         }
       }

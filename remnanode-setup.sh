@@ -11,7 +11,7 @@ SSH_PORT_OVERRIDE=""
 NODE_DIR="${NODE_DIR:-/opt/remnanode}"
 CERT_DIR="${CERT_DIR:-/etc/remna-certs}"
 ENV_STORE="${ENV_STORE:-/root/remnanode.env}"
-NODE_IMAGE="${NODE_IMAGE:-remnawave/node:3.1.1}"
+NODE_IMAGE="${NODE_IMAGE:-latest}"
 SELF_STEAL_TEMPLATE_URL="${SELF_STEAL_TEMPLATE_URL:-https://raw.githubusercontent.com/bami7up/multi-protocol/main/self-steal-site.html}"
 XCADDY_VERSION="${XCADDY_VERSION:-v0.4.5}"
 CADDY_VERSION="${CADDY_VERSION:-v2.11.4}"
@@ -25,7 +25,7 @@ LOG_FILE="${LOG_DIR}/remnanode-setup-$(date +%F-%H%M%S).log"
 
 usage() {
   cat <<'USAGE'
-remnanode-setup.sh — установка ноды Remnawave (VLESS + Trojan + Hysteria2 за Caddy L4)
+remnanode-setup.sh — установка ноды Remnawave (VLESS + Hysteria2 за Caddy L4)
 
 Использование:
   bash remnanode-setup.sh [флаги]
@@ -36,7 +36,7 @@ remnanode-setup.sh — установка ноды Remnawave (VLESS + Trojan + H
   --reset-firewall      сбросить существующие правила ufw перед настройкой
   --force-dns           не прерываться при несовпадении DNS
   --ssh-port N          явно указать SSH-порт для правила ufw
-  --node-image REF      образ ноды (по умолчанию remnawave/node:3.1.1)
+  --node-image REF      образ ноды (по умолчанию latest)
   -y | --yes            авто-подтверждение всех «y/n» вопросов
   --non-interactive     не задавать вопросы: все значения из env/дефолтов
   -h | --help           показать эту справку
@@ -110,7 +110,7 @@ banner() {
     "${D}│${R}  ${L}  ▀█▀${R}  ${T}███████╗██║  ██║   ██║   ███████╗██╔╝ ██╗${R}            ${D}│${R}" \
     "${D}│${R}  ${L}     ${R}  ${T}╚══════╝╚═╝  ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝${R}            ${D}│${R}" \
     "${D}│${R}                                                              ${D}│${R}" \
-    "${D}│${R}  ${A}REMNAWAVE NODE · VLESS · Trojan · Hysteria2 · Caddy L4${R}      ${D}│${R}" \
+    "${D}│${R}  ${A}REMNAWAVE NODE · VLESS · Hysteria2 · Caddy L4${R}      ${D}│${R}" \
     "${D}│${R}  ${S}by Latex · github.com/1atex${R}                                 ${D}│${R}" \
     "${D}╰──────────────────────────────────────────────────────────────╯${R}"
 }
@@ -271,6 +271,24 @@ ask() {
   printf -v "$__var" '%s' "$__input"
 }
 
+# ask_secret — как ask, но значение не печатается никогда: секреты не попадают
+# ни на экран, ни в установочный лог (например SECRET_KEY ноды).
+ask_secret() {
+  local __var="$1" __prompt="$2" __default="${3:-}" __input=""
+  if [[ "$NONINTERACTIVE" == 1 ]]; then
+    [[ -n "$__default" ]] || die "--non-interactive: нет значения для «$__prompt» (задайте через env)."
+    printf -v "$__var" '%s' "$__default"
+    note "(auto) $__prompt = <скрыто, символов: ${#__default}>"
+    return
+  fi
+  while [[ -z "$__input" ]]; do
+    printf ' %s?%s %s (ввод скрыт): ' "$C_MAG$C_B" "$C_RST" "$__prompt" > /dev/tty
+    IFS= read -rs __input < /dev/tty || true
+    printf '\n' > /dev/tty
+  done
+  printf -v "$__var" '%s' "$__input"
+}
+
 # confirm "вопрос" "дефолт(y/n)" -> 0 если да, 1 если нет; уважает --yes/--non-interactive
 confirm() {
   local __prompt="$1" __default="${2:-n}" __ans
@@ -412,9 +430,8 @@ fi
 ask BASE_DOMAIN "Базовый домен (напр. example.com)" "${BASE_DOMAIN:-}"
 ask PREFIX      "Префикс поддомена (напр. usa)"      "${PREFIX:-usa}"
 VLESS_HOST="${PREFIX}1.${BASE_DOMAIN}"
-TROJAN_HOST="${PREFIX}2.${BASE_DOMAIN}"
 HY_HOST="${PREFIX}3.${BASE_DOMAIN}"
-ok "Домены: $VLESS_HOST / $TROJAN_HOST / $HY_HOST"
+ok "Домены: $VLESS_HOST / $HY_HOST"
 
 ACME_EMAIL="admin@${BASE_DOMAIN}"
 ok "Email для Let's Encrypt: $ACME_EMAIL"
@@ -438,16 +455,16 @@ is_ipv4 "$PANEL_IP"          || die "Некорректный IP панели: $
 { [[ "$NODE_API_PORT" =~ ^[0-9]+$ ]] && (( NODE_API_PORT >= 1 && NODE_API_PORT <= 65535 )); } \
   || die "Некорректный порт ноды: $NODE_API_PORT"
 case "$NODE_API_PORT" in
-  80|443|9443|10443|10444|10445)
+  80|443|9443|10443|10444)
     die "Node API port $NODE_API_PORT занят этой схемой; выберите другой, например 2222."
     ;;
 esac
 ACTIVE_SSH_PORT="${SSH_PORT_OVERRIDE:-$(detect_ssh_port)}"
 [[ "$NODE_API_PORT" != "$ACTIVE_SSH_PORT" ]] \
   || die "Node API port $NODE_API_PORT совпадает с SSH-портом; выберите другой порт ноды."
-[[ "$SELF_STEAL_HOST" != "$TROJAN_HOST" && "$SELF_STEAL_HOST" != "$HY_HOST" ]] \
-  || die "SELF_STEAL_HOST должен отличаться от доменов Trojan/Hysteria2."
-[[ "$XHTTP_SNI" != "$SELF_STEAL_HOST" && "$XHTTP_SNI" != "$TROJAN_HOST" ]] \
+[[ "$SELF_STEAL_HOST" != "$HY_HOST" ]] \
+  || die "SELF_STEAL_HOST должен отличаться от доменов Hysteria2."
+[[ "$XHTTP_SNI" != "$SELF_STEAL_HOST" && "$XHTTP_SNI" != "$HY_HOST" ]] \
   || die "XHTTP_SNI конфликтует с SNI другого маршрута Caddy."
 [[ "$SELF_STEAL_TEMPLATE_URL" == https://* ]] \
   || die "SELF_STEAL_TEMPLATE_URL должен начинаться с https://"
@@ -456,7 +473,7 @@ ACTIVE_SSH_PORT="${SSH_PORT_OVERRIDE:-$(detect_ssh_port)}"
 [[ "$CADDY_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Некорректная версия Caddy: $CADDY_VERSION"
 [[ "$CADDY_L4_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Некорректная версия caddy-l4: $CADDY_L4_VERSION"
 
-export SERVER_IP BASE_DOMAIN PREFIX VLESS_HOST TROJAN_HOST HY_HOST ACME_EMAIL \
+export SERVER_IP BASE_DOMAIN PREFIX VLESS_HOST HY_HOST ACME_EMAIL \
        SELF_STEAL_HOST VISION_SNI XHTTP_SNI XHTTP_PATH PANEL_IP NODE_API_PORT
 
 ( umask 077
@@ -465,7 +482,6 @@ export SERVER_IP BASE_DOMAIN PREFIX VLESS_HOST TROJAN_HOST HY_HOST ACME_EMAIL \
     printf 'export BASE_DOMAIN=%q\n' "$BASE_DOMAIN"
     printf 'export PREFIX=%q\n' "$PREFIX"
     printf 'export VLESS_HOST=%q\n' "$VLESS_HOST"
-    printf 'export TROJAN_HOST=%q\n' "$TROJAN_HOST"
     printf 'export HY_HOST=%q\n' "$HY_HOST"
     printf 'export ACME_EMAIL=%q\n' "$ACME_EMAIL"
     printf 'export SELF_STEAL_HOST=%q\n' "$SELF_STEAL_HOST"
@@ -484,7 +500,6 @@ echo
 hr
 kv "SERVER_IP"     "$SERVER_IP"
 kv "VLESS"         "$VLESS_HOST"
-kv "TROJAN"        "$TROJAN_HOST"
 kv "HYSTERIA2"     "$HY_HOST"
 kv "SELF_STEAL"    "$SELF_STEAL_HOST -> 127.0.0.1:9443"
 kv "XHTTP_SNI"     "$XHTTP_SNI"
@@ -497,7 +512,7 @@ confirm "Всё верно, продолжаем?" "y" || die "Отменено 
 step 2 "Проверка DNS и SNI"
 DNS_OK=1
 declare -A DNS_SEEN=()
-for d in "$VLESS_HOST" "$TROJAN_HOST" "$HY_HOST" "$SELF_STEAL_HOST"; do
+for d in "$VLESS_HOST" "$HY_HOST" "$SELF_STEAL_HOST"; do
   [[ "${DNS_SEEN[$d]:-0}" -eq 0 ]] || continue
   DNS_SEEN[$d]=1
   mapfile -t resolved_a < <(dig +short "$d" A 2>/dev/null | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/' | sort -u)
@@ -589,7 +604,7 @@ if [[ "$MANAGE_FIREWALL" -eq 1 ]]; then
   ufw default allow outgoing >/dev/null
   remove_managed_ufw_rules
   ufw allow "${SSH_PORT}/tcp" comment 'SSH'                        >/dev/null
-  ufw allow 443/tcp           comment 'VLESS/Trojan via Caddy L4'  >/dev/null
+  ufw allow 443/tcp           comment 'VLESS via Caddy L4'  >/dev/null
   ufw allow 443/udp           comment 'Hysteria2 QUIC'             >/dev/null
   ufw allow 80/tcp            comment 'acme.sh standalone'         >/dev/null
   ufw allow from "$PANEL_IP" to any port "$NODE_API_PORT" proto tcp comment 'Remnawave panel -> node' >/dev/null
@@ -598,7 +613,7 @@ if [[ "$MANAGE_FIREWALL" -eq 1 ]]; then
   ufw status numbered | sed 's/^/   /' || true
 else
   step 4 "Firewall (пропущен)"
-  warn "--no-firewall: убедитесь, что 443 tcp/udp, 80/tcp открыты, а $NODE_API_PORT доступен только панели."
+  warn "--no-firewall: убедитесь, что 443 tcp/udp, 80/tcp открыты, а $NODE_API_PORT доступен только панели. Без firewall нет гарантий ограничения доступа Node API."
 fi
 
 caddy_build_matches() {
@@ -658,7 +673,7 @@ else
 fi
 caddy version || true
 
-step 6 "Сертификаты acme.sh (self-steal + Trojan + Hysteria2)"
+step 6 "Сертификаты acme.sh (self-steal + Hysteria2)"
 if ss -lntup 2>/dev/null | grep -q ':80 '; then
   warn "Порт 80 занят — acme.sh standalone может не выпустить сертификаты:"
   ss -lntup 2>/dev/null | grep ':80 ' | sed 's/^/   /' || true
@@ -671,6 +686,12 @@ ACME=/root/.acme.sh/acme.sh
 [[ -x "$ACME" ]] || die "acme.sh не найден по пути $ACME."
 "$ACME" --upgrade --auto-upgrade >/dev/null 2>&1 || true
 "$ACME" --set-default-ca --server letsencrypt >/dev/null 2>&1 || warn "Не удалось выставить CA по умолчанию."
+
+# Caddy занимает :80 ради HTTP->HTTPS 301, поэтому standalone challenge требует
+# временно остановить Caddy. Хуки сохраняются в конфиг сертификата acme.sh и
+# срабатывают при автопродлении из cron (--renew/--cron) так же, как при первой выдаче.
+ACME_PRE_HOOK='systemctl stop caddy >/dev/null 2>&1 || true'
+ACME_POST_HOOK='systemctl start caddy >/dev/null 2>&1 || true'
 
 issue_cert() {
   local d="$1"
@@ -686,27 +707,22 @@ issue_cert() {
       ss -H -lntp 'sport = :80' 2>/dev/null | sed 's/^/   /' || true
       die "Порт 80 занят другим процессом — ACME standalone challenge невозможен."
     fi
-    if ! "$ACME" --issue --standalone -d "$d" --keylength ec-256; then
+    if ! "$ACME" --issue --standalone -d "$d" --keylength ec-256 \
+        --pre-hook "$ACME_PRE_HOOK" --post-hook "$ACME_POST_HOOK"; then
       warn "Не удалось выпустить сертификат для $d (проверьте DNS/порт 80)."
       return 1
     fi
   fi
 }
 issue_cert "$SELF_STEAL_HOST" || die "Без сертификата $SELF_STEAL_HOST настоящий self-steal невозможен."
-issue_cert "$TROJAN_HOST" || die "Не удалось подготовить обязательный сертификат Trojan."
 issue_cert "$HY_HOST" || die "Не удалось подготовить обязательный сертификат Hysteria2."
 
-mkdir -p "$CERT_DIR/$SELF_STEAL_HOST" "$CERT_DIR/$TROJAN_HOST" "$CERT_DIR/$HY_HOST"
+mkdir -p "$CERT_DIR/$SELF_STEAL_HOST" "$CERT_DIR/$HY_HOST"
 "$ACME" --install-cert -d "$SELF_STEAL_HOST" --ecc \
   --key-file       "$CERT_DIR/$SELF_STEAL_HOST/key.pem" \
   --fullchain-file "$CERT_DIR/$SELF_STEAL_HOST/fullchain.pem" \
   --reloadcmd "systemctl reload caddy >/dev/null 2>&1 || true" \
   || die "Не удалось установить сертификат self-steal для $SELF_STEAL_HOST."
-"$ACME" --install-cert -d "$TROJAN_HOST" --ecc \
-  --key-file       "$CERT_DIR/$TROJAN_HOST/key.pem" \
-  --fullchain-file "$CERT_DIR/$TROJAN_HOST/fullchain.pem" \
-  --reloadcmd "docker restart remnanode >/dev/null 2>&1 || true" \
-  || die "install-cert для $TROJAN_HOST не удался."
 "$ACME" --install-cert -d "$HY_HOST" --ecc \
   --key-file       "$CERT_DIR/$HY_HOST/key.pem" \
   --fullchain-file "$CERT_DIR/$HY_HOST/fullchain.pem" \
@@ -715,7 +731,6 @@ mkdir -p "$CERT_DIR/$SELF_STEAL_HOST" "$CERT_DIR/$TROJAN_HOST" "$CERT_DIR/$HY_HO
 
 for cert_file in \
   "$CERT_DIR/$SELF_STEAL_HOST/key.pem" "$CERT_DIR/$SELF_STEAL_HOST/fullchain.pem" \
-  "$CERT_DIR/$TROJAN_HOST/key.pem" "$CERT_DIR/$TROJAN_HOST/fullchain.pem" \
   "$CERT_DIR/$HY_HOST/key.pem" "$CERT_DIR/$HY_HOST/fullchain.pem"; do
   [[ -s "$cert_file" ]] || die "Сертификат или ключ отсутствует/пуст: $cert_file"
 done
@@ -759,15 +774,17 @@ cat > /etc/caddy/Caddyfile <<EOF
       route @xhttp {
         proxy 127.0.0.1:10444
       }
-      @trojan tls sni $TROJAN_HOST
-      route @trojan {
-        proxy 127.0.0.1:10445
-      }
       route {
         proxy 127.0.0.1:9443
       }
     }
   }
+}
+
+# Постоянный 301 на HTTPS с сохранением пути и query string.
+# Домен берётся из конфигурации, а не из заголовка Host, поэтому open redirect невозможен.
+http://$SELF_STEAL_HOST {
+  redir https://$SELF_STEAL_HOST{uri} permanent
 }
 
 https://$SELF_STEAL_HOST:9443 {
@@ -780,6 +797,7 @@ https://$SELF_STEAL_HOST:9443 {
     X-Content-Type-Options nosniff
     Referrer-Policy no-referrer
     Permissions-Policy "camera=(), microphone=(), geolocation=()"
+    Strict-Transport-Security "max-age=31536000"
   }
   file_server
 }
@@ -790,7 +808,7 @@ systemctl restart caddy || die "Не удалось перезапустить C
 sleep 1
 if systemctl is-active --quiet caddy; then
   CADDY_RESTORE_NEEDED=0
-  ok "Caddy запущен: :443 L4 и локальный TLS-сайт 127.0.0.1:9443"
+  ok "Caddy запущен: :443 L4, HTTP->HTTPS 301, и локальный TLS-сайт 127.0.0.1:9443"
 else
   die "Caddy не поднялся. journalctl -u caddy -n 50"
 fi
@@ -841,7 +859,7 @@ note "Создайте ноду в панели (Nodes -> Add) с IP $SERVER_IP 
 note "Панель выдаст SECRET_KEY (публичный ключ ноды). Вставьте его целиком."
 note "Можно как чистое значение (eyJ...), так и строку 'SECRET_KEY=...'."
 echo
-ask SECRET_RAW "SECRET_KEY из панели" "${SECRET_KEY:-}"
+ask_secret SECRET_RAW "SECRET_KEY из панели" "${SECRET_KEY:-}"
 
 SECRET_VALUE="$SECRET_RAW"
 SECRET_VALUE="${SECRET_VALUE#SECRET_KEY=}"
@@ -863,7 +881,7 @@ services:
   remnanode:
     container_name: remnanode
     hostname: remnanode
-    image: ${NODE_IMAGE:-remnawave/node:3.1.1}
+    image: ${NODE_IMAGE:-latest}
     network_mode: host
     restart: always
     cap_add:
@@ -942,7 +960,6 @@ all_protocol_listeners_ready() {
     && has_tcp_listener_at 127.0.0.1 9443 \
     && has_tcp_listener_at 127.0.0.1 10443 \
     && has_tcp_listener_at 127.0.0.1 10444 \
-    && has_tcp_listener_at 127.0.0.1 10445 \
     && has_tcp_listener "$NODE_API_PORT" \
     && has_udp_listener 443
 }
@@ -958,7 +975,7 @@ for _ in $(seq 1 30); do
 done
 
 printf '   %s%sTCP listeners%s\n' "$C_B" "$C_MAG" "$C_RST"
-ss -lntup 2>/dev/null | grep -E ':443|:9443|:10443|:10444|:10445|:'"$NODE_API_PORT" | sed 's/^/     /' || true
+ss -lntup 2>/dev/null | grep -E ':443|:9443|:10443|:10444|:'"$NODE_API_PORT" | sed 's/^/     /' || true
 printf '   %s%sUDP listeners (Hysteria2)%s\n' "$C_B" "$C_MAG" "$C_RST"
 ss -lnuap 2>/dev/null | grep ':443' | sed 's/^/     /' || true
 
@@ -967,7 +984,6 @@ if [[ "$listeners_ready" -ne 1 ]]; then
   has_tcp_listener_at 127.0.0.1 9443 || warn "Self-steal сайт не слушает 127.0.0.1:9443."
   has_tcp_listener_at 127.0.0.1 10443 || warn "Vision inbound не слушает 127.0.0.1:10443."
   has_tcp_listener_at 127.0.0.1 10444 || warn "XHTTP inbound не слушает 127.0.0.1:10444."
-  has_tcp_listener_at 127.0.0.1 10445 || warn "Trojan inbound не слушает 127.0.0.1:10445."
   has_tcp_listener "$NODE_API_PORT" || warn "Node API не слушает порт $NODE_API_PORT."
   has_udp_listener 443 || warn "Hysteria2 не слушает UDP/443."
   docker logs remnanode --tail 120 2>&1 | sed 's/^/   /' || true
@@ -990,7 +1006,7 @@ check_tls_route() {
 }
 
 tls_failures=0
-for pair in "Vision:$VISION_SNI" "XHTTP:$XHTTP_SNI" "Trojan:$TROJAN_HOST"; do
+for pair in "Vision:$VISION_SNI" "XHTTP:$XHTTP_SNI"; do
   name="${pair%%:*}"; sni="${pair#*:}"
   check_tls_route "$name" "$sni" || tls_failures=$((tls_failures + 1))
 done
@@ -1018,8 +1034,8 @@ echo
 printf '   %s%sКонфигурация нод-инбаундов (сверьте в панели)%s\n' "$C_B" "$C_MAG" "$C_RST"
 kv "Vision/Reality" "SNI $SELF_STEAL_HOST  →  127.0.0.1:10443  (target: 127.0.0.1:9443)"
 kv "XHTTP"          "SNI $XHTTP_SNI  path $XHTTP_PATH  →  127.0.0.1:10444"
-kv "Trojan (TLS)"   "SNI $TROJAN_HOST  →  127.0.0.1:10445  (cert $CERT_DIR/$TROJAN_HOST)"
 kv "Hysteria2"      "UDP/443 напрямую  (cert $CERT_DIR/$HY_HOST)"
+kv "HTTP 301"       "TCP/80  →  https://$SELF_STEAL_HOST  (путь и query сохраняются)"
 kv "Node API"       "$SERVER_IP:$NODE_API_PORT  (только с панели $PANEL_IP)"
 kv "Образ ноды"     "$NODE_IMAGE"
 echo

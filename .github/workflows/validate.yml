@@ -33,7 +33,7 @@ jobs:
           npx --yes json5@2.2.3 -s 2 Xray_template_split.json > /tmp/xray-template-split.json
           jq -e . /tmp/multiselect.json /tmp/xray-template.json /tmp/xray-template-split.json >/dev/null
           jq -e '
-            [.inbounds[].tag] == ["REALITY_VISION", "REALITY_XHTTP", "TROJAN", "HYSTERIA2"] and
+            [.inbounds[].tag] == ["REALITY_VISION", "REALITY_XHTTP", "HYSTERIA2"] and
             (.inbounds[0].listen == "127.0.0.1") and
             (.inbounds[0].port == 10443) and
             (.inbounds[0].streamSettings.realitySettings.minClientVer == "0.0.0") and
@@ -41,10 +41,8 @@ jobs:
             (.inbounds[1].listen == "127.0.0.1") and
             (.inbounds[1].port == 10444) and
             (.inbounds[1].streamSettings.realitySettings.minClientVer == "0.0.0") and
-            (.inbounds[2].listen == "127.0.0.1") and
-            (.inbounds[2].port == 10445) and
-            (.inbounds[3].listen == "0.0.0.0") and
-            (.inbounds[3].port == 443)
+            (.inbounds[2].listen == "0.0.0.0") and
+            (.inbounds[2].port == 443)
           ' /tmp/multiselect.json >/dev/null
           jq -e '
             (.remnawave.injectHosts[0].selector.type == "tagRegex") and
@@ -74,3 +72,42 @@ jobs:
 
       - name: Check whitespace
         run: "! git grep -nI -E '[[:blank:]]+$' -- '*.sh' '*.json' '*.md' '*.html' '*.yml'"
+
+      - name: Guard fixed invariants
+        run: |
+          # Проверки на баги, которые уже были исправлены: пусть регресс ломает CI.
+          # Каждая проверка завершает шаг сама, потому что `! cmd` под `set -e` не прерывает скрипт.
+          set -euo pipefail
+          fail() { echo "✖ $1" >&2; exit 1; }
+          # Этот файл исключён из поиска: строки ниже сами содержат искомые литералы.
+          WF=':!.github/workflows/validate.yml'
+
+          # 1. Никаких следов удалённого Trojan TLS и его порта.
+          if git grep -nI -E '10445|Trojan|trojan' -- '*.sh' '*.json' '*.md' '*.html' "$WF"; then
+            fail "в репозитории остались следы Trojan/10445 (см. вывод выше)"
+          fi
+
+          # 2. На :80 — постоянный 301 с сохранением URI, а не respond-заглушка.
+          grep -q 'redir https://$SELF_STEAL_HOST{uri} permanent' remnanode-setup.sh \
+            || fail "на :80 нет 'redir ... permanent'"
+          if grep -q 'respond "301' remnanode-setup.sh; then
+            fail "на :80 остался respond-заглушка вместо редиректа"
+          fi
+
+          # 3. acme.sh должен освобождать :80 и поднимать Caddy обратно, в том числе при продлении.
+          grep -qF -- '--pre-hook "$ACME_PRE_HOOK"' remnanode-setup.sh || fail "acme.sh без --pre-hook"
+          grep -qF -- '--post-hook "$ACME_POST_HOOK"' remnanode-setup.sh || fail "acme.sh без --post-hook"
+
+          # 4. SECRET_KEY вводится только маскирующим ask_secret и не попадает в лог.
+          grep -q 'ask_secret SECRET_RAW' remnanode-setup.sh || fail "SECRET_KEY вводится не через ask_secret"
+          if grep -q 'ask SECRET_RAW' remnanode-setup.sh; then
+            fail "SECRET_KEY спрашивается обычным ask (значение попадёт в лог)"
+          fi
+          grep -q 'note "(auto) $__prompt = <скрыто' remnanode-setup.sh || fail "в ask_secret нет маскирования"
+
+          # 5. Ожидание слушателей не должно ссылаться на порт, который никто не открывает.
+          if grep -q 'has_tcp_listener_at 127.0.0.1 10445' remnanode-setup.sh; then
+            fail "ожидание порта 10445, который больше никто не слушает"
+          fi
+
+          echo "✔ инварианты P0 на месте"
