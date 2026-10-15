@@ -66,7 +66,7 @@ Vision использует `target: 127.0.0.1:9443`: REALITY крадёт ру�
 - желательно от 1 GB RAM и 3 GB свободного места;
 - Remnawave Panel 3.x;
 - публичный IPv4 ноды и IPv4/IPv6-адрес панели;
-- две A-записи на IP ноды (`usa1` и `usa3`) и отсутствие AAAA-записей на протокольных доменах.
+- две A-записи на IP ноды (`usa1` и `usa3`) и отсутствие AAAA-записей на протокольных доменах — либо включите режим Cloudflare, и установщик создаст записи сам (см. раздел «Cloudflare: создание поддоменов автоматически»).
 
 Пример для префикса `usa`:
 
@@ -96,6 +96,8 @@ Vision использует `target: 127.0.0.1:9443`: REALITY крадёт ру�
 |---|---|
 | `<prefix>1.<domain>` | `usa1.example.com` |
 | `<prefix>3.<domain>` | `usa3.example.com` |
+
+В режиме Cloudflare подставьте вместо этих плейсхолдеров хосты, сгенерированные установщиком (например `quiet-otter.example.com`): они печатаются в конце установки.
 
 Проверьте inbound'ы:
 
@@ -154,6 +156,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/
 | `HYSTERIA2` | `usa3.example.com` | `443` | `USA` | ON |
 
 Для первых двух хостов вручную укажите публичный порт `443`. Порты `10443–10444` локальные и не должны попадать клиентам.
+
+В режиме Cloudflare в поле **Address** подставьте сгенерированные установщиком хосты вместо `usa1`/`usa3`.
 
 В XHTTP Host укажите те же `path` и внешний SNI, что в Config Profile и установщике.
 
@@ -231,6 +235,8 @@ NODE_IMAGE=latest \
 bash remnanode-setup.sh
 ```
 
+Пример неинтерактивного запуска с автоматическими DNS-записями Cloudflare — в разделе [Cloudflare: создание поддоменов автоматически](#cloudflare-создание-поддоменов-автоматически).
+
 Без `NODE_IMAGE` используется `latest`. Установщик автоматически выберет актуальную версию образа ноды. Версия `latest` следует за upstream-релизами Remnawave Node, однако future major-ветки могут изменить API; для воспроизводимых деплоя используйте конкретный тег, например `remnawave/node:3.1.1`. Сборка маршрутизатора также воспроизводима: `Caddy v2.11.4`, `caddy-l4 v0.1.2`, `xcaddy v0.4.5` и официальный Go `1.25.1`. Архив Go проверяется по опубликованному SHA256 и ставится отдельно в `/opt/remnanode-toolchains`, не заменяя системный Go.
 
 ## Флаги
@@ -243,14 +249,74 @@ bash remnanode-setup.sh
 --force-dns           продолжить при несовпадении DNS и IP ноды
 --ssh-port N          явно указать SSH-порт для UFW
 --node-image REF      образ ноды; по умолчанию latest
+--cloudflare          создать A-записи через Cloudflare API
+--no-cloudflare       не использовать Cloudflare, даже если токен в env
 -y, --yes             подтвердить вопросы yes/no
 --non-interactive     брать значения из env и дефолтов
 -h, --help            показать справку
 ```
 
-Переменные: `BASE_DOMAIN`, `PREFIX`, `SELF_STEAL_HOST`, `XHTTP_SNI`, `XHTTP_PATH`, `PANEL_IP`, `NODE_API_PORT`, `SECRET_KEY`, `NODE_IMAGE`, `SELF_STEAL_TEMPLATE_URL`, `XCADDY_VERSION`, `CADDY_VERSION`, `CADDY_L4_VERSION`, `NODE_DIR`, `CERT_DIR`, `ENV_STORE`.
+Переменные: `BASE_DOMAIN`, `PREFIX`, `SELF_STEAL_HOST`, `XHTTP_SNI`, `XHTTP_PATH`, `PANEL_IP`, `NODE_API_PORT`, `SECRET_KEY`, `NODE_IMAGE`, `SELF_STEAL_TEMPLATE_URL`, `XCADDY_VERSION`, `CADDY_VERSION`, `CADDY_L4_VERSION`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ZONE`, `NODE_DIR`, `CERT_DIR`, `ENV_STORE`.
 
 Свой фасад можно передать через публичный HTTPS URL в `SELF_STEAL_TEMPLATE_URL`. При ошибке установщик создаст минимальную локальную страницу.
+
+## Cloudflare: создание поддоменов автоматически
+
+Вместо ручного создания A-записей установщик может создать их сам через Cloudflare API — и сразу с **осмысленными случайными именами**, не похожими друг на друга: вместо связанной нумерации `usa1`/`usa3` получаются что-то вроде `quiet-otter.example.com` и `brisk-lantern.example.com`. Имена собираются из двух словарей (прилагательное-существительное), каждое слово берётся один раз — два хоста различаются в обеих частях.
+
+### Токен
+
+Создайте API-токен, привязанный к целевой зоне (не глобальный ключ), с правами:
+
+- `Zone:Zone:Read` — поиск зоны;
+- `Zone:DNS:Edit` — создание и обновление A-записей.
+
+### Запуск
+
+```bash
+CLOUDFLARE_API_TOKEN=xxxx bash remnanode-setup.sh --cloudflare
+```
+
+- `--cloudflare` — режим обязателен: без токена установщик остановится с подсказкой; при `--non-interactive` токен передаётся только через `CLOUDFLARE_API_TOKEN`.
+- Без флага режим включается сам, если `CLOUDFLARE_API_TOKEN` уже есть в окружении. `--no-cloudflare` отключает его принудительно (например, если токен есть в env, но для этого запуска нужен ручной DNS).
+- `CLOUDFLARE_ZONE` — имя зоны, если `BASE_DOMAIN` является её поддоменом (по умолчанию равен `BASE_DOMAIN`).
+- Токен не попадает ни в лог, ни в `ps`: curl читает его из временного файла `0600` и удаляет после работы.
+
+### Поведение
+
+- Создаются или обновляются ровно две A-записи — self-steal (Vision/XHTTP) и Hysteria2 — на определённый публичный IPv4 ноды; `proxied: false` и `ttl: auto`: записи всегда **DNS only**, оранжевое облако несовместимо со схемой и API его никогда не включает.
+- Свежая генерация сначала проверяет занятость имени в зоне и не перезаписывает существующие чужие записи: имя перебирается до свободного.
+- Повторный запуск переиспользует хосты, сохранённые в `remnanode.env`, и просто обновляет записи на текущий IP — панель и сертификаты не нужно пересобирать. Запуск без токена тоже не затирает эти имена (шаблонные `usa1`/`usa3` не подставляются).
+- После создания установщик ждёт появления записей в резолвере и печатает итоговые хосты.
+- HTTP-01 через порт 80 и автопродление работают как обычно: записи DNS-only, поэтому challenge доходит до ноды.
+
+### Неинтерактивный запуск с Cloudflare
+
+Токен в этом режиме передаётся только через env — без него установщик с `--cloudflare` остановится с подсказкой. Имена хостов сгенерируются сами, поэтому `PREFIX`, `SELF_STEAL_HOST` и DNS-плейсхолдеры задавать не нужно:
+
+```bash
+CLOUDFLARE_API_TOKEN=xxxx \
+BASE_DOMAIN=example.com \
+PANEL_IP=203.0.113.10 \
+NODE_API_PORT=2222 \
+SECRET_KEY='eyJ...' \
+bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/remnanode-setup.sh) \
+  --cloudflare --non-interactive --yes
+```
+
+- если `BASE_DOMAIN` — поддомен зоны, добавьте `CLOUDFLARE_ZONE=example.com`;
+- при необходимости переопределите `SERVER_IP` (например, если нода за NAT и определить публичный адрес не удалось);
+- готовые хосты печатаются в конце установки — подставьте их в Config Profile и Hosts панели (см. ниже).
+
+### Что подставить в панели
+
+Сгенерированные хосты используются вместо `<prefix>1.<domain>` / `<prefix>3.<domain>`:
+
+- в Config Profile (`Multiselect.json`): `serverNames`, `serverName` и пути сертификатов `/etc/remna-certs/<хост>/`;
+- в Hosts (шаг 5) и виртуальном хосте (шаг 7): поле **Address**;
+- в диагностических командах и примерах README — вместо `usa1.example.com`.
+
+Остальные шаги (префикс `PREFIX`, порт 80, HTTP-01, DNS-only) не меняются; `PREFIX` в этом режиме ни на что не влияет и остаётся только для совместимости.
 
 ## Проверка после установки
 
@@ -310,6 +376,7 @@ echo | openssl s_client \
 | BBR не активен | поддержка BBR ядром или необходимость перезагрузки |
 | Нет 301 на `:80` | сайт `http://<self-steal-домен>` в Caddyfile, порт 80 открыт в UFW, `curl` не перехвачен прокси |
 | Панель по IPv6 не проходит в Node API | `IPV6=yes` в `/etc/default/ufw`, правило `ufw status` с адресом панели |
+| Cloudflare не создаёт записи | Токен с правами `Zone:Read` + `Zone:DNS:Edit` именно на нужную зону; для поддомена задайте `CLOUDFLARE_ZONE`; в выводе установщика видно сообщение ошибки API |
 
 ## IPv6, UFW и ACME
 

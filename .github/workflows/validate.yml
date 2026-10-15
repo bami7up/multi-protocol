@@ -236,3 +236,35 @@ jobs:
             || fail "минимум версии ОС из документации не проверяется"
 
           echo "✔ инварианты P4 на месте"
+
+          # Проверки режима Cloudflare (автоматические A-записи).
+
+          # 27. Записи создаются только в режиме DNS-only: proxied=false,
+          #     иначе оранжевое облако сломает REALITY и прямой Hysteria2.
+          grep -qF '"proxied":false' remnanode-setup.sh \
+            || fail "записи Cloudflare без proxied:false (не DNS-only)"
+
+          # 28. Токен не попадает в argv curl и в лог: curl читает его
+          #     из временного файла 0600 через -K.
+          grep -qF -- '-K "$CF_CURL_CFG"' remnanode-setup.sh \
+            || fail "токен Cloudflare передаётся не через -K (виден в ps)"
+
+          # 29. Генератор случайных хостов и точка входа на месте
+          #     (генератор покрыт tests/installer-funcs-checks.sh).
+          grep -q '^cf_make_hosts() {' remnanode-setup.sh || fail "нет cf_make_hosts"
+          grep -q '^cf_setup_hosts() {' remnanode-setup.sh || fail "нет cf_setup_hosts"
+
+          # 30. Повторный запуск без токена не затирает случайные хосты,
+          #     созданные когда-то в режиме Cloudflare.
+          grep -qF 'cf_valid_saved_host "${VLESS_HOST:-}"' remnanode-setup.sh \
+            || fail "сохранённые хосты не переиспользуются при запуске без токена"
+
+          # 31. usage() и README описывают Cloudflare-режим.
+          grep -qF 'создать A-записи через Cloudflare API' remnanode-setup.sh \
+            || fail "usage() не описывает --cloudflare"
+          grep -qF 'CLOUDFLARE_API_TOKEN, CLOUDFLARE_ZONE' remnanode-setup.sh \
+            || fail "usage() не описывает переменные Cloudflare"
+          grep -qF 'Cloudflare: создание поддоменов автоматически' README.md \
+            || fail "в README нет раздела про Cloudflare"
+
+          echo "✔ инварианты Cloudflare на месте"

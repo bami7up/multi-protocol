@@ -8,6 +8,11 @@ FORCE_DNS=0
 ASSUME_YES="${ASSUME_YES:-0}"
 NONINTERACTIVE="${NONINTERACTIVE:-0}"
 SSH_PORT_OVERRIDE=""
+# Cloudflare: "" — судить по CLOUDFLARE_API_TOKEN, 1 — требовать (--cloudflare),
+# 0 — запретить (--no-cloudflare).
+CF_MODE_SETTING=""
+CF_MODE=0
+CF_CURL_CFG=""
 NODE_DIR="${NODE_DIR:-/opt/remnanode}"
 CERT_DIR="${CERT_DIR:-/etc/remna-certs}"
 ENV_STORE="${ENV_STORE:-/root/remnanode.env}"
@@ -38,6 +43,8 @@ remnanode-setup.sh — установка ноды Remnawave (VLESS + Hysteria2 
   --force-dns           не прерываться при несовпадении DNS
   --ssh-port N          явно указать SSH-порт для правила ufw
   --node-image REF      образ ноды (по умолчанию latest)
+  --cloudflare          создать A-записи через Cloudflare API
+  --no-cloudflare       не использовать Cloudflare, даже если токен в env
   -y | --yes            авто-подтверждение всех «y/n» вопросов
   --non-interactive     не задавать вопросы: все значения из env/дефолтов
   -h | --help           показать эту справку
@@ -46,6 +53,7 @@ remnanode-setup.sh — установка ноды Remnawave (VLESS + Hysteria2 
   BASE_DOMAIN, PREFIX, SELF_STEAL_HOST, XHTTP_SNI, XHTTP_PATH,
   PANEL_IP, NODE_API_PORT, SECRET_KEY, NODE_IMAGE, SELF_STEAL_TEMPLATE_URL,
   XCADDY_VERSION, CADDY_VERSION, CADDY_L4_VERSION,
+  CLOUDFLARE_API_TOKEN, CLOUDFLARE_ZONE,
   NODE_DIR, CERT_DIR, ENV_STORE
 USAGE
 }
@@ -67,11 +75,21 @@ while [[ $# -gt 0 ]]; do
       NODE_IMAGE="${2:-}"
       [[ -n "$NODE_IMAGE" ]] || { echo "--node-image требует значение" >&2; exit 2; }
       shift ;;
+    --cloudflare)    CF_MODE_SETTING=1 ;;
+    --no-cloudflare) CF_MODE_SETTING=0 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Неизвестный аргумент: $1" >&2; usage; exit 2 ;;
   esac
   shift
 done
+
+if [[ "$CF_MODE_SETTING" == 1 ]]; then
+  CF_MODE=1
+elif [[ "$CF_MODE_SETTING" == 0 ]]; then
+  CF_MODE=0
+elif [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]]; then
+  CF_MODE=1
+fi
 
 if [[ -t 1 || "${FORCE_COLOR:-0}" == 1 ]]; then
   C_RST=$'\033[0m';  C_B=$'\033[1m';   C_DIM=$'\033[2m'
@@ -282,6 +300,184 @@ is_safe_xhttp_path() {
   [[ ${#1} -le 2048 && "$1" =~ $pattern ]]
 }
 
+# ——— Cloudflare: автоматические A-записи с осмысленными случайными именами ———
+# Поддомены собираются из двух словарей как «прилагательное-существительное»:
+# в отличие от usa1/usa3 нумерация не выдаёт связь между записями, а четыре
+# разных слова делают два хоста визуально непохожими друг на друга.
+CF_HOST_ADJ=(quiet brisk amber coral golden vivid mellow crisp gentle lofty lucid nimble placid rugged serene slender sturdy tranquil azure bright clever frosty misty silken snowy sober solid sunny tidy wavy warm wild windy zesty merry prime rapid calm jolly mild)
+CF_HOST_NOUN=(otter lantern drift fern ridge cove beacon birch cinder clover dune ember falcon fjord flare forest garnet glade granite grove hazel heron iris jade jetty juniper kelp lagoon laurel lilac linen lotus maple mesa moss nectar nickel olive onyx orbit pebble pewter pine prairie quartz quarry raven reef rivet ruby sage shale shore sienna spruce stone thistle tide timber topaz valley velvet willow zenith zephyr)
+CF_API_BASE="https://api.cloudflare.com/client/v4"
+
+# Индекс [0, n) из криптографически случайных байтов (не $RANDOM).
+cf_rand_index() {
+  local n="${1:-}" raw
+  [[ "$n" =~ ^[1-9][0-9]*$ ]] || return 1
+  raw="$(od -An -N4 -tu4 </dev/urandom 2>/dev/null | tr -d '[:space:]')"
+  [[ "$raw" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' $(( raw % n ))
+}
+
+# Два непохожих хоста «прилагательное-существительное.BASE_DOMAIN»:
+# прилагательные и существительные не повторяются, поэтому хосты различаются
+# в обеих частях. В stdout — ровно две строки.
+cf_make_hosts() {
+  local base="${1:-}" a1 a2 n1 n2 guard=0
+  [[ -n "$base" ]] || return 1
+  while :; do
+    a1="$(cf_rand_index "${#CF_HOST_ADJ[@]}")" || return 1
+    a2="$(cf_rand_index "${#CF_HOST_ADJ[@]}")" || return 1
+    n1="$(cf_rand_index "${#CF_HOST_NOUN[@]}")" || return 1
+    n2="$(cf_rand_index "${#CF_HOST_NOUN[@]}")" || return 1
+    if (( a1 != a2 && n1 != n2 )); then break; fi
+    guard=$((guard + 1))
+    (( guard < 20 )) || return 1
+  done
+  printf '%s-%s.%s\n%s-%s.%s\n' \
+    "${CF_HOST_ADJ[$a1]}" "${CF_HOST_NOUN[$n1]}" "$base" \
+    "${CF_HOST_ADJ[$a2]}" "${CF_HOST_NOUN[$n2]}" "$base"
+}
+
+# Сохранённый в прошлый раз хост переиспользуем, только если он валиден и лежит
+# в текущем BASE_DOMAIN: при смене базового домена старые имена бессмысленны.
+cf_valid_saved_host() {
+  local host="${1:-}" base="${2:-}"
+  [[ -n "$host" && -n "$base" ]] || return 1
+  is_fqdn "$host" && [[ "$host" == *".$base" ]]
+}
+
+# cf_api METHOD PATH [JSON-ТЕЛО] → JSON в stdout. Токен уходит не в argv, а
+# через файл конфигурации curl (-K), поэтому его не видно в ps и в логе.
+cf_api() {
+  local method="$1" path="$2" body="${3:-}"
+  local -a args=(-sS --max-time 20 -X "$method" -K "$CF_CURL_CFG" -H "Content-Type: application/json")
+  if [[ -n "$body" ]]; then args+=(-d "$body"); fi
+  curl "${args[@]}" "$CF_API_BASE$path"
+}
+
+cf_json_success() {
+  jq -e '.success == true' >/dev/null 2>&1 <<<"$1"
+}
+cf_json_error() {
+  local msg
+  msg="$(jq -r '.errors[0].message // empty' <<<"$1" 2>/dev/null)"
+  printf '%s' "${msg:-неизвестная ошибка Cloudflare API}"
+}
+
+# cf_upsert_a ZONE_ID HOST — создать A-запись или обновить существующую на
+# текущий SERVER_IP. proxied=false обязателен: оранжевое облако ломает и
+# REALITY, и прямой Hysteria2 (см. README, Cloudflare и DNS-only записи).
+cf_upsert_a() {
+  local zone="$1" host="$2" resp id
+  local body
+  body="$(printf '{"type":"A","name":"%s","content":"%s","ttl":1,"proxied":false}' "$host" "$SERVER_IP")"
+  resp="$(cf_api GET "/zones/$zone/dns_records?type=A&name=$host")" \
+    || die "Cloudflare API недоступен при чтении записи $host (сеть/HTTP)."
+  cf_json_success "$resp" || die "Cloudflare API (чтение $host): $(cf_json_error "$resp")"
+  id="$(jq -r '.result[0].id // empty' <<<"$resp")"
+  if [[ -n "$id" ]]; then
+    resp="$(cf_api PUT "/zones/$zone/dns_records/$id" "$body")" \
+      || die "Cloudflare API недоступен при обновлении $host."
+  else
+    resp="$(cf_api POST "/zones/$zone/dns_records" "$body")" \
+      || die "Cloudflare API недоступен при создании $host."
+  fi
+  cf_json_success "$resp" || die "Cloudflare API (запись $host): $(cf_json_error "$resp")"
+  ok "Cloudflare: A-запись $host → $SERVER_IP (DNS only, proxied=off)"
+}
+
+# cf_a_exists ZONE_ID HOST → 0, если A-запись уже есть (иначе 1; die при ошибке API).
+cf_a_exists() {
+  local resp
+  resp="$(cf_api GET "/zones/$1/dns_records?type=A&name=$2")" \
+    || die "Cloudflare API недоступен при проверке $2."
+  cf_json_success "$resp" || die "Cloudflare API (проверка $2): $(cf_json_error "$resp")"
+  [[ -n "$(jq -r '.result[0].id // empty' <<<"$resp")" ]]
+}
+
+# Точка входа CF-режима: токен → зона → либо переиспользуем сохранённые хосты
+# (идемпотентный повторный запуск), либо генерируем свободные случайные —
+# и только потом создаём/обновляем обе A-записи и ждём их в DNS.
+cf_setup_hosts() {
+  have jq || die "Для режима Cloudflare нужен jq — он не установился на шаге 0."
+  have curl || die "Для режима Cloudflare нужен curl."
+  is_ipv4 "$SERVER_IP" \
+    || die "Режим Cloudflare требует публичный IPv4 (SERVER_IP) для A-записей, но он не определён. Задайте SERVER_IP через env."
+  [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]] \
+    || die "Режим Cloudflare требует токен: задайте CLOUDFLARE_API_TOKEN."
+  local zone_name="${CLOUDFLARE_ZONE:-$BASE_DOMAIN}"
+  is_fqdn "$zone_name" || die "Некорректное имя зоны Cloudflare: $zone_name"
+
+  # Токен не должен попадать ни в argv curl (видно в ps), ни в лог: он живёт
+  # во временном файле 0600, который curl читает через -K.
+  CF_CURL_CFG="$(mktemp)"
+  ( umask 077; printf 'header = "Authorization: Bearer %s"\n' "$CLOUDFLARE_API_TOKEN" > "$CF_CURL_CFG" )
+
+  local resp zone_id
+  resp="$(cf_api GET "/zones?name=${zone_name}&status=active")" \
+    || die "Cloudflare API недоступен (сеть или HTTP-ошибка)."
+  cf_json_success "$resp" || die "Cloudflare API (зоны): $(cf_json_error "$resp")"
+  zone_id="$(jq -r '.result[0].id // empty' <<<"$resp")"
+  [[ -n "$zone_id" ]] \
+    || die "Токен не видит зону $zone_name: нужны права Zone:Read и Zone:DNS:Edit; если BASE_DOMAIN — поддомен, задайте CLOUDFLARE_ZONE."
+  ok "Cloudflare: зона $zone_name найдена"
+
+  local -a cand=()
+  if cf_valid_saved_host "${VLESS_HOST:-}" "$BASE_DOMAIN" \
+      && cf_valid_saved_host "${HY_HOST:-}" "$BASE_DOMAIN"; then
+    ok "Cloudflare: переиспользую хосты из сохранённых переменных: $VLESS_HOST / $HY_HOST"
+  else
+    local tries=0 found=0
+    while (( tries < 5 )); do
+      cand=()
+      mapfile -t cand < <(cf_make_hosts "$BASE_DOMAIN")
+      # Свободность проверяем до создания: случайное имя не должно
+      # затереть чужую запись в зоне.
+      if (( ${#cand[@]} == 2 )) \
+          && ! cf_a_exists "$zone_id" "${cand[0]}" \
+          && ! cf_a_exists "$zone_id" "${cand[1]}"; then
+        VLESS_HOST="${cand[0]}"
+        HY_HOST="${cand[1]}"
+        found=1
+        break
+      fi
+      tries=$((tries + 1))
+    done
+    (( found == 1 )) \
+      || die "Не удалось подобрать свободные имена поддоменов в зоне $zone_name за 5 попыток."
+    ok "Cloudflare: сгенерированы непохожие хосты: $VLESS_HOST / $HY_HOST"
+  fi
+
+  cf_upsert_a "$zone_id" "$VLESS_HOST"
+  if [[ "$HY_HOST" != "$VLESS_HOST" ]]; then
+    cf_upsert_a "$zone_id" "$HY_HOST"
+  fi
+
+  # Записи созданы — дожидаемся, пока резолвер их увидит, чтобы шаг 2
+  # не засомневался в DNS, который мы только что настроили сами.
+  if have dig; then
+    local d i resolved=0
+    for i in $(seq 1 10); do
+      resolved=1
+      for d in "$VLESS_HOST" "$HY_HOST"; do
+        dig +short "$d" A 2>/dev/null \
+          | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/' \
+          | grep -qxF "$SERVER_IP" || resolved=0
+      done
+      if (( resolved == 1 )); then break; fi
+      sleep 3
+    done
+    if (( resolved == 1 )); then
+      ok "A-записи уже видны резолверу"
+    else
+      warn "A-записи созданы, но ещё не резолвятся — шаг проверки DNS может предупредить."
+    fi
+  fi
+
+  note "Подставьте сгенерированные хосты вместо <prefix>1.<domain> / <prefix>3.<domain> в Config Profile и Hosts панели (README, раздел Cloudflare)."
+  rm -f "$CF_CURL_CFG"
+  CF_CURL_CFG=""
+}
+
 apt_wait() {
   local -i waited=0
   while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
@@ -396,6 +592,9 @@ on_exit() {
   if [[ -n "${GO_ARCHIVE_TMP:-}" && -f "$GO_ARCHIVE_TMP" ]]; then
     rm -f -- "$GO_ARCHIVE_TMP"
   fi
+  if [[ -n "${CF_CURL_CFG:-}" && -f "$CF_CURL_CFG" ]]; then
+    rm -f -- "$CF_CURL_CFG"
+  fi
   if [[ "${CADDY_RESTORE_NEEDED:-0}" -eq 1 ]]; then
     if systemctl start caddy >/dev/null 2>&1; then
       CADDY_RESTORE_NEEDED=0
@@ -468,7 +667,7 @@ fi
 
 log "Устанавливаю базовые утилиты (curl, ca-certificates, dnsutils)"
 retry 3 5 apt_get update -y || warn "apt-get update завершился с ошибкой — продолжаю с текущими списками."
-retry 3 5 apt_get install -y curl ca-certificates dnsutils \
+retry 3 5 apt_get install -y curl ca-certificates dnsutils jq \
   || warn "Не удалось установить базовые утилиты — некоторые проверки будут ограничены."
 
 step 1 "Переменные окружения"
@@ -499,8 +698,24 @@ fi
 
 ask BASE_DOMAIN "Базовый домен (напр. example.com)" "${BASE_DOMAIN:-}"
 ask PREFIX      "Префикс поддомена (напр. usa)"      "${PREFIX:-usa}"
-VLESS_HOST="${PREFIX}1.${BASE_DOMAIN}"
-HY_HOST="${PREFIX}3.${BASE_DOMAIN}"
+if (( CF_MODE )); then
+  if [[ -z "${CLOUDFLARE_API_TOKEN:-}" ]]; then
+    # Интерактив — ввод скрыт; при --non-interactive без env ask_secret
+    # остановится с подсказкой задать переменную.
+    ask_secret CLOUDFLARE_API_TOKEN \
+      "Cloudflare API Token (CLOUDFLARE_API_TOKEN, для создания A-записей)" ""
+  fi
+  log "Режим Cloudflare: A-записи создаст сам API (случайные непохожие хосты)"
+  cf_setup_hosts
+elif cf_valid_saved_host "${VLESS_HOST:-}" "$BASE_DOMAIN" \
+    && cf_valid_saved_host "${HY_HOST:-}" "$BASE_DOMAIN"; then
+  # Без токена повторный запуск не должен затирать случайные имена,
+  # созданные когда-то в режиме Cloudflare, — сохранённые хосты главнее.
+  ok "Хосты из сохранённых переменных: $VLESS_HOST / $HY_HOST"
+else
+  VLESS_HOST="${PREFIX}1.${BASE_DOMAIN}"
+  HY_HOST="${PREFIX}3.${BASE_DOMAIN}"
+fi
 ok "Домены: $VLESS_HOST / $HY_HOST"
 
 ACME_EMAIL="admin@${BASE_DOMAIN}"
@@ -581,6 +796,9 @@ kv "SELF_STEAL"    "$SELF_STEAL_HOST -> 127.0.0.1:9443"
 kv "XHTTP_SNI"     "$XHTTP_SNI"
 kv "PANEL_IP"      "$PANEL_IP"
 kv "NODE_API_PORT" "$NODE_API_PORT"
+if (( CF_MODE )); then
+  kv "DNS"            "Cloudflare: A-записи созданы API (DNS only, proxied=off)"
+fi
 hr
 echo
 confirm "Всё верно, продолжаем?" "y" || die "Отменено пользователем."
