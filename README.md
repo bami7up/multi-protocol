@@ -1,6 +1,6 @@
 # Multi-protocol Remnawave Node
 
-Установщик ноды Remnawave с четырьмя протоколами на одном публичном порту:
+Пошаговая инструкция по установке ноды Remnawave с четырьмя протоколами на одном публичном порту:
 
 - VLESS Reality/Vision с локальным self-steal;
 - VLESS XHTTP + Reality;
@@ -10,6 +10,24 @@
 Caddy L4 принимает `443/tcp` и распределяет соединения по SNI. На `80/tcp` Caddy отвечает постоянным 301 на HTTPS с сохранением пути и query string. Hysteria2 принимает `443/udp` напрямую. Обычный браузер на self-steal-домене получает локальный TLS-сайт в стиле закрытого файлообменника. VLESS за CDN отдельного порта не требует: клиент ходит на CDN-домен через `443/tcp`, а сам CDN — на тот же `443/tcp` ноды (см. раздел [VLESS за CDN](#vless-за-cdn-cloudflare)).
 
 > Форма входа на маскировочном сайте декоративная: данные никуда не отправляются и не сохраняются.
+
+**Порядок работы:**
+
+| Шаг | Что делаете | Где |
+|---|---|---|
+| [0](#шаг-0-требования-и-подготовка) | Требования, домены, DNS, выбор конфигурации | локально |
+| [1](#шаг-1-создайте-серверный-config-profile) | Серверный Config Profile | панель |
+| [2](#шаг-2-создайте-ноду) | Нода с `SECRET_KEY` | панель |
+| [3](#шаг-3-запустите-установщик-на-ноде) | Установщик: Docker, Caddy, сертификаты, UFW, Node | нода |
+| [4](#шаг-4-проверьте-статус-ноды) | Нода `Online` | панель |
+| [5](#шаг-5-создайте-рабочие-хосты) | Рабочие хосты (скрытые) | панель |
+| [6](#шаг-6-создайте-xray_json-шаблон) | Клиентский XRAY_JSON-шаблон | панель |
+| [7](#шаг-7-создайте-виртуальный-хост) | Видимый виртуальный хост | панель |
+| [8](#шаг-8-добавьте-inboundы-в-internal-squad) | Internal Squad | панель |
+| [9](#шаг-9-подключите-клиент) | Подписка и проверка клиента | клиент |
+| [10](#проверка-после-установки) | Итоговая проверка ноды | нода |
+
+Дополнительно, по мере необходимости: [VLESS за CDN](#vless-за-cdn-cloudflare), [темы фасада](#фасад-self-steal-темы), [split-routing](#опциональный-split-routing), [автоматические DNS-записи Cloudflare](#cloudflare-создание-поддоменов-автоматически), [неинтерактивный запуск](#неинтерактивный-запуск), [флаги](#флаги), [диагностика](#диагностика).
 
 ## Совместимость с Remnawave 3.x
 
@@ -25,30 +43,33 @@ Caddy L4 принимает `443/tcp` и распределяет соедине
 
 Оба REALITY inbound'а содержат `minClientVer: "0.0.0"`. Это сохраняет совместимость с Mihomo и другими клиентами, которые некорректно определялись новым Xray-core. Параметры `smux` и `brutal-opts` в этом профиле не используются, поэтому `remnanode-smux`, модуль `tcp-brutal` и замена штатного ядра для данной конфигурации не нужны.
 
-Полный интеграционный тест требует живой панели, DNS и публичного IP. CI репозитория проверяет Bash/ShellCheck, JSON5-шаблоны, JavaScript фасада, форматирование, а также поднимает настоящий Caddy и прогоняет HTTP-слой именно того Caddyfile, который генерирует установщик (`tests/caddy-http-checks.sh`: 301 с сохранением URI, HSTS, TLS 1.2/1.3, запрет TLS 1.0/1.1). После установки на конкретном сервере выполните [проверку](#проверка-после-установки).
+Полный интеграционный тест требует живой панели, DNS и публичного IP. CI репозитория проверяет Bash/ShellCheck, JSON5-шаблоны, JavaScript фасада, форматирование, а также поднимает настоящий Caddy и прогоняет HTTP-слой именно того Caddyfile, который генерирует установщик (`tests/caddy-http-checks.sh`: 301 с сохранением URI, HSTS, TLS 1.2/1.3, запрет TLS 1.0/1.1, маршруты CDN-хоста вплоть до gRPC по h2c). После установки на конкретном сервере выполните [проверку](#проверка-после-установки).
 
 Официальные источники:
 
 - [Установка Remnawave Node](https://docs.rw/install/remnawave-node)
 - [Config Profiles](https://docs.rw/learn-en/config-profiles)
+- [Hosts](https://docs.rw/learn-en/hosts/)
 - [XRAY_JSON и injectHosts](https://docs.rw/learn/xray-json-advanced)
 - [Образы Remnawave Node](https://github.com/remnawave/node/pkgs/container/node)
 - [Зависимость caddy-l4 v0.1.2 от Caddy v2.11.4](https://github.com/mholt/caddy-l4/blob/v0.1.2/go.mod)
 - [Официальные архивы и SHA256 Go](https://go.dev/dl/)
 
-## Какой файл куда загружать
+## Файлы репозитория и куда их загружать
 
 Это два разных типа шаблонов. Не меняйте их местами.
 
 | Файл | Куда в Remnawave 3.x | Назначение |
 |---|---|---|
-| `Multiselect.json` | **Config Profiles → Create Config Profile** | Шаблон серверной конфигурации Xray; установщик сохраняет готовую копию профиля в `$NODE_DIR/Multiselect.json` |
-| `Xray_template.json` | **Templates → XRAY_JSON** | Клиентская подписка с балансировщиком и инжектом хостов |
-| `Xray_template_split.json` | **Templates → XRAY_JSON** | Опциональный split-routing: выбранные домены через VPN, остальное напрямую |
-| `remnanode-setup.sh` | Запуск от `root` на ноде | Docker, Caddy L4, сертификаты, UFW и Node |
+| `Multiselect.json` | **Config Profiles → Create Config Profile** (шаг 1) | Шаблон серверной конфигурации Xray; установщик сохраняет готовую копию профиля в `$NODE_DIR/Multiselect.json` |
+| `Xray_template.json` | **Templates → XRAY_JSON** (шаг 6) | Клиентская подписка с балансировщиком и инжектом хостов |
+| `Xray_template_split.json` | **Templates → XRAY_JSON** (опция) | Опциональный split-routing: выбранные домены через VPN, остальное напрямую |
+| `remnanode-setup.sh` | Запуск от `root` на ноде (шаг 3) | Docker, Caddy L4, сертификаты, UFW и Node |
 | `self-steal-templates/*.html` | В панель не загружается | Темы локального сайта self-steal (`vaultdrop`, `mail`, `cloud`, `admin`, `docs`) |
 
-## Схема портов
+## Как это устроено
+
+### Схема портов
 
 | Публичный вход | SNI | Локальный получатель |
 |---|---|---|
@@ -60,6 +81,239 @@ Caddy L4 принимает `443/tcp` и распределяет соедине
 | `80/tcp` | self-steal-домен | постоянный 301 на HTTPS с сохранением пути и query |
 
 Vision использует `target: 127.0.0.1:9443`: REALITY крадёт рукопожатие у собственного TLS-сайта. XHTTP оставлен с внешним target, потому что локальный XHTTP+REALITY self-steal имеет [известную проблему в Xray-core](https://github.com/XTLS/Xray-core/issues/5923). CDN-хост занимает собственный SNI-маршрут L4 и отдельный локальный TLS-сайт `127.0.0.1:9444`, который слушает только loopback.
+
+### Маскировочный сайт
+
+На `127.0.0.1:9443` (и на `:80`) отдаётся локальная страница-фасад: по SNI, который не совпал с протокольными, сканер видит правдоподобный сайт, а не заглушку. Тема выбирается в [шаге 0](#шаг-0-требования-и-подготовка), список тем — в разделе [Фасад self-steal: темы](#фасад-self-steal-темы).
+
+## Шаг 0. Требования и подготовка
+
+### Сервер и ПО
+
+- отдельный сервер ноды с Debian 11/12 или Ubuntu 20.04+ (на более старых версиях установщик предупредит о несоответствии минимума);
+- `amd64` или `arm64`, root-доступ;
+- желательно от 1 GB RAM и 3 GB свободного места;
+- Remnawave Panel 3.x;
+- публичный IPv4 ноды и IPv4/IPv6-адрес панели.
+
+### Домены и DNS
+
+Минимум — две A-записи на IP ноды (`usa1` и `usa3`) и отсутствие AAAA-записей на протокольных доменах. Пример для префикса `usa`:
+
+| A-запись | Назначение |
+|---|---|
+| `usa1.example.com` | Reality/Vision self-steal |
+| `usa3.example.com` | Hysteria2 TLS |
+
+Если не хотите создавать записи вручную — включите [режим Cloudflare](#cloudflare-создание-поддоменов-автоматически), и установщик создаст записи сам.
+
+> [!IMPORTANT]
+> Все протокольные записи должны постоянно работать в режиме **DNS only**. Если DNS управляется через Cloudflare, оставьте для них серое облако и не включайте Proxy после выпуска сертификатов. Cloudflare завершает TLS на своей стороне, поэтому исходный TLS ClientHello не доходит до Caddy/Reality и self-steal перестаёт работать. Обычный Cloudflare Proxy также ломает прямой Hysteria2 и не проксирует UDP-трафик Hysteria2. Единственные исключения: CDN-хост из раздела [VLESS за CDN](#vless-за-cdn-cloudflare) — там оранжевое облако обязательно, — и отдельный обычный веб-домен, который не используется этими протоколами.
+
+Не создавайте AAAA-записи для этих доменов: Hysteria2 в профиле привязан к `0.0.0.0:443`, то есть только к IPv4. При наличии AAAA часть клиентов выберет IPv6 и получит нестабильное подключение. Установщик проверяет все A/AAAA-записи и предупреждает о лишних адресах.
+
+До запуска проверьте, что `80/tcp`, `443/tcp`, `443/udp` доступны из интернета. Node Port, например `2222/tcp`, должен быть доступен только с IP панели.
+
+Установщик выпускает и продлевает сертификаты через HTTP-01 в standalone-режиме. Поэтому A-записи должны вести прямо на публичный IPv4 ноды, а `80/tcp` должен быть доступен из интернета не только при первой установке, но и при автоматическом продлении. Поскольку `80/tcp` занимает Caddy, установщик передаёт acme.sh хуки `--pre-hook`/`--post-hook`, которые останавливают и поднимают Caddy вокруг challenge; acme.sh сохраняет их и применяет точно так же при автопродлении из cron. Порт 80 при этом должен быть свободен от посторонних сервисов (nginx, apache и т.п.).
+
+### Токен Cloudflare
+
+Токен нужен, если вы планируете один из двух режимов (оба не обязательны):
+
+- [автоматические DNS-записи](#cloudflare-создание-поддоменов-автоматически) для `usa1`/`usa3` — флаг `--cloudflare`;
+- [VLESS за CDN](#vless-за-cdn-cloudflare) — там токен требуется всегда: он выпускает DNS-01 сертификат CDN-хоста.
+
+Создайте API-токен, привязанный к целевой зоне (не глобальный ключ), с правами `Zone:Zone:Read` и `Zone:DNS:Edit`.
+
+### Выбор конфигурации
+
+Всё решается переменными окружения или ответами установщика; подробности — в разделах по ссылкам.
+
+| Что выбираете | Значения по умолчанию | Варианты | Подробнее |
+|---|---|---|---|
+| XHTTP в selfsteal | `ENABLE_XHTTP=y` | `y` / `n` | [неинтерактивный запуск](#неинтерактивный-запуск) |
+| VLESS за CDN | `ENABLE_CDN=n` | `n` / `y` + `CDN_TRANSPORT=ws\|xhttp\|grpc\|both\|all` | [VLESS за CDN](#vless-за-cdn-cloudflare) |
+| Авто-DNS в Cloudflare | по токену в env | `--cloudflare` / `--no-cloudflare` | [Cloudflare: создание поддоменов автоматически](#cloudflare-создание-поддоменов-автоматически) |
+| Тема фасада | `SELF_STEAL_TEMPLATE=vaultdrop` | `vaultdrop`, `mail`, `cloud`, `admin`, `docs` | [Фасад self-steal: темы](#фасад-self-steal-темы) |
+| Маршрутизация клиента | `Xray_template.json` (full-tunnel) | `Xray_template_split.json` (split-routing) | [Опциональный split-routing](#опциональный-split-routing) |
+
+## Пошаговая установка для Remnawave 3.x
+
+### Шаг 1. Создайте серверный Config Profile
+
+Установщик уже сохраняет готовый профиль в `$NODE_DIR/Multiselect.json` (по умолчанию `/opt/remnanode/Multiselect.json`): в нём подставлены реальные хосты, внешний SNI, `path` XHTTP и пути к сертификатам Hysteria2. Если XHTTP в selfsteal выключен (`ENABLE_XHTTP=n`), inbound `REALITY_XHTTP` из профиля удалён; если включён VLESS за CDN (`ENABLE_CDN=y`), добавляются CDN-инбаунды выбранных транспортов (`CDN_TRANSPORT`) — профиль всегда совпадает с Caddyfile на ноде.
+
+1. Откройте **Config Profiles → Create Config Profile**.
+2. Вставьте сохранённый установщиком файл `$NODE_DIR/Multiselect.json` (либо `Multiselect.json` из репозитория, если заполняете профиль до установки — тогда замените плейсхолдеры):
+
+| Плейсхолдер | Пример |
+|---|---|
+| `<prefix>1.<domain>` | `usa1.example.com` |
+| `<prefix>3.<domain>` | `usa3.example.com` |
+
+В режиме Cloudflare хосты генерирует сам установщик (например `quiet-otter.example.com`): они уже подставлены в сохранённый профиль и печатаются в конце установки.
+
+3. Проверьте inbound'ы:
+
+| Tag | Listen | Port | Критичное поле |
+|---|---|---:|---|
+| `REALITY_VISION` | `127.0.0.1` | `10443` | `target: 127.0.0.1:9443`, `minClientVer: "0.0.0"`, self-steal-домен в `serverNames` |
+| `REALITY_XHTTP` | `127.0.0.1` | `10444` | внешний SNI в `serverNames`, `minClientVer: "0.0.0"` |
+| `HYSTERIA2` | `0.0.0.0` | `443/udp` | сертификат Hysteria2-домена |
+
+С включённым VLESS за CDN (`ENABLE_CDN=y`) в профиле появляются ещё три (или меньше, по `CDN_TRANSPORT`) inbound'а без собственного TLS:
+
+| Tag | Listen | Port | Критичное поле |
+|---|---|---:|---|
+| `VLESS_CDN_WS` | `127.0.0.1` | `10446` | `security: none`, `wsSettings.path` совпадает с Caddy и Host'ом |
+| `VLESS_CDN_XHTTP` | `127.0.0.1` | `10447` | `security: none`, `xhttpSettings.mode: auto`, свой `path` |
+| `VLESS_CDN_GRPC` | `127.0.0.1` | `10448` | `security: none` (h2c со стороны Caddy), `grpcSettings.serviceName` |
+
+`privateKey`, `shortIds` и массивы `clients` оставьте под управлением Remnawave.
+
+### Шаг 2. Создайте ноду
+
+Откройте **Nodes → Management → +**:
+
+1. Укажите публичный IP ноды.
+2. Укажите Node Port, например `2222`.
+3. Скопируйте выданный панелью `SECRET_KEY`.
+4. Выберите Config Profile из шага 1.
+5. Активируйте все inbound'ы профиля и сохраните ноду: три при включённом XHTTP, два — при `ENABLE_XHTTP=n`; при включённом CDN активируйте и его inbound'ы (`10446–10448`).
+
+Сгенерированный панелью compose отдельно запускать не нужно: установщик создаёт совместимый compose сам. Нужны только `SECRET_KEY`, IP и Node Port.
+
+### Шаг 3. Запустите установщик на ноде
+
+Рекомендуемый вариант — сначала скачать и просмотреть:
+
+```bash
+apt-get update && apt-get install -y curl
+curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/remnanode-setup.sh -o remnanode-setup.sh
+less remnanode-setup.sh
+bash remnanode-setup.sh
+```
+
+Короткий вариант:
+
+```bash
+apt-get update && apt-get install -y curl
+bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/remnanode-setup.sh)
+```
+
+Скрипт спросит базовый домен, префикс, self-steal-домен, нужен ли XHTTP в selfsteal (при согласии — внешний SNI и путь XHTTP), добавить ли VLESS за CDN (при согласии — CDN-домен, транспорт, пути и токен Cloudflare), IP панели, Node Port и `SECRET_KEY`. SSH-порт определяется автоматически; при необходимости передайте `--ssh-port N`. Ответы сохраняются в `/root/remnanode.env`.
+
+Готовый неинтерактивный запуск (в том числе с CDN и Cloudflare) — в разделе [Неинтерактивный запуск](#неинтерактивный-запуск).
+
+### Шаг 4. Проверьте статус ноды
+
+В **Nodes → Management** нода должна стать `Online`. Если она offline, сначала проверяйте Node Port, `SECRET_KEY` и UFW — хосты и клиентский шаблон на этот статус не влияют.
+
+### Шаг 5. Создайте рабочие хосты
+
+В **Hosts** создайте по хосту для каждого inbound'а. Всем рабочим хостам задайте одинаковый тег, например `USA`, включите видимость и **Hide host**.
+
+| Inbound | Address | Публичный port | Tag | Hide host |
+|---|---|---:|---|---|
+| `REALITY_VISION` | `usa1.example.com` | `443` | `USA` | ON |
+| `REALITY_XHTTP` | `usa1.example.com` | `443` | `USA` | ON |
+| `HYSTERIA2` | `usa3.example.com` | `443` | `USA` | ON |
+
+- Для первых двух хостов вручную укажите публичный порт `443`: порты `10443–10444` локальные и не должны попадать клиентам.
+- В режиме Cloudflare в поле **Address** подставьте сгенерированные установщиком хосты вместо `usa1`/`usa3`.
+- В XHTTP Host укажите те же `path` и внешний SNI, что в Config Profile и установщике.
+- С выключенным XHTTP (`ENABLE_XHTTP=n`) создаются только два хоста — для `REALITY_VISION` и `HYSTERIA2`; лишний XHTTP-хост панели не нужен.
+- С включённым VLESS за CDN добавьте ещё по одному хосту на каждый CDN-транспорт: Inbound — `VLESS_CDN_*`, **Address** — сам CDN-домен (`CDN_HOST`), **Port** — `443`, SNI — CDN-домен, **Security layer** — `TLS`, тот же тег и **Hide host** ON (подробная таблица — в разделе [VLESS за CDN](#vless-за-cdn-cloudflare)).
+
+### Шаг 6. Создайте XRAY_JSON-шаблон
+
+Откройте **Templates → XRAY_JSON** и вставьте `Xray_template.json`.
+
+Если используете тег не `USA`, замените его в:
+
+- `routing.balancers[].tag`;
+- `remnawave.injectHosts[].selector.pattern`.
+
+`tagPrefix: "proxy"`, `routing.balancers[].selector: ["proxy"]` и `burstObservatory.subjectSelector: ["proxy"]` должны совпадать.
+
+### Шаг 7. Создайте виртуальный хост
+
+Это видимая оболочка для XRAY_JSON-шаблона:
+
+| Поле | Значение |
+|---|---|
+| Inbound | любой inbound этого профиля |
+| Address | валидный адрес, например `usa1.example.com` |
+| Port | `443` |
+| Tag | пусто |
+| Видимость | ON |
+| Hide host | **OFF** |
+| XRAY_JSON template | шаблон из шага 6 |
+
+Итого: три скрытых рабочих хоста (плюс по одному на каждый CDN-транспорт при включённом CDN) и один видимый виртуальный.
+
+### Шаг 8. Добавьте inbound'ы в Internal Squad
+
+Откройте **Internal Squads** и включите все inbound'ы, к которым привязаны рабочие и виртуальный хосты — включая CDN-инбаунды при включённом CDN. Иначе часть хостов не попадёт в подписку.
+
+### Шаг 9. Подключите клиент
+
+1. Возьмите подписку пользователя в панели и импортируйте её в клиент (v2rayNG, Hiddify, Streisand, Mihomo и т.п.).
+2. В списке хостов появятся все скрытые рабочие хосты: выбирайте любой — Reality-хосты идут напрямую, CDN-хосты через CDN; балансировщик `USA` равномерно использует все outbound'ы.
+3. Для split-routing назначьте клиенту второй шаблон (см. [Опциональный split-routing](#опциональный-split-routing)).
+
+Если хостов в подписке нет или виден только один — вернитесь к шагам [5](#шаг-5-создайте-рабочие-хосты), [7](#шаг-7-создайте-виртуальный-хост) и [8](#шаг-8-добавьте-inboundы-в-internal-squad): почти всегда причина в Hide host, теге или Internal Squad.
+
+## Проверка после установки
+
+```bash
+docker ps --filter name=remnanode
+docker logs remnanode --tail 120
+docker exec -it remnanode tail -f /var/log/xray/current
+systemctl status caddy --no-pager
+ss -lntup | grep -E ':80|:443|:9443|:9444|:10443|:10444|:10446|:10447|:10448'
+ufw status numbered
+```
+
+Проверка редиректа и HSTS:
+
+```bash
+curl -sI "http://usa1.example.com/probe/path?x=1" | head -3
+curl -s -D - -o /dev/null "https://usa1.example.com/" | grep -i strict-transport-security
+```
+
+Первая команда должна вернуть `301` и `Location: https://usa1.example.com/probe/path?x=1`, вторая — `strict-transport-security: max-age=31536000`.
+
+Проверка self-steal:
+
+```bash
+echo | openssl s_client \
+  -connect 127.0.0.1:9443 \
+  -servername usa1.example.com \
+  -verify_return_error -brief
+```
+
+Откройте `https://usa1.example.com/` в браузере. Должен появиться фасад файлообменника с валидным сертификатом.
+
+Проверка VLESS за CDN (выполняется при `ENABLE_CDN=y`):
+
+```bash
+# origin-сайт CDN должен отдавать фасад и свой сертификат
+echo | openssl s_client -connect 127.0.0.1:9444 -servername cdn.example.com -brief
+# фасад и заголовки через сам CDN
+curl -sI "https://cdn.example.com/" | head -3
+# путь WebSocket должен уходить в Xray (пока апстрим недоступен — ошибка апстрима, но не 404)
+curl -s -o /dev/null -w '%{http_code}\n' "https://cdn.example.com/api/v1/stream"
+```
+
+Ожидаемый итог:
+
+- нода `Online`;
+- `443/tcp` слушает Caddy, `443/udp` — Xray/Hysteria2;
+- `10443–10444` и CDN-инбаунды `10446–10448` слушаются только на `127.0.0.1`;
+- XRAY_JSON содержит `proxy`, `proxy-2`, `proxy-3` (и `proxy-4`… при включённом CDN);
+- `http://usa1.example.com/<любой-путь>?x=1` отдаёт `301` c `Location: https://usa1.example.com/<любой-путь>?x=1`;
+- клиент подключается, балансировщик видит три и более outbound'а (по числу скрытых хостов).
 
 ## VLESS за CDN (Cloudflare)
 
@@ -129,7 +383,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/
 
 ### Что изменить в панели
 
-Делаются после обычной установки (шаги 1–4 выше), только для CDN-режима:
+Делаются после основных шагов 1–4, только для CDN-режима:
 
 1. **Config Profile** — CDN-инбаунды `VLESS_CDN_WS` / `VLESS_CDN_XHTTP` / `VLESS_CDN_GRPC` уже входят в сохранённый установщиком профиль `$NODE_DIR/Multiselect.json` (при ручном заполнении вставьте `Multiselect.json` из репозитория). Они слушают `127.0.0.1:10446–10448` и идут **без собственного TLS** (`security: none`): публичный TLS на этой схеме терминируют CDN и Caddy, Xray наружу не смотрит.
 2. **Nodes → Management** — активируйте новые inbound'ы профиля вместе с остальными и пересохраните ноду.
@@ -161,7 +415,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/
 
 ## Фасад self-steal: темы
 
-На `127.0.0.1:9443` (и на `:80`) отдаётся локальная страница-фасад: по SNI, который не совпал с протокольными, сканер видит правдоподобный сайт, а не заглушку. В репозитории пять автономных тем — каждая без внешних запросов, шрифтов и ссылок, с инлайновым скриптом (CSP установщика разрешает только инлайновые стили и скрипты):
+Тема — это страница, которую видит обычный браузер на протокольном домене (и на CDN-хосте). В репозитории пять автономных тем — каждая без внешних запросов, шрифтов и ссылок, с инлайновым скриптом (CSP установщика разрешает только инлайновые стили и скрипты):
 
 | Тема | Что изображает |
 |---|---|
@@ -183,227 +437,6 @@ SELF_STEAL_TEMPLATE=admin bash remnanode-setup.sh --non-interactive --yes
 - `SELF_STEAL_TEMPLATE_URL` важнее темы: свой фасад можно отдать публичным HTTPS URL, и тема тогда не используется.
 - Если шаблон не удалось скачать (например, нет доступа к GitHub), установщик поставит минимальную локальную заглушку и предупредит — установка продолжится.
 - Тема не печатается в исходном коде страницы: по HTML нельзя понять, что фасад выбран установщиком.
-
-## Требования
-
-- отдельный сервер ноды с Debian 11/12 или Ubuntu 20.04+ (на более старых версиях установщик предупредит о несоответствии минимума);
-- `amd64` или `arm64`, root-доступ;
-- желательно от 1 GB RAM и 3 GB свободного места;
-- Remnawave Panel 3.x;
-- публичный IPv4 ноды и IPv4/IPv6-адрес панели;
-- две A-записи на IP ноды (`usa1` и `usa3`) и отсутствие AAAA-записей на протокольных доменах — либо включите режим Cloudflare, и установщик создаст записи сам (см. раздел «Cloudflare: создание поддоменов автоматически»).
-
-Пример для префикса `usa`:
-
-| A-запись | Назначение |
-|---|---|
-| `usa1.example.com` | Reality/Vision self-steal |
-| `usa3.example.com` | Hysteria2 TLS |
-
-> [!IMPORTANT]
-> Все протокольные записи должны постоянно работать в режиме **DNS only**. Если DNS управляется через Cloudflare, оставьте для них серое облако и не включайте Proxy после выпуска сертификатов. Cloudflare завершает TLS на своей стороне, поэтому исходный TLS ClientHello не доходит до Caddy/Reality и self-steal перестаёт работать. Обычный Cloudflare Proxy также ломает прямой Hysteria2 и не проксирует UDP-трафик Hysteria2. Единственные исключения: CDN-хост из раздела [VLESS за CDN](#vless-за-cdn-cloudflare) — там оранжевое облако обязательно, — и отдельный обычный веб-домен, который не используется этими протоколами.
-
-Не создавайте AAAA-записи для этих доменов: Hysteria2 в профиле привязан к `0.0.0.0:443`, то есть только к IPv4. При наличии AAAA часть клиентов выберет IPv6 и получит нестабильное подключение. Установщик проверяет все A/AAAA-записи и предупреждает о лишних адресах.
-
-До запуска проверьте DNS и доступность `80/tcp`, `443/tcp`, `443/udp`. Node Port, например `2222/tcp`, должен быть доступен только с IP панели.
-
-Установщик выпускает и продлевает сертификаты через HTTP-01 в standalone-режиме. Поэтому A-записи должны вести прямо на публичный IPv4 ноды, а `80/tcp` должен быть доступен из интернета не только при первой установке, но и при автоматическом продлении. Поскольку `80/tcp` занимает Caddy, установщик передаёт acme.sh хуки `--pre-hook`/`--post-hook`, которые останавливают и поднимают Caddy вокруг challenge; acme.sh сохраняет их и применяет точно так же при автопродлении из cron. Порт 80 при этом должен быть свободен от посторонних сервисов (nginx, apache и т.п.).
-
-## Пошаговая установка для Remnawave 3.x
-
-### 1. Создайте серверный Config Profile
-
-Установщик уже сохраняет готовый профиль в `$NODE_DIR/Multiselect.json` (по умолчанию `/opt/remnanode/Multiselect.json`): в нём подставлены реальные хосты, внешний SNI, `path` XHTTP и пути к сертификатам Hysteria2. Если XHTTP в selfsteal выключен (`ENABLE_XHTTP=n`), inbound `REALITY_XHTTP` из профиля удалён; если включён VLESS за CDN (`ENABLE_CDN=y`), добавляются CDN-инбаунды выбранных транспортов (`CDN_TRANSPORT`) — профиль всегда совпадает с Caddyfile на ноде.
-
-Откройте **Config Profiles → Create Config Profile** и вставьте этот файл (либо `Multiselect.json` из репозитория, если профиль заполняется вручную).
-
-В шаблоне из репозитория замените плейсхолдеры:
-
-| Плейсхолдер | Пример |
-|---|---|
-| `<prefix>1.<domain>` | `usa1.example.com` |
-| `<prefix>3.<domain>` | `usa3.example.com` |
-
-В режиме Cloudflare хосты генерирует сам установщик (например `quiet-otter.example.com`): они уже подставлены в сохранённый профиль и печатаются в конце установки.
-
-Проверьте inbound'ы:
-
-| Tag | Listen | Port | Критичное поле |
-|---|---|---:|---|
-| `REALITY_VISION` | `127.0.0.1` | `10443` | `target: 127.0.0.1:9443`, `minClientVer: "0.0.0"`, self-steal-домен в `serverNames` |
-| `REALITY_XHTTP` | `127.0.0.1` | `10444` | внешний SNI в `serverNames`, `minClientVer: "0.0.0"` |
-| `HYSTERIA2` | `0.0.0.0` | `443/udp` | сертификат Hysteria2-домена |
-
-С включённым VLESS за CDN (`ENABLE_CDN=y`) в профиле появляются ещё три (или меньше, по `CDN_TRANSPORT`) inbound'а без собственного TLS:
-
-| Tag | Listen | Port | Критичное поле |
-|---|---|---:|---|
-| `VLESS_CDN_WS` | `127.0.0.1` | `10446` | `security: none`, `wsSettings.path` совпадает с Caddy и Host'ом |
-| `VLESS_CDN_XHTTP` | `127.0.0.1` | `10447` | `security: none`, `xhttpSettings.mode: auto`, свой `path` |
-| `VLESS_CDN_GRPC` | `127.0.0.1` | `10448` | `security: none` (h2c со стороны Caddy), `grpcSettings.serviceName` |
-
-`privateKey`, `shortIds` и массивы `clients` оставьте под управлением Remnawave.
-
-### 2. Создайте ноду
-
-Откройте **Nodes → Management → +**:
-
-1. Укажите публичный IP ноды.
-2. Укажите Node Port, например `2222`.
-3. Скопируйте выданный панелью `SECRET_KEY`.
-4. Выберите Config Profile из шага 1.
-5. Активируйте все inbound'ы профиля и сохраните ноду: три при включённом XHTTP, два — при `ENABLE_XHTTP=n`; при включённом CDN активируйте и его inbound'ы (`10446–10448`).
-
-Сгенерированный панелью compose отдельно запускать не нужно: установщик создаёт совместимый compose сам. Нужны только `SECRET_KEY`, IP и Node Port.
-
-### 3. Запустите установщик на ноде
-
-Рекомендуемый вариант — сначала скачать и просмотреть:
-
-```bash
-apt-get update && apt-get install -y curl
-curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/remnanode-setup.sh -o remnanode-setup.sh
-less remnanode-setup.sh
-bash remnanode-setup.sh
-```
-
-Короткий вариант:
-
-```bash
-apt-get update && apt-get install -y curl
-bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/remnanode-setup.sh)
-```
-
-Скрипт спросит базовый домен, префикс, self-steal-домен, нужен ли XHTTP в selfsteal (при согласии — внешний SNI и путь XHTTP), IP панели, Node Port и `SECRET_KEY`. SSH-порт определяется автоматически; при необходимости передайте `--ssh-port N`. Ответы сохраняются в `/root/remnanode.env`.
-
-### 4. Проверьте статус ноды
-
-В **Nodes → Management** нода должна стать `Online`. Если она offline, сначала проверяйте Node Port, `SECRET_KEY` и UFW — хосты и клиентский шаблон на этот статус не влияют.
-
-### 5. Создайте три рабочих хоста
-
-В **Hosts** создайте по хосту для каждого inbound'а. Всем трём задайте одинаковый тег, например `USA`, включите видимость и **Hide host**.
-
-| Inbound | Address | Публичный port | Tag | Hide host |
-|---|---|---:|---|---|
-| `REALITY_VISION` | `usa1.example.com` | `443` | `USA` | ON |
-| `REALITY_XHTTP` | `usa1.example.com` | `443` | `USA` | ON |
-| `HYSTERIA2` | `usa3.example.com` | `443` | `USA` | ON |
-
-Для первых двух хостов вручную укажите публичный порт `443`. Порты `10443–10444` локальные и не должны попадать клиентам.
-
-В режиме Cloudflare в поле **Address** подставьте сгенерированные установщиком хосты вместо `usa1`/`usa3`.
-
-В XHTTP Host укажите те же `path` и внешний SNI, что в Config Profile и установщике. С выключенным XHTTP (`ENABLE_XHTTP=n`) создаются только два хоста — для `REALITY_VISION` и `HYSTERIA2`; лишний XHTTP-хост панели не нужен.
-
-С включённым VLESS за CDN добавьте ещё по одному хосту на каждый CDN-транспорт: Inbound — `VLESS_CDN_*`, **Address** — сам CDN-домен (`CDN_HOST`), **Port** — `443`, SNI — CDN-домен, **Security layer** — `TLS`, тот же тег и **Hide host** ON (подробная таблица — в разделе [VLESS за CDN](#vless-за-cdn-cloudflare)).
-
-### 6. Создайте XRAY_JSON-шаблон
-
-Откройте **Templates → XRAY_JSON** и вставьте `Xray_template.json`.
-
-Если используете тег не `USA`, замените его в:
-
-- `routing.balancers[].tag`;
-- `remnawave.injectHosts[].selector.pattern`.
-
-`tagPrefix: "proxy"`, `routing.balancers[].selector: ["proxy"]` и `burstObservatory.subjectSelector: ["proxy"]` должны совпадать.
-
-### 7. Создайте виртуальный хост
-
-Это видимая оболочка для XRAY_JSON-шаблона:
-
-| Поле | Значение |
-|---|---|
-| Inbound | любой inbound этого профиля |
-| Address | валидный адрес, например `usa1.example.com` |
-| Port | `443` |
-| Tag | пусто |
-| Видимость | ON |
-| Hide host | **OFF** |
-| XRAY_JSON template | шаблон из шага 6 |
-
-Итого: три скрытых рабочих хоста (плюс по одному на каждый CDN-транспорт при включённом CDN) и один видимый виртуальный.
-
-### 8. Добавьте inbound'ы в Internal Squad
-
-Откройте **Internal Squads** и включите все inbound'ы, к которым привязаны рабочие и виртуальный хосты — включая CDN-инбаунды при включённом CDN. Иначе часть хостов не попадёт в подписку.
-
-## Опциональный split-routing
-
-`Xray_template.json` — безопасный full-tunnel: весь пользовательский трафик, кроме заблокированного BitTorrent, идёт через VPN.
-
-`Xray_template_split.json` — режим выборочной маршрутизации:
-
-- домены из актуального на момент генерации списка [itdoginfo/allow-domains — Russia inside](https://github.com/itdoginfo/allow-domains/blob/main/Russia/inside-raw.lst) идут через балансировщик `USA`;
-- дополнительно подключены отдельные списки Telegram и Google AI;
-- IPv4/IPv6-подсети Telegram, Meta/Instagram и Twitter тоже идут через VPN — это важно для приложений, которые подключаются прямо к IP;
-- используется публичный AdGuard DNS `94.140.14.14` и `94.140.15.15`: он блокирует известные рекламные, трекинговые и вредоносные домены;
-- в split-routing запросы к AdGuard DNS также идут через VPN, поэтому DNS не раскрывается провайдеру;
-- тяжёлый список `geosite:category-ads-all` не загружается в Xray, что экономит память на мобильных устройствах;
-- DNS-фильтрация не блокирует рекламу, которая приходит с тех же доменов, что и контент (например, встроенную рекламу YouTube или Instagram);
-- UDP/443 блокируется, чтобы приложения откатывались с QUIC на маршрутизируемый TCP;
-- весь трафик, не совпавший со списком, идёт через `direct`;
-- BitTorrent блокируется: выводить его через `direct`, как в исходном примере, небезопасно — клиент раскрывает реальный IP.
-
-Для split-routing создайте второй шаблон типа **XRAY_JSON** и вставьте в него `Xray_template_split.json`. Затем назначьте его нужному виртуальному хосту или отдельной группе пользователей.
-
-> Split-routing не является режимом полной приватности. Любой отсутствующий или новый домен пойдёт напрямую до следующего обновления списка. Для обычной VPN-подписки оставляйте `Xray_template.json`.
-
-## Неинтерактивный запуск
-
-```bash
-BASE_DOMAIN=example.com \
-PREFIX=usa \
-SELF_STEAL_HOST=usa1.example.com \
-XHTTP_SNI=www.gstatic.com \
-XHTTP_PATH=/api/v3/sync/r1 \
-PANEL_IP=203.0.113.10 \
-NODE_API_PORT=2222 \
-SECRET_KEY='eyJ...' \
-bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/remnanode-setup.sh) \
-  --non-interactive --yes
-```
-
-Для воспроизводимого деплоя можно зафиксировать Node:
-
-```bash
-NODE_IMAGE=latest \
-bash remnanode-setup.sh
-```
-
-Пример неинтерактивного запуска с автоматическими DNS-записями Cloudflare — в разделе [Cloudflare: создание поддоменов автоматически](#cloudflare-создание-поддоменов-автоматически).
-
-`ENABLE_XHTTP=n` отключает XHTTP в selfsteal: установщик не спрашивает SNI и path, не пишет их в `/root/remnanode.env`, не добавляет маршрут XHTTP в Caddyfile и вырезает inbound `REALITY_XHTTP` из сохранённого Config Profile. Значение по умолчанию — `y`, то есть поведение прежних версий.
-
-`ENABLE_CDN=y` включает VLESS за CDN (см. раздел [VLESS за CDN](#vless-за-cdn-cloudflare)): установщик дополнительно спрашивает/берёт из env `CDN_HOST`, `CDN_TRANSPORT` (`ws`, `xhttp`, `grpc`, `both`, `all`), `CDN_WS_PATH`, `CDN_XHTTP_PATH`, `CDN_GRPC_PATH` и токен Cloudflare для DNS-01 сертификата. По умолчанию — `n`, то есть без CDN, как в прежних версиях.
-
-Без `NODE_IMAGE` используется `latest`. Установщик автоматически выберет актуальную версию образа ноды. Версия `latest` следует за upstream-релизами Remnawave Node, однако future major-ветки могут изменить API; для воспроизводимых деплоя используйте конкретный тег, например `remnawave/node:3.1.1`. Сборка маршрутизатора также воспроизводима: `Caddy v2.11.4`, `caddy-l4 v0.1.2`, `xcaddy v0.4.5` и официальный Go `1.25.1`. Архив Go проверяется по опубликованному SHA256 и ставится отдельно в `/opt/remnanode-toolchains`, не заменяя системный Go.
-
-## Флаги
-
-```text
---no-compose          не заменять docker-compose.yml; обновить только .env
---no-firewall         не настраивать ufw
---reset-firewall      удалить существующие правила ufw
---no-reset-firewall   не сбрасывать ufw (по умолчанию; для совместимости)
---force-dns           продолжить при несовпадении DNS и IP ноды
---ssh-port N          явно указать SSH-порт для UFW
---node-image REF      образ ноды; по умолчанию latest
---self-steal-template T
-                      тема фасада self-steal (vaultdrop, mail, cloud, admin, docs)
---cloudflare          создать A-записи через Cloudflare API
---no-cloudflare       не использовать Cloudflare, даже если токен в env
--y, --yes             подтвердить вопросы yes/no
---non-interactive     брать значения из env и дефолтов
--h, --help            показать справку
-```
-
-Переменные: `BASE_DOMAIN`, `PREFIX`, `SELF_STEAL_HOST`, `ENABLE_XHTTP`, `XHTTP_SNI`, `XHTTP_PATH`, `ENABLE_CDN`, `CDN_HOST`, `CDN_TRANSPORT`, `CDN_WS_PATH`, `CDN_XHTTP_PATH`, `CDN_GRPC_PATH`, `PANEL_IP`, `NODE_API_PORT`, `SECRET_KEY`, `NODE_IMAGE`, `SELF_STEAL_TEMPLATE`, `SELF_STEAL_TEMPLATE_URL`, `MULTISELECT_TEMPLATE_URL`, `XCADDY_VERSION`, `CADDY_VERSION`, `CADDY_L4_VERSION`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ZONE`, `NODE_DIR`, `CERT_DIR`, `ENV_STORE`.
-
-Тема фасада выбирается переменной `SELF_STEAL_TEMPLATE` или флагом `--self-steal-template` (см. [«Фасад self-steal: темы»](#фасад-self-steal-темы)). Свой фасад можно передать через публичный HTTPS URL в `SELF_STEAL_TEMPLATE_URL` — он важнее темы. При ошибке скачивания установщик создаст минимальную локальную страницу.
-
-Шаблон Config Profile берётся из файла `Multiselect.json` рядом со скриптом (запуск из клона репозитория) или скачивается из `MULTISELECT_TEMPLATE_URL`. Если скачать не удалось, установщик предупредит и продолжит без сохранённого профиля — тогда вставьте `Multiselect.json` из репозитория вручную.
 
 ## Cloudflare: создание поддоменов автоматически
 
@@ -463,56 +496,81 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/
 
 Остальные шаги (префикс `PREFIX`, порт 80, HTTP-01, DNS-only) не меняются; `PREFIX` в этом режиме ни на что не влияет и остаётся только для совместимости.
 
-## Проверка после установки
+## Опциональный split-routing
+
+`Xray_template.json` — безопасный full-tunnel: весь пользовательский трафик, кроме заблокированного BitTorrent, идёт через VPN.
+
+`Xray_template_split.json` — режим выборочной маршрутизации:
+
+- домены из актуального на момент генерации списка [itdoginfo/allow-domains — Russia inside](https://github.com/itdoginfo/allow-domains/blob/main/Russia/inside-raw.lst) идут через балансировщик `USA`;
+- дополнительно подключены отдельные списки Telegram и Google AI;
+- IPv4/IPv6-подсети Telegram, Meta/Instagram и Twitter тоже идут через VPN — это важно для приложений, которые подключаются прямо к IP;
+- используется публичный AdGuard DNS `94.140.14.14` и `94.140.15.15`: он блокирует известные рекламные, трекинговые и вредоносные домены;
+- в split-routing запросы к AdGuard DNS также идут через VPN, поэтому DNS не раскрывается провайдеру;
+- тяжёлый список `geosite:category-ads-all` не загружается в Xray, что экономит память на мобильных устройствах;
+- DNS-фильтрация не блокирует рекламу, которая приходит с тех же доменов, что и контент (например, встроенную рекламу YouTube или Instagram);
+- UDP/443 блокируется, чтобы приложения откатывались с QUIC на маршрутизируемый TCP;
+- весь трафик, не совпавший со списком, идёт через `direct`;
+- BitTorrent блокируется: выводить его через `direct`, как в исходном примере, небезопасно — клиент раскрывает реальный IP.
+
+Для split-routing создайте второй шаблон типа **XRAY_JSON** и вставьте в него `Xray_template_split.json`. Затем назначьте его нужному виртуальному хосту или отдельной группе пользователей.
+
+> Split-routing не является режимом полной приватности. Любой отсутствующий или новый домен пойдёт напрямую до следующего обновления списка. Для обычной VPN-подписки оставляйте `Xray_template.json`.
+
+## Неинтерактивный запуск
 
 ```bash
-docker ps --filter name=remnanode
-docker logs remnanode --tail 120
-docker exec -it remnanode tail -f /var/log/xray/current
-systemctl status caddy --no-pager
-ss -lntup | grep -E ':80|:443|:9443|:9444|:10443|:10444|:10446|:10447|:10448'
-ufw status numbered
+BASE_DOMAIN=example.com \
+PREFIX=usa \
+SELF_STEAL_HOST=usa1.example.com \
+XHTTP_SNI=www.gstatic.com \
+XHTTP_PATH=/api/v3/sync/r1 \
+PANEL_IP=203.0.113.10 \
+NODE_API_PORT=2222 \
+SECRET_KEY='eyJ...' \
+bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/remnanode-setup.sh) \
+  --non-interactive --yes
 ```
 
-Проверка редиректа и HSTS:
+Для воспроизводимого деплоя можно зафиксировать Node:
 
 ```bash
-curl -sI "http://usa1.example.com/probe/path?x=1" | head -3
-curl -s -D - -o /dev/null "https://usa1.example.com/" | grep -i strict-transport-security
+NODE_IMAGE=latest \
+bash remnanode-setup.sh
 ```
 
-Первая команда должна вернуть `301` и `Location: https://usa1.example.com/probe/path?x=1`, вторая — `strict-transport-security: max-age=31536000`.
+Пример неинтерактивного запуска с автоматическими DNS-записями Cloudflare — в разделе [Cloudflare: создание поддоменов автоматически](#cloudflare-создание-поддоменов-автоматически).
 
-Проверка self-steal:
+`ENABLE_XHTTP=n` отключает XHTTP в selfsteal: установщик не спрашивает SNI и path, не пишет их в `/root/remnanode.env`, не добавляет маршрут XHTTP в Caddyfile и вырезает inbound `REALITY_XHTTP` из сохранённого Config Profile. Значение по умолчанию — `y`, то есть поведение прежних версий.
 
-```bash
-echo | openssl s_client \
-  -connect 127.0.0.1:9443 \
-  -servername usa1.example.com \
-  -verify_return_error -brief
+`ENABLE_CDN=y` включает VLESS за CDN (см. раздел [VLESS за CDN](#vless-за-cdn-cloudflare)): установщик дополнительно спрашивает/берёт из env `ENABLE_CDN`, `CDN_HOST`, `CDN_TRANSPORT` (`ws`, `xhttp`, `grpc`, `both`, `all`), `CDN_WS_PATH`, `CDN_XHTTP_PATH`, `CDN_GRPC_PATH` и токен Cloudflare для DNS-01 сертификата. По умолчанию — `n`, то есть без CDN, как в прежних версиях.
+
+Без `NODE_IMAGE` используется `latest`. Установщик автоматически выберет актуальную версию образа ноды. Версия `latest` следует за upstream-релизами Remnawave Node, однако future major-ветки могут изменить API; для воспроизводимых деплоя используйте конкретный тег, например `remnawave/node:3.1.1`. Сборка маршрутизатора также воспроизводима: `Caddy v2.11.4`, `caddy-l4 v0.1.2`, `xcaddy v0.4.5` и официальный Go `1.25.1`. Архив Go проверяется по опубликованному SHA256 и ставится отдельно в `/opt/remnanode-toolchains`, не заменяя системный Go.
+
+Шаблон Config Profile берётся из файла `Multiselect.json` рядом со скриптом (запуск из клона репозитория) или скачивается из `MULTISELECT_TEMPLATE_URL`. Если скачать не удалось, установщик предупредит и продолжит без сохранённого профиля — тогда вставьте `Multiselect.json` из репозитория вручную.
+
+## Флаги
+
+```text
+--no-compose          не заменять docker-compose.yml; обновить только .env
+--no-firewall         не настраивать ufw
+--reset-firewall      удалить существующие правила ufw
+--no-reset-firewall   не сбрасывать ufw (по умолчанию; для совместимости)
+--force-dns           продолжить при несовпадении DNS и IP ноды
+--ssh-port N          явно указать SSH-порт для UFW
+--node-image REF      образ ноды; по умолчанию latest
+--self-steal-template T
+                      тема фасада self-steal (vaultdrop, mail, cloud, admin, docs)
+--cloudflare          создать A-записи через Cloudflare API
+--no-cloudflare       не использовать Cloudflare, даже если токен в env
+-y, --yes             подтвердить вопросы yes/no
+--non-interactive     брать значения из env и дефолтов
+-h, --help            показать справку
 ```
 
-Откройте `https://usa1.example.com/` в браузере. Должен появиться фасад файлообменника с валидным сертификатом.
+Переменные: `BASE_DOMAIN`, `PREFIX`, `SELF_STEAL_HOST`, `ENABLE_XHTTP`, `XHTTP_SNI`, `XHTTP_PATH`, `ENABLE_CDN`, `CDN_HOST`, `CDN_TRANSPORT`, `CDN_WS_PATH`, `CDN_XHTTP_PATH`, `CDN_GRPC_PATH`, `PANEL_IP`, `NODE_API_PORT`, `SECRET_KEY`, `NODE_IMAGE`, `SELF_STEAL_TEMPLATE`, `SELF_STEAL_TEMPLATE_URL`, `MULTISELECT_TEMPLATE_URL`, `XCADDY_VERSION`, `CADDY_VERSION`, `CADDY_L4_VERSION`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ZONE`, `NODE_DIR`, `CERT_DIR`, `ENV_STORE`.
 
-Проверка VLESS за CDN (выполняется при `ENABLE_CDN=y`):
-
-```bash
-# origin-сайт CDN должен отдавать фасад и свой сертификат
-echo | openssl s_client -connect 127.0.0.1:9444 -servername cdn.example.com -brief
-# фасад и заголовки через сам CDN
-curl -sI "https://cdn.example.com/" | head -3
-# путь WebSocket должен уходить в Xray (пока апстрим недоступен — ошибка апстрима, но не 404)
-curl -s -o /dev/null -w '%{http_code}\n' "https://cdn.example.com/api/v1/stream"
-```
-
-Ожидаемый итог:
-
-- нода `Online`;
-- `443/tcp` слушает Caddy, `443/udp` — Xray/Hysteria2;
-- `10443–10444` и CDN-инбаунды `10446–10448` слушаются только на `127.0.0.1`;
-- XRAY_JSON содержит `proxy`, `proxy-2`, `proxy-3` (и `proxy-4`… при включённом CDN);
-- `http://usa1.example.com/<любой-путь>?x=1` отдаёт `301` c `Location: https://usa1.example.com/<любой-путь>?x=1`;
-- клиент подключается, балансировщик видит три и более outbound'а (по числу скрытых хостов).
+Тема фасада выбирается переменной `SELF_STEAL_TEMPLATE` или флагом `--self-steal-template` (см. [«Фасад self-steal: темы»](#фасад-self-steal-темы)). Свой фасад можно передать через публичный HTTPS URL в `SELF_STEAL_TEMPLATE_URL` — он важнее темы. При ошибке скачивания установщик создаст минимальную локальную страницу.
 
 ## Диагностика
 
