@@ -13,11 +13,40 @@ SSH_PORT_OVERRIDE=""
 CF_MODE_SETTING=""
 CF_MODE=0
 CF_CURL_CFG=""
+CF_ZONE_ID=""
 NODE_DIR="${NODE_DIR:-/opt/remnanode}"
 CERT_DIR="${CERT_DIR:-/etc/remna-certs}"
 ENV_STORE="${ENV_STORE:-/root/remnanode.env}"
 NODE_IMAGE="${NODE_IMAGE:-latest}"
-SELF_STEAL_TEMPLATE_URL="${SELF_STEAL_TEMPLATE_URL:-https://raw.githubusercontent.com/bami7up/multi-protocol/main/self-steal-site.html}"
+# Темы фасада self-steal: файлы self-steal-templates/<тема>.html в репозитории.
+# Дефолт — прежний «файлообменник», чтобы поведение не менялось без запроса.
+SELF_STEAL_RAW_BASE="https://raw.githubusercontent.com/bami7up/multi-protocol/main"
+SELF_STEAL_TEMPLATES=(vaultdrop mail cloud admin docs)
+SELF_STEAL_TEMPLATE="${SELF_STEAL_TEMPLATE:-vaultdrop}"
+# Явный URL (свой фасад) важнее имени темы; проверяется при разборе переменных.
+SELF_STEAL_TEMPLATE_URL="${SELF_STEAL_TEMPLATE_URL:-}"
+SELF_STEAL_THEME_USED=0
+# VLESS за CDN: инбаунды слушают только loopback и без своего TLS — публичный
+# TLS терминирует CDN, а TLS между CDN и origin — Caddy с сертификатом для
+# CDN-хоста. HTTP-01 такой сертификат не выпустит (за прокси на :80 отвечает
+# CDN), поэтому используется ACME DNS-01 тем же токеном Cloudflare.
+ENABLE_CDN="${ENABLE_CDN:-n}"
+CDN_TRANSPORT="${CDN_TRANSPORT:-ws}"
+CDN_HOST="${CDN_HOST:-}"
+CDN_WS_PATH="${CDN_WS_PATH:-/api/v1/stream}"
+CDN_XHTTP_PATH="${CDN_XHTTP_PATH:-/api/v3/sync/c1}"
+# gRPC: serviceName начинается со слэша, поэтому Caddy выделяет его префиксом
+# пути (@grpccdn), а сам трафик уходит в Xray по h2c (HTTP/2 без TLS).
+CDN_GRPC_PATH="${CDN_GRPC_PATH:-/api/v4/stream}"
+CDN_WS_ENABLED=0
+CDN_XHTTP_ENABLED=0
+CDN_GRPC_ENABLED=0
+CDN_WS_PORT=10446
+CDN_XHTTP_PORT=10447
+CDN_GRPC_PORT=10448
+CDN_TLS_PORT=9444
+# Шаблон Config Profile: из него установщик сохраняет готовый Multiselect.json.
+MULTISELECT_TEMPLATE_URL="${MULTISELECT_TEMPLATE_URL:-https://raw.githubusercontent.com/bami7up/multi-protocol/main/Multiselect.json}"
 XCADDY_VERSION="${XCADDY_VERSION:-v0.4.5}"
 CADDY_VERSION="${CADDY_VERSION:-v2.11.4}"
 CADDY_L4_VERSION="${CADDY_L4_VERSION:-v0.1.2}"
@@ -27,6 +56,9 @@ GO_ARCHIVE_TMP=""
 CADDY_RESTORE_NEEDED=0
 LOG_DIR="/var/log"
 LOG_FILE="${LOG_DIR}/remnanode-setup-$(date +%F-%H%M%S).log"
+# Каталог самого скрипта: при запуске из клона репозитория шаблоны берутся
+# локально, а не из сети (при `bash <(...)` каталога нет — скачаем по URL).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo /nonexistent)"
 
 usage() {
   cat <<'USAGE'
@@ -43,6 +75,8 @@ remnanode-setup.sh — установка ноды Remnawave (VLESS + Hysteria2 
   --force-dns           не прерываться при несовпадении DNS
   --ssh-port N          явно указать SSH-порт для правила ufw
   --node-image REF      образ ноды (по умолчанию latest)
+  --self-steal-template T
+                        тема фасада self-steal (vaultdrop, mail, cloud, admin, docs)
   --cloudflare          создать A-записи через Cloudflare API
   --no-cloudflare       не использовать Cloudflare, даже если токен в env
   -y | --yes            авто-подтверждение всех «y/n» вопросов
@@ -50,8 +84,10 @@ remnanode-setup.sh — установка ноды Remnawave (VLESS + Hysteria2 
   -h | --help           показать эту справку
 
 Переменные окружения (для --non-interactive / CI):
-  BASE_DOMAIN, PREFIX, SELF_STEAL_HOST, XHTTP_SNI, XHTTP_PATH,
-  PANEL_IP, NODE_API_PORT, SECRET_KEY, NODE_IMAGE, SELF_STEAL_TEMPLATE_URL,
+  BASE_DOMAIN, PREFIX, SELF_STEAL_HOST, XHTTP_SNI, XHTTP_PATH, ENABLE_XHTTP,
+  ENABLE_CDN, CDN_HOST, CDN_TRANSPORT, CDN_WS_PATH, CDN_XHTTP_PATH, CDN_GRPC_PATH,
+  PANEL_IP, NODE_API_PORT, SECRET_KEY, NODE_IMAGE,
+  SELF_STEAL_TEMPLATE, SELF_STEAL_TEMPLATE_URL, MULTISELECT_TEMPLATE_URL,
   XCADDY_VERSION, CADDY_VERSION, CADDY_L4_VERSION,
   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ZONE,
   NODE_DIR, CERT_DIR, ENV_STORE
@@ -74,6 +110,10 @@ while [[ $# -gt 0 ]]; do
     --node-image)
       NODE_IMAGE="${2:-}"
       [[ -n "$NODE_IMAGE" ]] || { echo "--node-image требует значение" >&2; exit 2; }
+      shift ;;
+    --self-steal-template)
+      SELF_STEAL_TEMPLATE="${2:-}"
+      [[ -n "$SELF_STEAL_TEMPLATE" ]] || { echo "--self-steal-template требует значение (тема фасада)" >&2; exit 2; }
       shift ;;
     --cloudflare)    CF_MODE_SETTING=1 ;;
     --no-cloudflare) CF_MODE_SETTING=0 ;;
@@ -363,13 +403,26 @@ cf_json_error() {
   printf '%s' "${msg:-неизвестная ошибка Cloudflare API}"
 }
 
-# cf_upsert_a ZONE_ID HOST — создать A-запись или обновить существующую на
-# текущий SERVER_IP. proxied=false обязателен: оранжевое облако ломает и
-# REALITY, и прямой Hysteria2 (см. README, Cloudflare и DNS-only записи).
+# Токен не должен попадать ни в argv curl (видно в ps), ни в лог: он живёт
+# во временном файле 0600, который curl читает через -K.
+cf_curl_cfg_init() {
+  CF_CURL_CFG="$(mktemp)"
+  ( umask 077; printf 'header = "Authorization: Bearer %s"\n' "$CLOUDFLARE_API_TOKEN" > "$CF_CURL_CFG" )
+}
+
+# cf_upsert_a ZONE_ID HOST [proxied] — создать A-запись или обновить
+# существующую на текущий SERVER_IP. По умолчанию запись DNS-only
+# (proxied=false): оранжевое облако ломает и REALITY, и прямой Hysteria2
+# (см. README, Cloudflare и DNS-only записи). Исключение — CDN-хост: там
+# проксирование и есть весь смысл, поэтому для него передаётся «proxied».
 cf_upsert_a() {
-  local zone="$1" host="$2" resp id
+  local zone="$1" host="$2" mode="${3:-dns-only}" resp id
   local body
-  body="$(printf '{"type":"A","name":"%s","content":"%s","ttl":1,"proxied":false}' "$host" "$SERVER_IP")"
+  if [[ "$mode" == proxied ]]; then
+    body="$(printf '{"type":"A","name":"%s","content":"%s","ttl":1,"proxied":true}' "$host" "$SERVER_IP")"
+  else
+    body="$(printf '{"type":"A","name":"%s","content":"%s","ttl":1,"proxied":false}' "$host" "$SERVER_IP")"
+  fi
   resp="$(cf_api GET "/zones/$zone/dns_records?type=A&name=$host")" \
     || die "Cloudflare API недоступен при чтении записи $host (сеть/HTTP)."
   cf_json_success "$resp" || die "Cloudflare API (чтение $host): $(cf_json_error "$resp")"
@@ -382,7 +435,11 @@ cf_upsert_a() {
       || die "Cloudflare API недоступен при создании $host."
   fi
   cf_json_success "$resp" || die "Cloudflare API (запись $host): $(cf_json_error "$resp")"
-  ok "Cloudflare: A-запись $host → $SERVER_IP (DNS only, proxied=off)"
+  if [[ "$mode" == proxied ]]; then
+    ok "Cloudflare: A-запись $host → $SERVER_IP (проксируется CDN, proxied=on)"
+  else
+    ok "Cloudflare: A-запись $host → $SERVER_IP (DNS only, proxied=off)"
+  fi
 }
 
 # cf_a_exists ZONE_ID HOST → 0, если A-запись уже есть (иначе 1; die при ошибке API).
@@ -407,10 +464,7 @@ cf_setup_hosts() {
   local zone_name="${CLOUDFLARE_ZONE:-$BASE_DOMAIN}"
   is_fqdn "$zone_name" || die "Некорректное имя зоны Cloudflare: $zone_name"
 
-  # Токен не должен попадать ни в argv curl (видно в ps), ни в лог: он живёт
-  # во временном файле 0600, который curl читает через -K.
-  CF_CURL_CFG="$(mktemp)"
-  ( umask 077; printf 'header = "Authorization: Bearer %s"\n' "$CLOUDFLARE_API_TOKEN" > "$CF_CURL_CFG" )
+  cf_curl_cfg_init
 
   local resp zone_id
   resp="$(cf_api GET "/zones?name=${zone_name}&status=active")" \
@@ -419,6 +473,9 @@ cf_setup_hosts() {
   zone_id="$(jq -r '.result[0].id // empty' <<<"$resp")"
   [[ -n "$zone_id" ]] \
     || die "Токен не видит зону $zone_name: нужны права Zone:Read и Zone:DNS:Edit; если BASE_DOMAIN — поддомен, задайте CLOUDFLARE_ZONE."
+  # Идентификатор зоны нужен и после cf_setup_hosts: для проксируемой записи
+  # CDN-хоста и для ACME DNS-01 сертификата этого хоста.
+  CF_ZONE_ID="$zone_id"
   ok "Cloudflare: зона $zone_name найдена"
 
   local -a cand=()
@@ -473,9 +530,166 @@ cf_setup_hosts() {
     fi
   fi
 
-  note "Подставьте сгенерированные хосты вместо <prefix>1.<domain> / <prefix>3.<domain> в Config Profile и Hosts панели (README, раздел Cloudflare)."
+  note "Готовый Config Profile с этими хостами сохраняется на шаге 1; в Hosts панели хосты впишите вручную (README, раздел Cloudflare)."
   rm -f "$CF_CURL_CFG"
   CF_CURL_CFG=""
+}
+
+# ——— self-steal: темы фасада ———
+# Имя темы → URL шаблона в репозитории. Пустая тема означает, что пользователь
+# задал SELF_STEAL_TEMPLATE_URL явно: свой фасад всегда важнее темы.
+# Возвращает 1 на неизвестной теме — вызывающая сторона сама решает, как
+# сообщить об этом (важно показать список доступных тем).
+self_steal_template_url() {
+  local theme="$1" known
+  if [[ -z "$theme" ]]; then
+    printf '%s\n' "$SELF_STEAL_TEMPLATE_URL"
+    return 0
+  fi
+  for known in "${SELF_STEAL_TEMPLATES[@]}"; do
+    if [[ "$known" == "$theme" ]]; then
+      printf '%s/self-steal-templates/%s.html\n' "$SELF_STEAL_RAW_BASE" "$known"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Доступные темы — для подсказки об опечатке и для тестов (чтобы они не
+# зависели от внутреннего массива с темами).
+self_steal_template_list() {
+  printf '%s\n' "${SELF_STEAL_TEMPLATES[@]}"
+}
+
+# CDN_TRANSPORT → включённые транспорты CDN. "both" (ws + xhttp) оставлен для
+# совместимости со старыми env-файлами, "all" — все три транспорта. Функцию
+# используют и промпты, и фильтр профиля, поэтому она вынесена отдельно.
+# Вызывается как cdn_transport_enabled ws|xhttp|grpc; комментарий не пишется
+# в строку с `{`: юнит-тест извлекает функцию по шаблону "скобка в конце строки".
+cdn_transport_enabled() {
+  case "$CDN_TRANSPORT:$1" in
+    ws:ws | xhttp:xhttp | grpc:grpc | both:ws | both:xhttp | all:ws | all:xhttp | all:grpc)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+# ——— Config Profile (Multiselect.json) ———
+# Панель отдаёт ноде серверный конфиг Xray из Config Profile, поэтому установщик
+# сохраняет готовый файл: с подставленными хостами и без inbound'а XHTTP, когда
+# XHTTP в selfsteal выключен. Иначе профиль разошёлся бы с Caddyfile и нода
+# слушала бы порт 10444, к которому ничего не маршрутизируется.
+#
+# multiselect_filter — чистый фильтр: JSON шаблона на stdin, адаптированный JSON
+# в stdout. Значения берутся из переменных установщика, поэтому функцию целиком
+# покрывает tests/installer-funcs-checks.sh (на шаблоне из репозитория).
+multiselect_filter() {
+  # Набор включённых транспортов в виде JSON-массива для jq.
+  local transports="" t
+  for t in ws xhttp grpc; do
+    if cdn_transport_enabled "$t"; then
+      transports+="\"$t\","
+    fi
+  done
+  transports="[${transports%,}]"
+  jq --arg vision "$SELF_STEAL_HOST" \
+     --arg hy "$HY_HOST" \
+     --arg xsni "$XHTTP_SNI" \
+     --arg xpath "$XHTTP_PATH" \
+     --arg wspath "$CDN_WS_PATH" \
+     --arg xhpath "$CDN_XHTTP_PATH" \
+     --arg grpcpath "$CDN_GRPC_PATH" \
+     --arg certdir "$CERT_DIR" \
+     --argjson transports "$transports" \
+     --argjson xhttp "$ENABLE_XHTTP" \
+     --argjson cdn "$ENABLE_CDN" '
+    # Транспорт CDN-инбаунда по его тегу (у остальных инбаундов — null).
+    def cdn_transport(tag):
+      if tag == "VLESS_CDN_WS" then "ws"
+      elif tag == "VLESS_CDN_XHTTP" then "xhttp"
+      elif tag == "VLESS_CDN_GRPC" then "grpc"
+      else null end;
+    .inbounds |= (
+      map(select(
+        # XHTTP в selfsteal выключен — убираем REALITY_XHTTP (и любой другой
+        # xhttp-инбаунд), кроме CDN-инбаундов: у них своё условие ниже.
+        (if $xhttp == 1 or (.tag | startswith("VLESS_CDN_"))
+         then true
+         else (.tag != "REALITY_XHTTP" and (.streamSettings.network // "") != "xhttp")
+         end)
+        and
+        # CDN выключен — CDN-инбаундов быть не должно; включён — остаются только
+        # те, что выбраны транспортом (ws, xhttp, grpc или их сочетания).
+        # Транспорт фиксируется в $tr до пайпа: внутри `$transports | …` точка
+        # уже указывает на массив транспортов, и `.tag` упал бы на нём.
+        (if cdn_transport(.tag) == null then true
+         else ($cdn == 1
+               and (cdn_transport(.tag) as $tr
+                    | ($transports | index($tr) != null)))
+         end)
+      ))
+      | map(
+          if .tag == "REALITY_VISION" then
+            .streamSettings.realitySettings.serverNames = [$vision]
+          elif .tag == "REALITY_XHTTP" then
+            .streamSettings.realitySettings.serverNames = [$xsni]
+            | .streamSettings.realitySettings.target = ($xsni + ":443")
+            | .streamSettings.xhttpSettings.path = $xpath
+          elif .tag == "HYSTERIA2" then
+            .streamSettings.tlsSettings.serverName = $hy
+            | .streamSettings.tlsSettings.certificates[0].keyFile = ($certdir + "/" + $hy + "/key.pem")
+            | .streamSettings.tlsSettings.certificates[0].certificateFile = ($certdir + "/" + $hy + "/fullchain.pem")
+          elif .tag == "VLESS_CDN_WS" then
+            .streamSettings.wsSettings.path = $wspath
+          elif .tag == "VLESS_CDN_XHTTP" then
+            .streamSettings.xhttpSettings.path = $xhpath
+          elif .tag == "VLESS_CDN_GRPC" then
+            .streamSettings.grpcSettings.serviceName = $grpcpath
+          else . end
+        )
+    )
+  '
+}
+
+write_config_profile() {
+  local src="" tmp="" out="$NODE_DIR/Multiselect.json"
+  if ! have jq; then
+    warn "jq недоступен — Config Profile не сохранён: возьмите Multiselect.json из репозитория вручную."
+    return 0
+  fi
+  # Локальная копия шаблона рядом со скриптом главнее сети: запуск из клона
+  # репозитория и тесты не должны зависеть от GitHub.
+  if [[ -r "$SCRIPT_DIR/Multiselect.json" ]]; then
+    src="$SCRIPT_DIR/Multiselect.json"
+  else
+    tmp="$(mktemp)"
+    if retry 3 3 curl -fsSL "$MULTISELECT_TEMPLATE_URL" -o "$tmp"; then
+      src="$tmp"
+    else
+      rm -f "$tmp"
+      warn "Не удалось скачать $MULTISELECT_TEMPLATE_URL — Config Profile не сохранён (возьмите Multiselect.json из репозитория)."
+      return 0
+    fi
+  fi
+  mkdir -p "$NODE_DIR"
+  # Пишем через временный файл: jq не должен оставить обрезанный профиль.
+  if multiselect_filter < "$src" > "$out.tmp" && [[ -s "$out.tmp" ]]; then
+    install -m 644 "$out.tmp" "$out"
+    rm -f "$out.tmp" "$tmp"
+    local profile_inbounds="Vision/Reality + Hysteria2"
+    if (( ENABLE_XHTTP )); then
+      profile_inbounds="Vision/Reality + XHTTP + Hysteria2"
+    fi
+    if (( ENABLE_CDN )); then
+      profile_inbounds+=" + CDN ($CDN_TRANSPORT)"
+    fi
+    ok "Config Profile сохранён: $out ($profile_inbounds)"
+  else
+    rm -f "$out.tmp" "$tmp"
+    warn "Не удалось адаптировать шаблон Config Profile — используйте Multiselect.json из репозитория."
+  fi
+  return 0
 }
 
 apt_wait() {
@@ -725,14 +939,51 @@ ask SELF_STEAL_HOST "Домен self-steal для Vision/Reality" "${SELF_STEAL_
 # Обратная совместимость с шаблонами/старыми env: для Vision SNI всегда равен
 # домену локального TLS-сайта. Иначе это снова будет обычный внешний REALITY target.
 VISION_SNI="$SELF_STEAL_HOST"
-ask XHTTP_SNI  "Маскировочный SNI для XHTTP"          "${XHTTP_SNI:-www.gstatic.com}"
-ask XHTTP_PATH "Путь XHTTP"                           "${XHTTP_PATH:-/api/v3/sync/r1}"
 ask ENABLE_XHTTP "Включить XHTTP в selfsteal?"         "${ENABLE_XHTTP:-y}"
 if [[ "${ENABLE_XHTTP,,}" != y* ]]; then
   warn "XHTTP в selfsteal отключён — будет использован режим только Vision (Reality)."
   ENABLE_XHTTP=0
+  # Без XHTTP SNI и path нигде не нужны: не спрашиваем и не сохраняем их.
+  XHTTP_SNI=""
+  XHTTP_PATH=""
 else
   ENABLE_XHTTP=1
+  ask XHTTP_SNI  "Маскировочный SNI для XHTTP"        "${XHTTP_SNI:-www.gstatic.com}"
+  ask XHTTP_PATH "Путь XHTTP"                         "${XHTTP_PATH:-/api/v3/sync/r1}"
+fi
+ask ENABLE_CDN "Добавить VLESS за CDN (Cloudflare и др.)?" "${ENABLE_CDN:-n}"
+if [[ "${ENABLE_CDN,,}" != y* ]]; then
+  ENABLE_CDN=0
+else
+  ENABLE_CDN=1
+  note "CDN прячет origin: клиент идёт на CDN-хост по 443, сам CDN — на :443 ноды,"
+  note "где Caddy отвечает сертификатом для этого хоста (ACME DNS-01 через Cloudflare)."
+  note "Пути транспортов уходят в Xray на loopback; gRPC — по h2c, без своего TLS."
+  ask CDN_HOST "Домен, проксируемый CDN (A-запись под оранжевым облаком)" "${CDN_HOST:-}"
+  ask CDN_TRANSPORT "Транспорт CDN: ws, xhttp, grpc, both (ws+xhttp) или all" "${CDN_TRANSPORT:-ws}"
+  CDN_TRANSPORT="${CDN_TRANSPORT,,}"
+  case "$CDN_TRANSPORT" in
+    ws|xhttp|grpc|both|all) ;;
+    *) die "CDN_TRANSPORT должен быть ws, xhttp, grpc, both или all (получено: $CDN_TRANSPORT)." ;;
+  esac
+  if cdn_transport_enabled ws; then
+    CDN_WS_ENABLED=1
+    ask CDN_WS_PATH "Путь WebSocket для CDN" "${CDN_WS_PATH:-/api/v1/stream}"
+  fi
+  if cdn_transport_enabled xhttp; then
+    CDN_XHTTP_ENABLED=1
+    ask CDN_XHTTP_PATH "Путь XHTTP для CDN" "${CDN_XHTTP_PATH:-/api/v3/sync/c1}"
+  fi
+  if cdn_transport_enabled grpc; then
+    CDN_GRPC_ENABLED=1
+    ask CDN_GRPC_PATH "serviceName gRPC для CDN" "${CDN_GRPC_PATH:-/api/v4/stream}"
+  fi
+  # Сертификат origin выпускается по DNS-01 (HTTP-01 за прокси невозможен),
+  # поэтому нужен токен с правами Zone:Read и Zone:DNS:Edit.
+  if [[ -z "${CLOUDFLARE_API_TOKEN:-}" ]]; then
+    ask_secret CLOUDFLARE_API_TOKEN \
+      "Cloudflare API Token (Zone:Read + DNS:Edit — для ACME DNS-01 сертификата CDN)" ""
+  fi
 fi
 ask PANEL_IP   "IP панели Remnawave (IPv4 или IPv6)"  "${PANEL_IP:-}"
 ask NODE_API_PORT "Порт ноды для связи с панелью"     "${NODE_API_PORT:-2222}"
@@ -742,9 +993,9 @@ is_fqdn "$BASE_DOMAIN"       || die "Некорректный домен: $BASE_
   || die "Некорректный префикс: $PREFIX"
 is_fqdn "$SELF_STEAL_HOST"   || die "Некорректный self-steal домен: $SELF_STEAL_HOST"
 if (( ENABLE_XHTTP )); then
-  is_fqdn "$XHTTP_SNI"         || die "Некорректный XHTTP SNI: $XHTTP_SNI"
+  is_fqdn "$XHTTP_SNI"             || die "Некорректный XHTTP SNI: $XHTTP_SNI"
   is_safe_xhttp_path "$XHTTP_PATH" || die "Некорректный XHTTP path: $XHTTP_PATH"
-  fi
+fi
 { is_ipv4 "$PANEL_IP" || is_ipv6 "$PANEL_IP"; } \
   || die "Некорректный IP панели: $PANEL_IP (нужен IPv4 или IPv6)"
 { [[ "$NODE_API_PORT" =~ ^[0-9]+$ ]] && (( NODE_API_PORT >= 1 && NODE_API_PORT <= 65535 )); } \
@@ -762,8 +1013,47 @@ if [[ -n "$SERVER_IP" && "$PANEL_IP" == "$SERVER_IP" ]]; then
 fi
 [[ "$SELF_STEAL_HOST" != "$HY_HOST" ]] \
   || die "SELF_STEAL_HOST должен отличаться от доменов Hysteria2."
-[[ "$XHTTP_SNI" != "$SELF_STEAL_HOST" && "$XHTTP_SNI" != "$HY_HOST" ]] \
-  || die "XHTTP_SNI конфликтует с SNI другого маршрута Caddy."
+if (( ENABLE_XHTTP )); then
+  [[ "$XHTTP_SNI" != "$SELF_STEAL_HOST" && "$XHTTP_SNI" != "$HY_HOST" ]] \
+    || die "XHTTP_SNI конфликтует с SNI другого маршрута Caddy."
+fi
+if (( ENABLE_CDN )); then
+  is_fqdn "$CDN_HOST" || die "Некорректный CDN-домен: $CDN_HOST"
+  [[ "$CDN_HOST" != "$SELF_STEAL_HOST" && "$CDN_HOST" != "$HY_HOST" && \
+     "$CDN_HOST" != "${XHTTP_SNI:-}" && "$CDN_HOST" != "$VLESS_HOST" ]] \
+    || die "CDN-домен $CDN_HOST совпадает с SNI другого маршрута Caddy — нужен отдельный поддомен."
+  if (( CDN_WS_ENABLED )); then
+    is_safe_xhttp_path "$CDN_WS_PATH" || die "Некорректный путь WebSocket для CDN: $CDN_WS_PATH"
+  fi
+  if (( CDN_XHTTP_ENABLED )); then
+    is_safe_xhttp_path "$CDN_XHTTP_PATH" || die "Некорректный путь XHTTP для CDN: $CDN_XHTTP_PATH"
+  fi
+  if (( CDN_GRPC_ENABLED )); then
+    # serviceName обязан начинаться со слэша: Caddy выделяет его префиксом пути,
+    # а Xray сам разбирает остаток (/<serviceName>/Tun).
+    is_safe_xhttp_path "$CDN_GRPC_PATH" \
+      || die "Некорректный serviceName gRPC для CDN: $CDN_GRPC_PATH (нужен путь, начинающийся со слэша)."
+  fi
+  # Пути (у gRPC — serviceName) обязаны различаться: иначе один маршрут Caddy
+  # перекроет другой и транспорт перестанет работать.
+  if (( CDN_WS_ENABLED && CDN_XHTTP_ENABLED )) && [[ "$CDN_WS_PATH" == "$CDN_XHTTP_PATH" ]]; then
+    die "Пути WebSocket и XHTTP для CDN должны различаться."
+  fi
+  if (( CDN_WS_ENABLED && CDN_GRPC_ENABLED )) && [[ "$CDN_WS_PATH" == "$CDN_GRPC_PATH" ]]; then
+    die "Путь WebSocket и serviceName gRPC для CDN должны различаться."
+  fi
+  if (( CDN_XHTTP_ENABLED && CDN_GRPC_ENABLED )) && [[ "$CDN_XHTTP_PATH" == "$CDN_GRPC_PATH" ]]; then
+    die "Путь XHTTP и serviceName gRPC для CDN должны различаться."
+  fi
+fi
+# Тема фасада → URL шаблона. Явный SELF_STEAL_TEMPLATE_URL имеет приоритет
+# и отключает подстановку по теме (иначе пользователь не мог бы задать свой
+# фасад, не переименовывая тему).
+if [[ -z "$SELF_STEAL_TEMPLATE_URL" ]]; then
+  SELF_STEAL_TEMPLATE_URL="$(self_steal_template_url "$SELF_STEAL_TEMPLATE")" \
+    || die "Неизвестная тема self-steal: $SELF_STEAL_TEMPLATE. Доступны: $(self_steal_template_list | tr '\n' ' ')."
+  SELF_STEAL_THEME_USED=1
+fi
 [[ "$SELF_STEAL_TEMPLATE_URL" == https://* ]] \
   || die "SELF_STEAL_TEMPLATE_URL должен начинаться с https://"
 [[ "$NODE_IMAGE" =~ ^[a-zA-Z0-9][a-zA-Z0-9._/:@-]+$ ]] || die "Некорректная ссылка на образ: $NODE_IMAGE"
@@ -772,7 +1062,28 @@ fi
 [[ "$CADDY_L4_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Некорректная версия caddy-l4: $CADDY_L4_VERSION"
 
 export SERVER_IP BASE_DOMAIN PREFIX VLESS_HOST HY_HOST ACME_EMAIL \
-       SELF_STEAL_HOST VISION_SNI XHTTP_SNI XHTTP_PATH PANEL_IP NODE_API_PORT
+       SELF_STEAL_HOST VISION_SNI PANEL_IP NODE_API_PORT
+if (( ENABLE_XHTTP )); then
+  export XHTTP_SNI XHTTP_PATH
+fi
+if (( ENABLE_CDN )); then
+  export ENABLE_CDN CDN_HOST CDN_TRANSPORT CDN_WS_PATH CDN_XHTTP_PATH CDN_GRPC_PATH
+fi
+
+# Запись CDN-хоста создаётся проксируемой: именно оранжевое облако направляет
+# трафик через CDN на origin. Токен нужен и для DNS-01 сертификата, поэтому всё,
+# что могло потребовать токена, выполняется здесь; затем временный конфиг curl
+# удаляется (и в on_exit, если установка прервётся раньше).
+if (( CF_MODE )); then
+  if (( ENABLE_CDN )); then
+    cf_curl_cfg_init
+    cf_upsert_a "$CF_ZONE_ID" "$CDN_HOST" proxied
+  fi
+  if [[ -n "$CF_CURL_CFG" ]]; then
+    rm -f "$CF_CURL_CFG"
+    CF_CURL_CFG=""
+  fi
+fi
 
 ( umask 077
   {
@@ -785,8 +1096,16 @@ export SERVER_IP BASE_DOMAIN PREFIX VLESS_HOST HY_HOST ACME_EMAIL \
     printf 'export SELF_STEAL_HOST=%q\n' "$SELF_STEAL_HOST"
     printf 'export VISION_SNI=%q\n' "$VISION_SNI"
     if (( ENABLE_XHTTP )); then
-    printf 'export XHTTP_SNI=%q\n' "$XHTTP_SNI"
-    printf 'export XHTTP_PATH=%q\n' "$XHTTP_PATH"
+      printf 'export XHTTP_SNI=%q\n' "$XHTTP_SNI"
+      printf 'export XHTTP_PATH=%q\n' "$XHTTP_PATH"
+    fi
+    if (( ENABLE_CDN )); then
+      printf 'export ENABLE_CDN=1\n'
+      printf 'export CDN_HOST=%q\n' "$CDN_HOST"
+      printf 'export CDN_TRANSPORT=%q\n' "$CDN_TRANSPORT"
+      printf 'export CDN_WS_PATH=%q\n' "$CDN_WS_PATH"
+      printf 'export CDN_XHTTP_PATH=%q\n' "$CDN_XHTTP_PATH"
+      printf 'export CDN_GRPC_PATH=%q\n' "$CDN_GRPC_PATH"
     fi
     printf 'export PANEL_IP=%q\n' "$PANEL_IP"
     printf 'export NODE_API_PORT=%q\n' "$NODE_API_PORT"
@@ -797,6 +1116,7 @@ export SERVER_IP BASE_DOMAIN PREFIX VLESS_HOST HY_HOST ACME_EMAIL \
 grep -qF "source $ENV_STORE" /root/.bashrc 2>/dev/null \
   || printf '[ -f %q ] && source %q\n' "$ENV_STORE" "$ENV_STORE" >> /root/.bashrc
 ok "Переменные сохранены в $ENV_STORE (0600, подхват в .bashrc)"
+write_config_profile
 
 echo
 hr
@@ -804,13 +1124,21 @@ kv "SERVER_IP"     "$SERVER_IP"
 kv "VLESS"         "$VLESS_HOST"
 kv "HYSTERIA2"     "$HY_HOST"
 kv "SELF_STEAL"    "$SELF_STEAL_HOST -> 127.0.0.1:9443"
+if (( SELF_STEAL_THEME_USED )); then
+  kv "Фасад"         "тема $SELF_STEAL_TEMPLATE"
+else
+  kv "Фасад"         "$SELF_STEAL_TEMPLATE_URL"
+fi
 if (( ENABLE_XHTTP )); then
   kv "XHTTP_SNI"     "$XHTTP_SNI"
   kv "XHTTP_PATH"    "$XHTTP_PATH"
-  else
-  kv "XHTTP_SNI"     "(отключено)"
-  kv "XHTTP_PATH"    "(отключено)"
-  fi
+else
+  kv "XHTTP"         "(отключено — профиль без inbound'а XHTTP)"
+fi
+if (( ENABLE_CDN )); then
+  kv "CDN"           "$CDN_HOST (транспорт: $CDN_TRANSPORT)"
+fi
+kv "Config Profile" "$NODE_DIR/Multiselect.json"
 kv "PANEL_IP"      "$PANEL_IP"
 kv "NODE_API_PORT" "$NODE_API_PORT"
 if (( CF_MODE )); then
@@ -853,12 +1181,14 @@ if [[ "$DNS_OK" -eq 0 && "$FORCE_DNS" -eq 0 ]]; then
   confirm "DNS не совпадает — сертификаты могут не выпуститься. Продолжить?" "n" \
     || die "Прервано из-за DNS. Поправьте A-записи или запустите с --force-dns."
 fi
-proto="$(echo | timeout 8 openssl s_client -connect "$XHTTP_SNI:443" -servername "$XHTTP_SNI" -alpn h2 -tls1_3 -brief 2>&1 \
-         | grep -Ei 'Protocol|ALPN' | tr '\n' ' ' || true)"
-if [[ -n "$proto" ]]; then
-  ok "SNI $XHTTP_SNI: $proto"
-else
-  warn "SNI $XHTTP_SNI: не удалось проверить TLS1.3/h2"
+if (( ENABLE_XHTTP )); then
+  proto="$(echo | timeout 8 openssl s_client -connect "$XHTTP_SNI:443" -servername "$XHTTP_SNI" -alpn h2 -tls1_3 -brief 2>&1 \
+           | grep -Ei 'Protocol|ALPN' | tr '\n' ' ' || true)"
+  if [[ -n "$proto" ]]; then
+    ok "SNI $XHTTP_SNI: $proto"
+  else
+    warn "SNI $XHTTP_SNI: не удалось проверить TLS1.3/h2"
+  fi
 fi
 
 step 3 "Базовые пакеты и Docker"
@@ -1108,8 +1438,44 @@ issue_cert() {
     return 1
   fi
 }
+
+# Сертификат для CDN-хоста: HTTP-01 здесь невозможен — за прокси на :80 отвечает
+# сам CDN, а не наша нода. Поэтому DNS-01 (`dns_cf`) тем же токеном Cloudflare.
+# acme.sh сохраняет креденшелы DNS-API в конфиг сертификата, поэтому cron
+# обновляет его так же, как остальные.
+issue_cert_dns() {
+  local d="$1" listed=0 days
+  local -a issue_args=(--issue --dns dns_cf -d "$d" --keylength ec-256)
+  [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]] \
+    || { warn "Для DNS-01 сертификата $d нужен CLOUDFLARE_API_TOKEN."; return 1; }
+  if "$ACME" --list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$d"; then
+    listed=1
+  fi
+  if (( listed )); then
+    if days="$(acme_cert_days_left "$d")" && (( days > 7 )); then
+      ok "Сертификат для $d уже выпущен (осталось ${days} дн.) — пропускаю issue"
+      return 0
+    fi
+    warn "Сертификат для $d отсутствует, нечитаем или истекает — перевыпускаю через DNS-01."
+    issue_args+=(--force)
+  fi
+  # dns_cf читает CF_Token; CF_Zone_ID избавляет от повторного поиска зоны.
+  export CF_Token="$CLOUDFLARE_API_TOKEN"
+  if [[ -n "${CF_ZONE_ID:-}" ]]; then export CF_Zone_ID="$CF_ZONE_ID"; fi
+  if ! "$ACME" "${issue_args[@]}"; then
+    warn "Не удалось выпустить сертификат для $d через DNS-01: проверьте права токена (Zone:Read + DNS:Edit) и CLOUDFLARE_ZONE."
+    return 1
+  fi
+}
+
 issue_cert "$SELF_STEAL_HOST" || die "Без сертификата $SELF_STEAL_HOST настоящий self-steal невозможен."
 issue_cert "$HY_HOST" || die "Не удалось подготовить обязательный сертификат Hysteria2."
+# Проверку через порт 80 для CDN-хоста не делаем вовсе: HTTP-01 за прокси
+# невозможно, а DNS-01 портов не требует и Caddy не останавливает.
+if (( ENABLE_CDN )); then
+  issue_cert_dns "$CDN_HOST" \
+    || die "CDN включён, но сертификат для $CDN_HOST не выпущен: без него CDN не сможет ходить на origin по Full (strict)."
+fi
 
 mkdir -p "$CERT_DIR/$SELF_STEAL_HOST" "$CERT_DIR/$HY_HOST"
 "$ACME" --install-cert -d "$SELF_STEAL_HOST" --ecc \
@@ -1123,9 +1489,23 @@ mkdir -p "$CERT_DIR/$SELF_STEAL_HOST" "$CERT_DIR/$HY_HOST"
   --reloadcmd "docker restart remnanode >/dev/null 2>&1 || true" \
   || die "install-cert для $HY_HOST не удался."
 
-for cert_file in \
-  "$CERT_DIR/$SELF_STEAL_HOST/key.pem" "$CERT_DIR/$SELF_STEAL_HOST/fullchain.pem" \
-  "$CERT_DIR/$HY_HOST/key.pem" "$CERT_DIR/$HY_HOST/fullchain.pem"; do
+if (( ENABLE_CDN )); then
+  mkdir -p "$CERT_DIR/$CDN_HOST"
+  "$ACME" --install-cert -d "$CDN_HOST" --ecc \
+    --key-file       "$CERT_DIR/$CDN_HOST/key.pem" \
+    --fullchain-file "$CERT_DIR/$CDN_HOST/fullchain.pem" \
+    --reloadcmd "systemctl reload caddy >/dev/null 2>&1 || true" \
+    || die "Не удалось установить сертификат CDN для $CDN_HOST."
+fi
+
+cert_files=(
+  "$CERT_DIR/$SELF_STEAL_HOST/key.pem" "$CERT_DIR/$SELF_STEAL_HOST/fullchain.pem"
+  "$CERT_DIR/$HY_HOST/key.pem" "$CERT_DIR/$HY_HOST/fullchain.pem"
+)
+if (( ENABLE_CDN )); then
+  cert_files+=("$CERT_DIR/$CDN_HOST/key.pem" "$CERT_DIR/$CDN_HOST/fullchain.pem")
+fi
+for cert_file in "${cert_files[@]}"; do
   [[ -s "$cert_file" ]] || die "Сертификат или ключ отсутствует/пуст: $cert_file"
 done
 
@@ -1135,6 +1515,11 @@ find "$CERT_DIR" -type f -name 'key.pem'       -exec chmod 600 {} \; || true
 find "$CERT_DIR" -type f -name 'fullchain.pem' -exec chmod 644 {} \; || true
 chown root:caddy "$CERT_DIR/$SELF_STEAL_HOST/key.pem" "$CERT_DIR/$SELF_STEAL_HOST/fullchain.pem"
 chmod 640 "$CERT_DIR/$SELF_STEAL_HOST/key.pem"
+if (( ENABLE_CDN )); then
+  # Caddy читает ключ CDN-хоста, поэтому права той же схемы, что у self-steal.
+  chown root:caddy "$CERT_DIR/$CDN_HOST/key.pem" "$CERT_DIR/$CDN_HOST/fullchain.pem"
+  chmod 640 "$CERT_DIR/$CDN_HOST/key.pem"
+fi
 ok "Сертификаты установлены в $CERT_DIR (автопродление — таймер/cron acme.sh)"
 
 step 7 "Caddyfile — SNI-роутинг и локальный self-steal сайт"
@@ -1143,7 +1528,11 @@ mkdir -p "$SELF_STEAL_ROOT"
 SELF_STEAL_TEMPLATE_TMP="$(mktemp)"
 if retry 3 3 curl -fsSL "$SELF_STEAL_TEMPLATE_URL" -o "$SELF_STEAL_TEMPLATE_TMP"; then
   install -m 644 "$SELF_STEAL_TEMPLATE_TMP" "$SELF_STEAL_ROOT/index.html"
-  ok "Шаблон закрытого файлообменника установлен"
+  if (( SELF_STEAL_THEME_USED )); then
+    ok "Фасад self-steal установлен (тема $SELF_STEAL_TEMPLATE)"
+  else
+    ok "Фасад self-steal установлен (SELF_STEAL_TEMPLATE_URL)"
+  fi
 else
   warn "Не удалось скачать шаблон — устанавливаю минимальную локальную заглушку."
   cat > "$SELF_STEAL_ROOT/index.html" <<EOF
@@ -1155,6 +1544,17 @@ chmod -R a=rX "$SELF_STEAL_ROOT"
 
 cp -a /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.backup-$(date +%F-%H%M%S)" 2>/dev/null || true
 prune_matching_files /etc/caddy 'Caddyfile.backup-*' 5
+# Маршрут XHTTP вырезается целиком, когда XHTTP выключен: иначе Caddy уводил бы
+# SNI XHTTP в 127.0.0.1:10444, где после отключения inbound'а никто не слушает.
+XHTTP_L4_BLOCK=""
+if (( ENABLE_XHTTP )); then
+  XHTTP_L4_BLOCK="$(printf '      @xhttp tls sni %s\n      route @xhttp {\n        proxy 127.0.0.1:10444\n      }' "$XHTTP_SNI")"
+fi
+# SNI CDN-хоста уводим на отдельный TLS-сайт: именно с ним приходит CDN на :443.
+CDN_L4_BLOCK=""
+if (( ENABLE_CDN )); then
+  CDN_L4_BLOCK="$(printf '      @cdn tls sni %s\n      route @cdn {\n        proxy 127.0.0.1:%s\n      }' "$CDN_HOST" "$CDN_TLS_PORT")"
+fi
 cat > /etc/caddy/Caddyfile <<EOF
 {
   auto_https disable_redirects
@@ -1164,10 +1564,8 @@ cat > /etc/caddy/Caddyfile <<EOF
       route @vision {
         proxy 127.0.0.1:10443
       }
-      @xhttp tls sni $XHTTP_SNI
-      route @xhttp {
-        proxy 127.0.0.1:10444
-      }
+$XHTTP_L4_BLOCK
+$CDN_L4_BLOCK
       route {
         proxy 127.0.0.1:9443
       }
@@ -1198,13 +1596,58 @@ https://$SELF_STEAL_HOST:9443 {
   file_server
 }
 EOF
+
+if (( ENABLE_CDN )); then
+  # Отдельный блок для CDN-хоста. Публичный TLS терминирует CDN, а к нам на :443
+  # приходит уже его SNI — отсюда маршрут @cdn в layer4. Здесь мы терминируем
+  # TLS сертификатом CDN-хоста и отдаём: пути инбаундов — в Xray (loopback),
+  # всё остальное — тот же фасад, что и на self-steal сайте. Сторонний сканер
+  # по CDN-хосту видит обычный веб-сайт. Xray при этом не смотрит наружу.
+  CDN_ROUTES_BLOCK=""
+  if (( CDN_WS_ENABLED )); then
+    CDN_ROUTES_BLOCK+="$(printf '\n  @ws path %s*\n  reverse_proxy @ws 127.0.0.1:%s' "$CDN_WS_PATH" "$CDN_WS_PORT")"
+  fi
+  if (( CDN_XHTTP_ENABLED )); then
+    CDN_ROUTES_BLOCK+="$(printf '\n  @xhttpcdn path %s*\n  reverse_proxy @xhttpcdn 127.0.0.1:%s' "$CDN_XHTTP_PATH" "$CDN_XHTTP_PORT")"
+  fi
+  if (( CDN_GRPC_ENABLED )); then
+    # gRPC: Xray слушает h2c (HTTP/2 без TLS), поэтому upstream — h2c://...;
+    # поток не буферизуем, иначе gRPC-стримы будут ждать закрытия ответа.
+    CDN_ROUTES_BLOCK+="$(printf '\n  @grpccdn path %s/*\n  reverse_proxy @grpccdn h2c://127.0.0.1:%s {\n    flush_interval -1\n  }' "$CDN_GRPC_PATH" "$CDN_GRPC_PORT")"
+  fi
+  cat >> /etc/caddy/Caddyfile <<EOF
+
+https://$CDN_HOST:$CDN_TLS_PORT {
+  bind 127.0.0.1
+  tls $CERT_DIR/$CDN_HOST/fullchain.pem $CERT_DIR/$CDN_HOST/key.pem {
+    protocols tls1.2 tls1.3
+  }
+$CDN_ROUTES_BLOCK
+  root * $SELF_STEAL_ROOT
+  header {
+    -Server
+    Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:; form-action 'none'; base-uri 'none'; frame-ancestors 'none'"
+    X-Content-Type-Options nosniff
+    Referrer-Policy no-referrer
+    Permissions-Policy "camera=(), microphone=(), geolocation=()"
+    Strict-Transport-Security "max-age=31536000"
+  }
+  file_server
+}
+EOF
+fi
+
 caddy fmt --overwrite /etc/caddy/Caddyfile || warn "caddy fmt не удался — продолжаю."
 caddy validate --config /etc/caddy/Caddyfile || die "Caddyfile невалиден — исправьте SNI/синтаксис."
 systemctl restart caddy || die "Не удалось перезапустить Caddy."
 sleep 1
 if systemctl is-active --quiet caddy; then
   CADDY_RESTORE_NEEDED=0
-  ok "Caddy запущен: :443 L4, HTTP->HTTPS 301, и локальный TLS-сайт 127.0.0.1:9443"
+  if (( ENABLE_XHTTP )); then
+    ok "Caddy запущен: :443 L4 (Vision + XHTTP), HTTP->HTTPS 301, и локальный TLS-сайт 127.0.0.1:9443"
+  else
+    ok "Caddy запущен: :443 L4 (только Vision), HTTP->HTTPS 301, и локальный TLS-сайт 127.0.0.1:9443"
+  fi
 else
   die "Caddy не поднялся. journalctl -u caddy -n 50"
 fi
@@ -1365,10 +1808,29 @@ has_udp_listener() {
 }
 
 all_protocol_listeners_ready() {
-  has_tcp_listener 443 \
+  local xhttp_ready=1 cdn_ready=1
+  # 10444 слушает только включённый XHTTP: с выключенным профилем его нет.
+  if (( ENABLE_XHTTP )); then
+    has_tcp_listener_at 127.0.0.1 10444 || xhttp_ready=0
+  fi
+  # CDN-сайт Caddy слушает всегда, когда включён CDN, а инбаунды — только если
+  # они есть в назначенном панелью профиле (то есть включены на карточке ноды).
+  if (( ENABLE_CDN )); then
+    has_tcp_listener_at 127.0.0.1 "$CDN_TLS_PORT" || cdn_ready=0
+    if (( CDN_WS_ENABLED )); then
+      has_tcp_listener_at 127.0.0.1 "$CDN_WS_PORT" || cdn_ready=0
+    fi
+    if (( CDN_XHTTP_ENABLED )); then
+      has_tcp_listener_at 127.0.0.1 "$CDN_XHTTP_PORT" || cdn_ready=0
+    fi
+    if (( CDN_GRPC_ENABLED )); then
+      has_tcp_listener_at 127.0.0.1 "$CDN_GRPC_PORT" || cdn_ready=0
+    fi
+  fi
+  (( xhttp_ready == 1 && cdn_ready == 1 )) \
+    && has_tcp_listener 443 \
     && has_tcp_listener_at 127.0.0.1 9443 \
     && has_tcp_listener_at 127.0.0.1 10443 \
-    && has_tcp_listener_at 127.0.0.1 10444 \
     && has_tcp_listener "$NODE_API_PORT" \
     && has_udp_listener 443
 }
@@ -1384,7 +1846,7 @@ for _ in $(seq 1 30); do
 done
 
 printf '   %s%sTCP listeners%s\n' "$C_B" "$C_MAG" "$C_RST"
-ss -lntup 2>/dev/null | grep -E ':443|:9443|:10443|:10444|:'"$NODE_API_PORT" | sed 's/^/     /' || true
+ss -lntup 2>/dev/null | grep -E ':443|:9443|:9444|:10443|:10444|:10446|:10447|:'"$NODE_API_PORT" | sed 's/^/     /' || true
 printf '   %s%sUDP listeners (Hysteria2)%s\n' "$C_B" "$C_MAG" "$C_RST"
 ss -lnuap 2>/dev/null | grep ':443' | sed 's/^/     /' || true
 
@@ -1392,10 +1854,31 @@ if [[ "$listeners_ready" -ne 1 ]]; then
   has_tcp_listener 443 || warn "Caddy L4 не слушает TCP/443."
   has_tcp_listener_at 127.0.0.1 9443 || warn "Self-steal сайт не слушает 127.0.0.1:9443."
   has_tcp_listener_at 127.0.0.1 10443 || warn "Vision inbound не слушает 127.0.0.1:10443."
-  has_tcp_listener_at 127.0.0.1 10444 || warn "XHTTP inbound не слушает 127.0.0.1:10444."
+  if (( ENABLE_XHTTP )); then
+    has_tcp_listener_at 127.0.0.1 10444 || warn "XHTTP inbound не слушает 127.0.0.1:10444."
+  fi
+  if (( ENABLE_CDN )); then
+    has_tcp_listener_at 127.0.0.1 "$CDN_TLS_PORT" \
+      || warn "CDN-сайт Caddy не слушает 127.0.0.1:$CDN_TLS_PORT."
+    if (( CDN_WS_ENABLED )); then
+      has_tcp_listener_at 127.0.0.1 "$CDN_WS_PORT" \
+        || warn "WS-inbound CDN не слушает 127.0.0.1:$CDN_WS_PORT (включён ли VLESS_CDN_WS на карточке ноды?)."
+    fi
+    if (( CDN_XHTTP_ENABLED )); then
+      has_tcp_listener_at 127.0.0.1 "$CDN_XHTTP_PORT" \
+        || warn "XHTTP-inbound CDN не слушает 127.0.0.1:$CDN_XHTTP_PORT (включён ли VLESS_CDN_XHTTP на карточке ноды?)."
+    fi
+    if (( CDN_GRPC_ENABLED )); then
+      has_tcp_listener_at 127.0.0.1 "$CDN_GRPC_PORT" \
+        || warn "gRPC-inbound CDN не слушает 127.0.0.1:$CDN_GRPC_PORT (включён ли VLESS_CDN_GRPC на карточке ноды?)."
+    fi
+  fi
   has_tcp_listener "$NODE_API_PORT" || warn "Node API не слушает порт $NODE_API_PORT."
   has_udp_listener 443 || warn "Hysteria2 не слушает UDP/443."
   docker logs remnanode --tail 120 2>&1 | sed 's/^/   /' || true
+  if (( ENABLE_CDN )); then
+    note "CDN включён: назначенный Config Profile должен содержать выбранные VLESS_CDN_*, а на карточке ноды они должны быть включены."
+  fi
   die "Не все inbound'ы поднялись за 60s. Проверьте назначенный Config Profile в Remnawave."
 fi
 ok "Все TCP/UDP-слушатели активны"
@@ -1415,7 +1898,16 @@ check_tls_route() {
 }
 
 tls_failures=0
-for pair in "Vision:$VISION_SNI" "XHTTP:$XHTTP_SNI"; do
+ROUTE_PAIRS=("Vision:$VISION_SNI")
+if (( ENABLE_XHTTP )); then
+  ROUTE_PAIRS+=("XHTTP:$XHTTP_SNI")
+fi
+if (( ENABLE_CDN )); then
+  # Проверяем именно origin-плечо: сертификат для CDN-хоста должен проходить
+  # проверку имени, иначе Cloudflare в режиме Full (strict) отвергнет origin.
+  ROUTE_PAIRS+=("CDN:$CDN_HOST")
+fi
+for pair in "${ROUTE_PAIRS[@]}"; do
   name="${pair%%:*}"; sni="${pair#*:}"
   check_tls_route "$name" "$sni" || tls_failures=$((tls_failures + 1))
 done
@@ -1480,13 +1972,27 @@ printf '%s%s╰─────────────────────�
 echo
 printf '   %s%sКонфигурация нод-инбаундов (сверьте в панели)%s\n' "$C_B" "$C_MAG" "$C_RST"
 kv "Vision/Reality" "SNI $SELF_STEAL_HOST  →  127.0.0.1:10443  (target: 127.0.0.1:9443)"
-kv "XHTTP"          "SNI $XHTTP_SNI  path $XHTTP_PATH  →  127.0.0.1:10444"
+if (( ENABLE_XHTTP )); then
+  kv "XHTTP"          "SNI $XHTTP_SNI  path $XHTTP_PATH  →  127.0.0.1:10444"
+else
+  kv "XHTTP"          "(отключено — режим только Vision)"
+fi
+if (( ENABLE_CDN )); then
+  kv "VLESS за CDN"   "$CDN_HOST  →  origin 127.0.0.1:$CDN_TLS_PORT  ($CDN_TRANSPORT)"
+  if (( CDN_WS_ENABLED )); then kv "  CDN: ws" "path $CDN_WS_PATH  →  127.0.0.1:$CDN_WS_PORT"; fi
+  if (( CDN_XHTTP_ENABLED )); then kv "  CDN: xhttp" "path $CDN_XHTTP_PATH  →  127.0.0.1:$CDN_XHTTP_PORT"; fi
+  if (( CDN_GRPC_ENABLED )); then kv "  CDN: grpc" "serviceName $CDN_GRPC_PATH  →  h2c 127.0.0.1:$CDN_GRPC_PORT"; fi
+fi
 kv "Hysteria2"      "UDP/443 напрямую  (cert $CERT_DIR/$HY_HOST)"
 kv "HTTP 301"       "TCP/80  →  https://$SELF_STEAL_HOST  (путь и query сохраняются)"
 kv "TLS"            "1.2/1.3 + HSTS max-age=31536000 на self-steal сайте"
 kv "Node API"       "$SERVER_IP:$NODE_API_PORT  (только с панели $PANEL_IP)"
 kv "Образ ноды"     "$NODE_IMAGE"
 echo
+if (( SELF_STEAL_THEME_USED )); then
+  kv "Тема фасада"    "$SELF_STEAL_TEMPLATE"
+fi
+kv "Config Profile" "$NODE_DIR/Multiselect.json  (вставьте в панели → Config Profiles)"
 kv "Лог установки"   "$LOG_FILE"
 kv "Логи ноды"       "docker logs remnanode --tail 120"
 kv "Логи Xray"      "docker exec -it remnanode tail -n +1 -f /var/log/xray/current"

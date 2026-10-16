@@ -40,7 +40,10 @@ jobs:
           npx --yes json5@2.2.3 -s 2 Xray_template_split.json > /tmp/xray-template-split.json
           jq -e . /tmp/multiselect.json /tmp/xray-template.json /tmp/xray-template-split.json >/dev/null
           jq -e '
-            [.inbounds[].tag] == ["REALITY_VISION", "REALITY_XHTTP", "HYSTERIA2"] and
+            [.inbounds[].tag] == [
+              "REALITY_VISION", "REALITY_XHTTP", "HYSTERIA2",
+              "VLESS_CDN_WS", "VLESS_CDN_XHTTP", "VLESS_CDN_GRPC"
+            ] and
             (.inbounds[0].listen == "127.0.0.1") and
             (.inbounds[0].port == 10443) and
             (.inbounds[0].streamSettings.realitySettings.minClientVer == "0.0.0") and
@@ -49,7 +52,17 @@ jobs:
             (.inbounds[1].port == 10444) and
             (.inbounds[1].streamSettings.realitySettings.minClientVer == "0.0.0") and
             (.inbounds[2].listen == "0.0.0.0") and
-            (.inbounds[2].port == 443)
+            (.inbounds[2].port == 443) and
+            # CDN-инбаунды: только loopback и без собственного TLS — публичный
+            # TLS терминируют CDN и Caddy, Xray наружу не смотрит.
+            ([.inbounds[3,4,5].listen] == ["127.0.0.1", "127.0.0.1", "127.0.0.1"]) and
+            ([.inbounds[3,4,5].port] == [10446, 10447, 10448]) and
+            ([.inbounds[3,4,5].streamSettings.security] | all(. == "none")) and
+            (.inbounds[3].streamSettings.network == "ws") and
+            (.inbounds[3].streamSettings.wsSettings.path == "/api/v1/stream") and
+            (.inbounds[4].streamSettings.network == "xhttp") and
+            (.inbounds[5].streamSettings.network == "grpc") and
+            (.inbounds[5].streamSettings.grpcSettings.serviceName == "/api/v4/stream")
           ' /tmp/multiselect.json >/dev/null
           jq -e '
             (.remnawave.injectHosts[0].selector.type == "tagRegex") and
@@ -74,8 +87,12 @@ jobs:
 
       - name: Validate facade JavaScript
         run: |
-          sed -n '/<script>/,/<\/script>/p' self-steal-site.html | sed '1d;$d' > /tmp/self-steal-site.js
-          node --check /tmp/self-steal-site.js
+          # Каждая тема фасада — самостоятельный файл со своим инлайновым скриптом.
+          for f in self-steal-templates/*.html; do
+            sed -n '/<script>/,/<\/script>/p' "$f" | sed '1d;$d' > /tmp/facade.js
+            node --check /tmp/facade.js || { echo "✖ $f: скрипт не проходит node --check" >&2; exit 1; }
+          done
+          echo "✔ скрипты всех тем self-steal валидны"
 
       - name: Integration-test the generated Caddyfile on a real Caddy
         run: bash tests/caddy-http-checks.sh
@@ -268,3 +285,97 @@ jobs:
             || fail "в README нет раздела про Cloudflare"
 
           echo "✔ инварианты Cloudflare на месте"
+
+          # Проверки Config Profile (Multiselect.json): профиль обязан
+          # сохраняться, а его состав — совпадать с режимом XHTTP.
+
+          # 32. Установщик сохраняет готовый профиль (панель отдаёт именно его
+          #     ноде) и убирает из него inbound XHTTP, когда тот выключен:
+          #     иначе профиль и Caddyfile разошлись бы и нода слушала бы 10444.
+          grep -q '^multiselect_filter() {' remnanode-setup.sh \
+            || fail "нет multiselect_filter (адаптация шаблона профиля)"
+          grep -q '^write_config_profile() {' remnanode-setup.sh \
+            || fail "нет write_config_profile (сохранение профиля)"
+          # Вырезание REALITY_XHTTP при выключенном XHTTP живёт внутри jq-фильтра
+          # multiselect_filter; что оно работает, проверяет юнит-тест ниже
+          # (ENABLE_XHTTP=0 → в профиле только REALITY_VISION и HYSTERIA2).
+          grep -qF 'startswith("VLESS_CDN_")' remnanode-setup.sh \
+            || fail "jq-фильтр профиля не отличает CDN-инбаунды от REALITY_XHTTP"
+          grep -qF 'out="$NODE_DIR/Multiselect.json"' remnanode-setup.sh \
+            || fail "Config Profile не сохраняется в NODE_DIR"
+
+          # 33. В режиме без XHTTP не генерируется и L4-маршрут на 10444.
+          grep -qF '$XHTTP_L4_BLOCK' remnanode-setup.sh \
+            || fail "в Caddyfile нет условной подстановки L4-маршрута XHTTP (переменная не используется)"
+          grep -qF 'XHTTP_SNI, XHTTP_PATH, ENABLE_XHTTP,' remnanode-setup.sh \
+            || fail "usage() не документирует ENABLE_XHTTP"
+          grep -qF 'отключает XHTTP в selfsteal' README.md \
+            || fail "README не описывает отключение XHTTP в selfsteal"
+
+          # 34. Проверки профиля покрыты юнит-тестами: шаблон берётся из
+          #     репозитория, поэтому переименование tag'а сломает CI, а не
+          #     установку на сервере пользователя.
+          grep -qF 'multiselect_filter cdn_transport_enabled write_config_profile' tests/installer-funcs-checks.sh \
+            || fail "multiselect_filter не покрыт tests/installer-funcs-checks.sh"
+          bash tests/installer-funcs-checks.sh >/dev/null \
+            || fail "tests/installer-funcs-checks.sh не прошёл после правок профиля"
+
+          echo "✔ инварианты Config Profile на месте"
+
+          # Проверки тем фасада self-steal.
+
+          # 35. Список тем в установщике обязан совпадать с файлами в репозитории:
+          #     иначе --self-steal-template NAME приведёт к 404 на ноде.
+          themes_setup="$(sed -n '/^SELF_STEAL_TEMPLATES=(/p' remnanode-setup.sh \
+            | sed 's/^SELF_STEAL_TEMPLATES=(//; s/).*//' | tr ' ' '\n' | sed '/^$/d' | sort)"
+          themes_files="$(ls self-steal-templates/*.html | xargs -n1 basename | sed 's/\.html$//' | sort)"
+          [[ "$themes_setup" == "$themes_files" ]] \
+            || fail "темы в установщике не совпадают с файлами: [$(echo "$themes_setup" | tr '\n' ' ')] vs [$(echo "$themes_files" | tr '\n' ' ')]"
+
+          # 36. Каждая тема автономна: без внешних ресурсов (CSP ставит
+          #     default-src 'none'), с noindex и инлайновым скриптом.
+          for f in self-steal-templates/*.html; do
+            grep -qF '<meta name="robots" content="noindex, nofollow">' "$f" \
+              || fail "$f: нет noindex, nofollow"
+            grep -q '<script>' "$f" || fail "$f: нет инлайнового скрипта"
+            if grep -qE '(src|href)="https?://' "$f" || grep -qE '@import|url\(https?://' "$f"; then
+              fail "$f: ссылка на внешний ресурс — CSP её всё равно заблокирует"
+            fi
+          done
+
+          # 37. Флаг и переменная описаны в usage() и README.
+          grep -qF -- '--self-steal-template T' remnanode-setup.sh \
+            || fail "usage() не описывает --self-steal-template"
+          grep -qF 'SELF_STEAL_TEMPLATE, SELF_STEAL_TEMPLATE_URL' remnanode-setup.sh \
+            || fail "usage() не описывает SELF_STEAL_TEMPLATE"
+          grep -qF 'Фасад self-steal: темы' README.md \
+            || fail "README не описывает темы фасада self-steal"
+
+          echo "✔ инварианты тем self-steal на месте"
+
+          # Проверки VLESS за CDN: протокол живёт в установщике, профиле,
+          # тестах и README — разъехавшиеся части ломают установку на сервере.
+
+          # 38. usage() документирует CDN-переменные — как README.
+          grep -qF 'ENABLE_CDN, CDN_HOST, CDN_TRANSPORT' remnanode-setup.sh \
+            || fail "usage() не документирует ENABLE_CDN/CDN_*"
+          grep -qF 'ENABLE_CDN`, `CDN_HOST`, `CDN_TRANSPORT`' README.md \
+            || fail "README не описывает переменные CDN"
+
+          # 39. README описывает сам протокол и работу с панелью.
+          grep -qF '## VLESS за CDN (Cloudflare)' README.md \
+            || fail "в README нет раздела про VLESS за CDN"
+          grep -qF '#vless-за-cdn-cloudflare' README.md \
+            || fail "в README нет ссылок на раздел про VLESS за CDN"
+          grep -qF 'Security layer' README.md \
+            || fail "README не объясняет Security layer TLS для CDN-хоста"
+
+          # 40. CDN-инбаунды есть в профиле, а их состав и пути покрыты тестами.
+          grep -qF '"tag": "VLESS_CDN_WS"' Multiselect.json \
+            || fail "в Multiselect.json нет CDN-инбаунда VLESS_CDN_WS"
+          grep -qF 'VLESS_CDN' tests/caddy-http-checks.sh \
+            || fail "CDN-маршруты Caddy не покрыты tests/caddy-http-checks.sh"
+          bash tests/installer-funcs-checks.sh >/dev/null \
+            || fail "tests/installer-funcs-checks.sh не прошёл после правок CDN"
+
+          echo "✔ инварианты VLESS за CDN на месте"

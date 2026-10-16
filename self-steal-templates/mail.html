@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Mailflux — Webmail sign in</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #eef1f6;
+      --surface: #ffffff;
+      --line: #dbe1ea;
+      --text: #1b2430;
+      --muted: #6b7789;
+      --brand: #2f6fed;
+      --brand-soft: #e8f0ff;
+      --ok: #127a55;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Ubuntu, Cantarell, "Helvetica Neue", Arial, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    body { min-height: 100vh; margin: 0; color: var(--text); background: var(--bg); }
+    button, input { font: inherit; }
+    button { cursor: pointer; }
+    .icon { width: 1.15rem; height: 1.15rem; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+
+    .topbar { display: flex; align-items: center; gap: 1rem; height: 3.4rem; padding: 0 1.1rem; border-bottom: 1px solid var(--line); background: var(--surface); }
+    .brand { display: flex; align-items: center; gap: .6rem; font-weight: 700; letter-spacing: -.01em; }
+    .brand-mark { display: grid; place-items: center; width: 1.9rem; height: 1.9rem; border-radius: .55rem; color: #fff; background: linear-gradient(135deg, #2f6fed, #4aa8ff); }
+    .search { flex: 1; max-width: 26rem; }
+    .search input { width: 100%; padding: .55rem .8rem; border: 1px solid var(--line); border-radius: .55rem; outline: 0; background: #f7f9fc; color: var(--text); }
+    .avatar { display: grid; place-items: center; width: 2rem; height: 2rem; margin-left: auto; border-radius: 50%; color: #fff; background: #7b8aa3; font-size: .78rem; font-weight: 700; }
+
+    .shell { display: grid; grid-template-columns: 13.5rem 1fr; min-height: calc(100vh - 3.4rem); }
+    .rail { padding: 1rem .8rem; border-right: 1px solid var(--line); background: var(--surface); }
+    .compose { display: flex; align-items: center; justify-content: center; gap: .5rem; width: 100%; height: 2.5rem; border: 0; border-radius: .6rem; color: #fff; background: var(--brand); font-weight: 650; }
+    .folder { display: flex; align-items: center; gap: .65rem; width: 100%; margin-top: .2rem; padding: .55rem .6rem; border: 0; border-radius: .5rem; color: var(--muted); background: transparent; text-align: left; }
+    .folder.active { color: var(--brand); background: var(--brand-soft); font-weight: 650; }
+    .folder .count { margin-left: auto; color: #96a1b3; font-size: .78rem; }
+    .quota { margin-top: 1.2rem; padding: .8rem; border: 1px solid var(--line); border-radius: .6rem; color: var(--muted); font-size: .74rem; }
+    .quota .bar { height: .35rem; margin: .5rem 0; border-radius: 2rem; background: #e6ebf3; overflow: hidden; }
+    .quota .bar::before { content: ""; display: block; width: 22%; height: 100%; background: var(--brand); }
+
+    .list { min-width: 0; background: var(--surface); }
+    .list-head { display: flex; align-items: center; gap: .8rem; padding: .9rem 1.1rem; border-bottom: 1px solid var(--line); }
+    .list-head h1 { margin: 0; font-size: 1.05rem; letter-spacing: -.01em; }
+    .list-head .meta { margin-left: auto; color: var(--muted); font-size: .78rem; }
+    .mail { display: grid; grid-template-columns: 1.1rem 12rem minmax(0, 1fr) 6rem; align-items: center; gap: .8rem; padding: .8rem 1.1rem; border-bottom: 1px solid var(--line); }
+    .mail.unread { background: #f8faff; }
+    .dot { width: .5rem; height: .5rem; border-radius: 50%; background: var(--brand); }
+    .mail.read .dot { background: #cfd6e2; }
+    .from { overflow: hidden; font-size: .87rem; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+    .subject { overflow: hidden; color: var(--muted); font-size: .86rem; text-overflow: ellipsis; white-space: nowrap; }
+    .when { color: #8b96a8; font-size: .76rem; text-align: right; }
+
+    .veil { position: fixed; inset: 0; z-index: 5; display: grid; place-items: center; padding: 1.2rem; background: rgba(27, 36, 48, .35); }
+    .card { width: min(100%, 24.5rem); padding: 1.6rem; border: 1px solid var(--line); border-radius: .9rem; background: var(--surface); box-shadow: 0 26px 60px rgba(20, 30, 46, .2); }
+    .card .brand { padding-bottom: .9rem; }
+    .card h2 { margin: 0 0 .4rem; font-size: 1.35rem; letter-spacing: -.02em; }
+    .card p.lead { margin: 0 0 1.2rem; color: var(--muted); font-size: .86rem; line-height: 1.5; }
+    label { display: block; margin: .85rem 0 .35rem; color: #48556a; font-size: .75rem; font-weight: 650; }
+    input[type="text"], input[type="password"] { width: 100%; padding: .68rem .75rem; border: 1px solid var(--line); border-radius: .55rem; outline: 0; background: #fff; color: var(--text); }
+    input:focus { border-color: var(--brand); box-shadow: 0 0 0 3px rgba(47, 111, 237, .14); }
+    .row { display: flex; align-items: center; justify-content: space-between; margin-top: .9rem; color: var(--muted); font-size: .78rem; }
+    .submit { width: 100%; margin-top: 1.1rem; height: 2.6rem; border: 0; border-radius: .6rem; color: #fff; background: var(--brand); font-weight: 650; }
+    .notice { display: none; margin-top: .8rem; padding: .6rem .7rem; border: 1px solid #f2c9c9; border-radius: .5rem; color: #8f2b2b; background: #fdf1f1; font-size: .78rem; }
+    .notice.on { display: block; }
+    .secure { display: flex; align-items: center; justify-content: center; gap: .4rem; margin-top: 1rem; color: #8b96a8; font-size: .72rem; }
+
+    @media (max-width: 780px) {
+      .shell { grid-template-columns: 1fr; }
+      .rail { display: none; }
+      .mail { grid-template-columns: 1rem minmax(0, 1fr) 4.5rem; }
+      .mail .subject { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark"><svg class="icon" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7 9 6 9-6"/></svg></span>Mailflux</div>
+    <div class="search"><input type="text" placeholder="Search mail" tabindex="-1"></div>
+    <span class="avatar">A</span>
+  </header>
+
+  <div class="shell" aria-hidden="true">
+    <aside class="rail">
+      <button class="compose"><svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>Compose</button>
+      <button class="folder active"><svg class="icon" viewBox="0 0 24 24"><path d="M4 6h16v13H4z"/><path d="m4 7 8 6 8-6"/></svg>Inbox<span class="count">12</span></button>
+      <button class="folder"><svg class="icon" viewBox="0 0 24 24"><path d="m12 3 2.7 5.5 6.1.9-4.4 4.3 1 6.1-5.4-2.9-5.4 2.9 1-6.1-4.4-4.3 6.1-.9z"/></svg>Starred</button>
+      <button class="folder"><svg class="icon" viewBox="0 0 24 24"><path d="M6 2h8l4 4v16H6zM14 2v5h5"/></svg>Drafts<span class="count">3</span></button>
+      <button class="folder"><svg class="icon" viewBox="0 0 24 24"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 19h14"/></svg>Sent</button>
+      <button class="folder"><svg class="icon" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3m-9 0 1 13h10l1-13"/></svg>Archive</button>
+      <div class="quota"><div>Mailbox storage</div><div class="bar"></div><div>2.1 GB of 10 GB used</div></div>
+    </aside>
+
+    <main class="list">
+      <div class="list-head"><h1>Inbox</h1><span class="meta">12 unread · 148 messages</span></div>
+      <div class="mail unread"><span class="dot"></span><span class="from">Aurora Logistics</span><span class="subject">Shipment #4821 cleared customs — documents attached</span><span class="when">09:41</span></div>
+      <div class="mail unread"><span class="dot"></span><span class="from">Helena Kowalski</span><span class="subject">Re: Q3 forecast review — updated figures</span><span class="when">08:57</span></div>
+      <div class="mail unread"><span class="dot"></span><span class="from">Billing</span><span class="subject">Invoice 2026-0871 is available in your account</span><span class="when">Tue</span></div>
+      <div class="mail read"><span class="dot"></span><span class="from">Design team</span><span class="subject">Component library 4.2 released</span><span class="when">Tue</span></div>
+      <div class="mail read"><span class="dot"></span><span class="from">Security</span><span class="subject">Scheduled sign-in review for your workspace</span><span class="when">Mon</span></div>
+      <div class="mail read"><span class="dot"></span><span class="from">Milena Duarte</span><span class="subject">Notes from the partner call</span><span class="when">Aug 9</span></div>
+    </main>
+  </div>
+
+  <div class="veil">
+    <form class="card" id="login-form" autocomplete="off">
+      <div class="brand"><span class="brand-mark"><svg class="icon" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7 9 6 9-6"/></svg></span>Mailflux</div>
+      <h2>Sign in to webmail</h2>
+      <p class="lead">Use your e-mail address and password to open the mailbox.</p>
+      <label for="account">E-mail address</label>
+      <input id="account" type="text" inputmode="email" placeholder="name@company.com" required>
+      <label for="password">Password</label>
+      <input id="password" type="password" placeholder="Enter your password" required>
+      <div class="row"><label for="remember" style="margin:0;font-weight:500"><input id="remember" type="checkbox"> Keep me signed in</label><span>Need help?</span></div>
+      <button class="submit" type="submit">Sign in</button>
+      <div class="notice" id="notice" role="status">The mail service is not responding right now. Please try again in a few minutes.</div>
+      <div class="secure"><svg class="icon" viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>Encrypted connection · session ends after 30 minutes idle</div>
+    </form>
+  </div>
+
+  <script>
+    document.getElementById('login-form').addEventListener('submit', function (event) {
+      event.preventDefault();
+      document.getElementById('account').value = '';
+      document.getElementById('password').value = '';
+      document.getElementById('notice').classList.add('on');
+    });
+  </script>
+</body>
+</html>

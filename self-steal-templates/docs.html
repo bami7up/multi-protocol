@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Handbuch — Deployment guide</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #ffffff;
+      --side: #f8f9fb;
+      --line: #e5e8ee;
+      --text: #171a1f;
+      --muted: #646e7c;
+      --accent: #6b4ee6;
+      --accent-soft: #f0ecff;
+      --code: #f4f5f7;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Ubuntu, Cantarell, "Helvetica Neue", Arial, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    body { min-height: 100vh; margin: 0; color: var(--text); background: var(--bg); }
+    button, input { font: inherit; }
+    button { cursor: pointer; }
+    .icon { width: 1.1rem; height: 1.1rem; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+
+    .top { position: sticky; top: 0; display: flex; align-items: center; gap: .9rem; height: 3.5rem; padding: 0 1.2rem; border-bottom: 1px solid var(--line); background: rgba(255,255,255,.92); backdrop-filter: blur(8px); z-index: 2; }
+    .brand { display: flex; align-items: center; gap: .55rem; font-weight: 700; letter-spacing: -.01em; }
+    .mark { display: grid; place-items: center; width: 1.8rem; height: 1.8rem; border-radius: .5rem; color: #fff; background: linear-gradient(135deg, var(--accent), #9a7bff); }
+    .crumb { color: var(--muted); font-size: .82rem; }
+    .top .grow { flex: 1; }
+    .search { display: flex; align-items: center; gap: .5rem; width: min(22rem, 38vw); padding: .45rem .7rem; border: 1px solid var(--line); border-radius: .5rem; color: var(--muted); background: #fbfbfd; }
+    .search input { flex: 1; border: 0; outline: 0; background: transparent; color: var(--text); font-size: .86rem; }
+    .cta { padding: .5rem .9rem; border: 0; border-radius: .5rem; color: #fff; background: var(--accent); font-size: .84rem; font-weight: 600; }
+
+    .layout { display: grid; grid-template-columns: 16.5rem minmax(0, 1fr) 14rem; align-items: start; }
+    .side { min-height: calc(100vh - 3.5rem); padding: 1.2rem .8rem 3rem; border-right: 1px solid var(--line); background: var(--side); }
+    .side .h { margin: .9rem .7rem .35rem; color: #7a8393; font-size: .68rem; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
+    .sec { display: flex; align-items: center; gap: .5rem; width: 100%; padding: .45rem .7rem; border: 0; border-radius: .45rem; color: #3d4552; background: transparent; text-align: left; font-size: .86rem; }
+    .sec .chev { margin-left: auto; color: #98a1b0; transition: transform .18s ease; }
+    .sec.open .chev { transform: rotate(90deg); }
+    .pages { display: none; margin: 0 0 .4rem 1.1rem; padding-left: .6rem; border-left: 1px solid var(--line); }
+    .sec.open + .pages { display: block; }
+    .pages button { display: block; width: 100%; padding: .38rem .6rem; border: 0; border-radius: .4rem; color: var(--muted); background: transparent; text-align: left; font-size: .83rem; }
+    .pages button.on { color: var(--accent); background: var(--accent-soft); font-weight: 600; }
+
+    article { max-width: 44rem; padding: 2rem 2.2rem 4rem; }
+    article .eyebrow { color: var(--accent); font-size: .76rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+    article h1 { margin: .6rem 0 .8rem; font-size: clamp(1.5rem, 3vw, 2rem); letter-spacing: -.035em; }
+    article .lead { margin: 0 0 1.4rem; color: var(--muted); font-size: .95rem; line-height: 1.65; }
+    article h2 { margin: 2rem 0 .6rem; font-size: 1.1rem; letter-spacing: -.02em; }
+    article p { margin: .6rem 0; color: #37404d; font-size: .92rem; line-height: 1.7; }
+    article ul { margin: .6rem 0 .6rem 1.1rem; color: #37404d; font-size: .92rem; line-height: 1.75; }
+    pre { margin: .8rem 0; padding: .85rem 1rem; overflow-x: auto; border: 1px solid var(--line); border-radius: .5rem; background: var(--code); color: #2b3340; font-size: .82rem; line-height: 1.6; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .callout { margin: 1.1rem 0; padding: .8rem 1rem; border-left: 3px solid var(--accent); border-radius: 0 .4rem .4rem 0; background: var(--accent-soft); color: #3b3355; font-size: .87rem; line-height: 1.6; }
+
+    .toc { position: sticky; top: 4.4rem; padding: 1.6rem 1.2rem; color: var(--muted); font-size: .82rem; }
+    .toc .h { margin-bottom: .55rem; color: #7a8393; font-size: .68rem; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
+    .toc a { display: block; padding: .28rem 0; color: var(--muted); text-decoration: none; }
+    .toc a.on { color: var(--accent); font-weight: 600; }
+
+    .veil { position: fixed; inset: 0; z-index: 8; display: grid; place-items: center; padding: 1.2rem; background: rgba(23, 26, 31, .42); }
+    .dialog { width: min(100%, 24rem); padding: 1.5rem 1.6rem; border-radius: .8rem; background: #fff; box-shadow: 0 28px 70px rgba(23,26,31,.28); }
+    .dialog .mark { width: 2.1rem; height: 2.1rem; }
+    .dialog h2 { margin: .9rem 0 .3rem; font-size: 1.25rem; letter-spacing: -.02em; }
+    .dialog p { margin: 0 0 1.1rem; color: var(--muted); font-size: .85rem; line-height: 1.55; }
+    .auth { display: flex; gap: .5rem; margin-bottom: .9rem; }
+    .auth button { flex: 1; padding: .5rem; border: 1px solid var(--line); border-radius: .45rem; color: var(--muted); background: #fbfbfd; font-size: .8rem; }
+    .auth button.on { color: var(--accent); border-color: #cec2ff; background: var(--accent-soft); font-weight: 600; }
+    label { display: block; margin: .75rem 0 .3rem; color: #46505f; font-size: .74rem; font-weight: 650; }
+    .dialog input { width: 100%; padding: .62rem .7rem; border: 1px solid var(--line); border-radius: .45rem; outline: 0; }
+    .dialog input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(107,78,230,.13); }
+    .submit { width: 100%; margin-top: 1rem; padding: .66rem; border: 0; border-radius: .45rem; color: #fff; background: var(--accent); font-weight: 650; }
+    .notice { display: none; margin-top: .75rem; padding: .6rem .7rem; border-radius: .45rem; color: #8f2b2b; background: #fdf1f1; font-size: .78rem; }
+    .notice.on { display: block; }
+
+    @media (max-width: 960px) {
+      .layout { grid-template-columns: 1fr; }
+      .side, .toc { display: none; }
+      article { padding: 1.4rem 1.2rem 3rem; }
+      .search { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <header class="top">
+    <div class="brand"><span class="mark"><svg class="icon" viewBox="0 0 24 24"><path d="M5 4h9l5 5v11H5z"/><path d="M14 4v5h5"/></svg></span>Handbuch</div>
+    <span class="crumb">Guides / Operations</span>
+    <span class="grow"></span>
+    <div class="search"><svg class="icon" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input type="text" placeholder="Search documentation" tabindex="-1"></div>
+    <button class="cta">Sign in</button>
+  </header>
+
+  <div class="layout" aria-hidden="true">
+    <aside class="side">
+      <div class="h">Getting started</div>
+      <button class="sec open"><svg class="icon" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>Installation<svg class="chev icon" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
+      <div class="pages">
+        <button class="on">Requirements</button>
+        <button>Deployment</button>
+        <button>Upgrades</button>
+      </div>
+      <button class="sec"><svg class="icon" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>Networking<svg class="chev icon" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
+      <div class="pages"><button>Firewall</button><button>Reverse proxy</button></div>
+      <button class="sec"><svg class="icon" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>Certificates<svg class="chev icon" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
+      <div class="pages"><button>ACME</button><button>Renewal</button></div>
+      <div class="h">Reference</div>
+      <button class="sec"><svg class="icon" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>Configuration<svg class="chev icon" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
+      <div class="pages"><button>Environment</button><button>Limits</button></div>
+      <button class="sec"><svg class="icon" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>Troubleshooting<svg class="chev icon" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
+      <div class="pages"><button>Logs</button><button>Health checks</button></div>
+    </aside>
+
+    <article>
+      <div class="eyebrow">Installation</div>
+      <h1>Deployment guide</h1>
+      <p class="lead">This guide walks through a standard single-node deployment: base packages, container runtime, TLS certificates and service hardening. Follow the sections in order — later steps assume the earlier ones completed without errors.</p>
+
+      <h2>Requirements</h2>
+      <ul>
+        <li>Debian 11/12 or Ubuntu 20.04 and newer, root access;</li>
+        <li>a public IPv4 address and two A-records pointing at the node;</li>
+        <li>inbound TCP/80 and TCP/443 plus UDP/443 open before first start;</li>
+        <li>at least 1 GB RAM and 3 GB of free disk space.</li>
+      </ul>
+
+      <h2>Prepare the host</h2>
+      <p>Update the package index, then install the base utilities used by the remaining steps.</p>
+      <pre>apt-get update &amp;&amp; apt-get upgrade -y
+apt-get install -y curl ca-certificates dnsutils jq cron openssl</pre>
+
+      <div class="callout">Keep the package index current before issuing certificates: an outdated <code>ca-certificates</code> bundle makes the ACME client fail with a certificate validation error.</div>
+
+      <h2>Issue certificates</h2>
+      <p>Certificates are renewed automatically. The pre-hook releases the HTTP port so the challenge can be answered, and the post-hook restores the service afterwards.</p>
+      <pre>acme.sh --issue --standalone -d node.example.com \
+  --pre-hook  "systemctl stop edge" \
+  --post-hook "systemctl start edge"</pre>
+
+      <h2>Verify the deployment</h2>
+      <p>Confirm that the listeners are bound, then check the effective TLS configuration.</p>
+      <pre>ss -lntup | grep -E ':443|:80'
+openssl s_client -connect 127.0.0.1:443 -servername node.example.com -brief &lt;/dev/null</pre>
+      <p>If a listener is missing, inspect the service log before changing any configuration files.</p>
+
+      <h2>Next steps</h2>
+      <ul>
+        <li>configure the firewall to allow the panel address only;</li>
+        <li>enable log rotation for the container runtime;</li>
+        <li>schedule a monthly upgrade window.</li>
+      </ul>
+    </article>
+
+    <nav class="toc">
+      <div class="h">On this page</div>
+      <a href="#requirements" class="on">Requirements</a>
+      <a href="#prepare">Prepare the host</a>
+      <a href="#certificates">Issue certificates</a>
+      <a href="#verify">Verify the deployment</a>
+      <a href="#next">Next steps</a>
+    </nav>
+  </div>
+
+  <div class="veil">
+    <form class="dialog" id="login-form" autocomplete="off">
+      <span class="mark"><svg class="icon" viewBox="0 0 24 24"><path d="M5 4h9l5 5v11H5z"/><path d="M14 4v5h5"/></svg></span>
+      <h2>Restricted documentation</h2>
+      <p>Internal guides require a workspace account.</p>
+      <div class="auth">
+        <button type="button" class="on" data-mode="sso">Workspace SSO</button>
+        <button type="button" data-mode="mail">E-mail link</button>
+      </div>
+      <label for="account">Workspace ID</label>
+      <input id="account" type="text" placeholder="team-workspace" required>
+      <label for="password">Password</label>
+      <input id="password" type="password" placeholder="Password" required>
+      <button class="submit" type="submit">Continue</button>
+      <div class="notice" id="notice" role="status">Your workspace is not available right now. Please try again later.</div>
+    </form>
+  </div>
+
+  <script>
+    document.querySelectorAll('.sec').forEach(function (section) {
+      section.addEventListener('click', function () {
+        section.classList.toggle('open');
+      });
+    });
+    document.querySelectorAll('.auth button').forEach(function (mode) {
+      mode.addEventListener('click', function () {
+        document.querySelectorAll('.auth button').forEach(function (other) {
+          other.classList.toggle('on', other === mode);
+        });
+      });
+    });
+    document.getElementById('login-form').addEventListener('submit', function (event) {
+      event.preventDefault();
+      document.getElementById('account').value = '';
+      document.getElementById('password').value = '';
+      document.getElementById('notice').classList.add('on');
+    });
+  </script>
+</body>
+</html>

@@ -16,7 +16,9 @@ ok()   { printf '✔ %s\n' "$*"; }
 [[ -r "$SETUP" ]] || fail "не найден $SETUP"
 
 for fn in is_ipv4 is_ipv6 is_private_ipv4 is_fqdn is_safe_xhttp_path \
-           acme_cert_days_left cf_rand_index cf_make_hosts cf_valid_saved_host; do
+           acme_cert_days_left cf_rand_index cf_make_hosts cf_valid_saved_host \
+           multiselect_filter cdn_transport_enabled write_config_profile self_steal_template_url \
+           self_steal_template_list; do
   sed -n "/^${fn}() {\$/,/^}\$/p" "$SETUP" > "$WORK/$fn.sh"
   grep -q "^${fn}() {" "$WORK/$fn.sh" || fail "не удалось извлечь $fn из установщика"
   grep -q '^}$' "$WORK/$fn.sh" || fail "тело $fn обрезано (нет закрывающей скобки)"
@@ -158,7 +160,8 @@ ok "cf_valid_saved_host"
 # обновление A-записей DNS-only → ожидание DNS, а также что die срабатывает
 # при ошибке API, отсутствии зоны и исчерпании перебора имён. curl подменяется
 # моком ПОСЛЕ извлечения функций.
-for fn in cf_api cf_json_success cf_json_error cf_upsert_a cf_a_exists cf_setup_hosts; do
+for fn in cf_api cf_json_success cf_json_error cf_curl_cfg_init \
+         cf_upsert_a cf_a_exists cf_setup_hosts; do
   sed -n "/^${fn}() {\$/,/^}\$/p" "$SETUP" > "$WORK/$fn.sh"
   grep -q "^${fn}() {" "$WORK/$fn.sh" || fail "не удалось извлечь $fn из установщика"
   # shellcheck source=/dev/null
@@ -293,7 +296,269 @@ grep -q 'Не удалось подобрать свободные' "$WORK/cf-er
 CF_MOCK_ALL_TAKEN=0
 ok "cf_setup_hosts: занятая зона → явная ошибка после 5 попыток"
 
+# Случай 6: запись CDN-хоста создаётся проксируемой (оранжевое облако) — иначе
+# трафик не пошёл бы через CDN, а постучался прямо в ноду.
+: > "$CF_MOCK_LOG"
+cf_curl_cfg_init
+cf_upsert_a zone123 cdn.example.com proxied
+grep -q '"proxied":true' "$CF_MOCK_LOG" || fail "запись CDN-хоста создаётся без proxied:true"
+grep -qF 'cdn.example.com' "$CF_MOCK_LOG" || fail "в записи нет CDN-хоста"
+rm -f "$CF_CURL_CFG"
+CF_CURL_CFG=""
+ok "cf_upsert_a: CDN-хост создаётся проксируемым (proxied=on)"
+
 unset BASE_DOMAIN SERVER_IP CLOUDFLARE_API_TOKEN VLESS_HOST HY_HOST
+
+# --- multiselect_filter: готовый Config Profile для панели ---
+# Профиль обязан следовать режиму XHTTP: с выключенным XHTTP inbound
+# REALITY_XHTTP уходит из профиля, иначе нода поднимала бы 127.0.0.1:10444,
+# к которому Caddy больше не маршрутизирует (см. L4-блок в установщике).
+# Заодно проверяем, что плейсхолдеры шаблона заменены на реальные хосты.
+command -v jq >/dev/null 2>&1 || fail "для проверки Config Profile нужен jq"
+MULTISELECT="$SRC/Multiselect.json"
+[[ -r "$MULTISELECT" ]] || fail "не найден $MULTISELECT"
+export SELF_STEAL_HOST=usa1.example.com HY_HOST=usa3.example.com
+export XHTTP_SNI=www.gstatic.com XHTTP_PATH=/api/v3/sync/r1 CERT_DIR=/etc/remna-certs
+# CDN-режим: набор inbound'ов обязан следовать за ENABLE_CDN/CDN_TRANSPORT,
+# а пути CDN — подставляться в профиль вместо шаблонных.
+export CDN_HOST=cdn.example.com CDN_TRANSPORT=ws
+export CDN_WS_PATH=/api/v1/stream CDN_XHTTP_PATH=/api/v3/sync/c1 CDN_GRPC_PATH=/api/v4/stream
+export ENABLE_CDN=0
+
+export ENABLE_XHTTP=1
+multiselect_filter < "$MULTISELECT" > "$WORK/profile-on.json"
+jq -e . "$WORK/profile-on.json" >/dev/null || fail "профиль с XHTTP — не валидный JSON"
+[[ "$(jq -c '[.inbounds[].tag]' "$WORK/profile-on.json")" == '["REALITY_VISION","REALITY_XHTTP","HYSTERIA2"]' ]] \
+  || fail "с включённым XHTTP профиль потерял inbound: $(jq -c '[.inbounds[].tag]' "$WORK/profile-on.json")"
+[[ "$(jq -r '.inbounds[] | select(.tag=="REALITY_VISION") | .streamSettings.realitySettings.serverNames[0]' "$WORK/profile-on.json")" == "$SELF_STEAL_HOST" ]] \
+  || fail "в Vision не подставлен self-steal домен"
+[[ "$(jq -r '.inbounds[] | select(.tag=="REALITY_XHTTP") | .streamSettings.xhttpSettings.path' "$WORK/profile-on.json")" == "$XHTTP_PATH" ]] \
+  || fail "в XHTTP не подставлен path"
+[[ "$(jq -r '.inbounds[] | select(.tag=="REALITY_XHTTP") | .streamSettings.realitySettings.target' "$WORK/profile-on.json")" == "$XHTTP_SNI:443" ]] \
+  || fail "target XHTTP не следует за внешним SNI"
+[[ "$(jq -r '.inbounds[] | select(.tag=="HYSTERIA2") | .streamSettings.tlsSettings.certificates[0].keyFile' "$WORK/profile-on.json")" == "$CERT_DIR/$HY_HOST/key.pem" ]] \
+  || fail "в Hysteria2 не подставлен путь к сертификату"
+if grep -q '<prefix>' "$WORK/profile-on.json"; then
+  fail "в профиле остались плейсхолдеры <prefix>1.<domain>/<prefix>3.<domain>"
+fi
+ok "multiselect_filter: хосты подставлены, XHTTP включён"
+
+export ENABLE_XHTTP=0
+multiselect_filter < "$MULTISELECT" > "$WORK/profile-off.json"
+jq -e . "$WORK/profile-off.json" >/dev/null || fail "профиль без XHTTP — не валидный JSON"
+[[ "$(jq -c '[.inbounds[].tag]' "$WORK/profile-off.json")" == '["REALITY_VISION","HYSTERIA2"]' ]] \
+  || fail "неверный набор inbound'ов без XHTTP: $(jq -c '[.inbounds[].tag]' "$WORK/profile-off.json")"
+[[ "$(jq '[.inbounds[] | select((.streamSettings.network // "") == "xhttp")] | length' "$WORK/profile-off.json")" == 0 ]] \
+  || fail "с выключенным XHTTP в профиле остался xhttp-inbound"
+# Остальные разделы (dns/outbounds/routing) адаптация задевать не должна.
+[[ "$(jq -S 'del(.inbounds)' "$MULTISELECT")" == "$(jq -S 'del(.inbounds)' "$WORK/profile-off.json")" ]] \
+  || fail "адаптация профиля затронула dns/outbounds/routing"
+ok "multiselect_filter: с выключенным XHTTP остаются только Vision и Hysteria2"
+
+# cdn_transport_enabled: строка CDN_TRANSPORT → набор транспортов. От неё
+# зависят и промпты, и состав профиля, поэтому проверяем все значения.
+for spec in \
+  'ws:ws' 'ws:!xhttp' 'ws:!grpc' \
+  'xhttp:xhttp' 'xhttp:!ws' 'xhttp:!grpc' \
+  'grpc:grpc' 'grpc:!ws' 'grpc:!xhttp' \
+  'both:ws' 'both:xhttp' 'both:!grpc' \
+  'all:ws' 'all:xhttp' 'all:grpc' \
+  'bogus:!ws' 'bogus:!xhttp' 'bogus:!grpc' \
+  ':!ws' ':!grpc'; do
+  spec_transport="${spec%%:*}"
+  spec_expect="${spec#*:}"
+  spec_name="${spec_expect#!}"
+  if CDN_TRANSPORT="$spec_transport" cdn_transport_enabled "$spec_name"; then
+    [[ "$spec_expect" == "$spec_name" ]] \
+      || fail "CDN_TRANSPORT='$spec_transport' не должен включать транспорт $spec_name"
+  else
+    [[ "$spec_expect" == "!$spec_name" ]] \
+      || fail "CDN_TRANSPORT='$spec_transport' должен включать транспорт $spec_name"
+  fi
+done
+ok "cdn_transport_enabled: ws/xhttp/grpc/both/all, чужое значение не включает ничего"
+
+# Таблица вариантов: xhttp:cdn:transport → ожидаемые теги inbound'ов.
+while IFS=: read -r xhttp cdn transport want; do
+  [[ -n "${want:-}" ]] || continue
+  ENABLE_XHTTP="$xhttp" ENABLE_CDN="$cdn" CDN_TRANSPORT="$transport" \
+    multiselect_filter < "$MULTISELECT" > "$WORK/profile-variant.json" \
+    || fail "фильтр профиля упал: xhttp=$xhttp cdn=$cdn transport=$transport"
+  got="$(jq -c '[.inbounds[].tag]' "$WORK/profile-variant.json")"
+  [[ "$got" == "$want" ]] \
+    || fail "xhttp=$xhttp cdn=$cdn transport=$transport: ожидались $want, получено $got"
+done <<'CASES'
+1:0:ws:["REALITY_VISION","REALITY_XHTTP","HYSTERIA2"]
+0:0:ws:["REALITY_VISION","HYSTERIA2"]
+1:1:ws:["REALITY_VISION","REALITY_XHTTP","HYSTERIA2","VLESS_CDN_WS"]
+1:1:xhttp:["REALITY_VISION","REALITY_XHTTP","HYSTERIA2","VLESS_CDN_XHTTP"]
+1:1:both:["REALITY_VISION","REALITY_XHTTP","HYSTERIA2","VLESS_CDN_WS","VLESS_CDN_XHTTP"]
+0:1:xhttp:["REALITY_VISION","HYSTERIA2","VLESS_CDN_XHTTP"]
+0:1:both:["REALITY_VISION","HYSTERIA2","VLESS_CDN_WS","VLESS_CDN_XHTTP"]
+1:1:grpc:["REALITY_VISION","REALITY_XHTTP","HYSTERIA2","VLESS_CDN_GRPC"]
+0:1:grpc:["REALITY_VISION","HYSTERIA2","VLESS_CDN_GRPC"]
+1:1:all:["REALITY_VISION","REALITY_XHTTP","HYSTERIA2","VLESS_CDN_WS","VLESS_CDN_XHTTP","VLESS_CDN_GRPC"]
+0:1:all:["REALITY_VISION","HYSTERIA2","VLESS_CDN_WS","VLESS_CDN_XHTTP","VLESS_CDN_GRPC"]
+# Неизвестный транспорт не должен оставлять «все» CDN-инбаунды: без выбранного
+# транспорта профиль обязан совпасть с режимом без CDN.
+1:1:bogus:["REALITY_VISION","REALITY_XHTTP","HYSTERIA2"]
+CASES
+ok "multiselect_filter: состав профиля следует за XHTTP и CDN (ws/xhttp/grpc/all)"
+
+# Пути CDN-транспортов в профиле должны совпадать с маршрутами Caddy.
+ENABLE_XHTTP=0 ENABLE_CDN=1 CDN_TRANSPORT=all \
+  multiselect_filter < "$MULTISELECT" > "$WORK/profile-cdn.json"
+[[ "$(jq -r '.inbounds[] | select(.tag=="VLESS_CDN_WS") | .streamSettings.wsSettings.path' "$WORK/profile-cdn.json")" == "$CDN_WS_PATH" ]] \
+  || fail "в CDN WebSocket не подставлен path"
+[[ "$(jq -r '.inbounds[] | select(.tag=="VLESS_CDN_XHTTP") | .streamSettings.xhttpSettings.path' "$WORK/profile-cdn.json")" == "$CDN_XHTTP_PATH" ]] \
+  || fail "в CDN XHTTP не подставлен path"
+[[ "$(jq -r '.inbounds[] | select(.tag=="VLESS_CDN_GRPC") | .streamSettings.grpcSettings.serviceName' "$WORK/profile-cdn.json")" == "$CDN_GRPC_PATH" ]] \
+  || fail "в CDN gRPC не подставлен serviceName"
+[[ "$(jq -c '[.inbounds[] | select(.tag|startswith("VLESS_CDN_")) | {tag, net: .streamSettings.network, listen, port}]' "$WORK/profile-cdn.json")" \
+   == '[{"tag":"VLESS_CDN_WS","net":"ws","listen":"127.0.0.1","port":10446},{"tag":"VLESS_CDN_XHTTP","net":"xhttp","listen":"127.0.0.1","port":10447},{"tag":"VLESS_CDN_GRPC","net":"grpc","listen":"127.0.0.1","port":10448}]' ]] \
+  || fail "CDN-инбаунды в профиле не совпадают с портами транспортов: $(jq -c '[.inbounds[] | select(.tag|startswith("VLESS_CDN_")) | {tag, net: .streamSettings.network, listen, port}]' "$WORK/profile-cdn.json")"
+[[ "$(jq '[.inbounds[] | select(.tag|startswith("VLESS_CDN")) | select(.streamSettings.security != "none")] | length' "$WORK/profile-cdn.json")" == 0 ]] \
+  || fail "CDN-инбаунды в профиле должны быть без собственного TLS (security: none)"
+# gRPC без TLS — это h2c: Caddy обязан ходить в него тем же протоколом.
+[[ "$(jq -r '.inbounds[] | select(.tag=="VLESS_CDN_GRPC") | .streamSettings.security' "$WORK/profile-cdn.json")" == "none" ]] \
+  || fail "CDN gRPC в профиле должен быть без TLS (security: none = h2c со стороны Caddy)"
+ok "multiselect_filter: пути и security CDN-инбаундов корректны"
+
+# write_config_profile — вторая половина задачи: готовый профиль должен ещё и
+# сохраниться на диск. Локальный шаблон рядом со скриптом берётся без сети
+# (тот же шаблон, что в репозитории), поэтому пишем в отдельный NODE_DIR.
+# have/warn — стабы, объявленные выше для Cloudflare-кейсов; здесь нужен только retry.
+retry() { local _tries="$1" _delay="$2"; shift 2; "$@"; }
+export NODE_DIR="$WORK/node" SCRIPT_DIR="$SRC"
+export ENABLE_XHTTP=1
+export ENABLE_CDN=0
+write_config_profile >/dev/null
+[[ -f "$NODE_DIR/Multiselect.json" ]] || fail "Config Profile не сохранён в $NODE_DIR"
+jq -e . "$NODE_DIR/Multiselect.json" >/dev/null \
+  || fail "сохранённый Config Profile — не валидный JSON"
+[[ "$(jq -c '[.inbounds[].tag]' "$NODE_DIR/Multiselect.json")" == '["REALITY_VISION","REALITY_XHTTP","HYSTERIA2"]' ]] \
+  || fail "в сохранённом профиле неверный набор inbound'ов"
+# С включённым CDN в сохранённом файле появляются выбранные CDN-инбаунды
+# (both — прежнее значение env-файлов, all — все три транспорта).
+export ENABLE_CDN=1 CDN_TRANSPORT=both
+write_config_profile >/dev/null
+[[ "$(jq -c '[.inbounds[].tag]' "$NODE_DIR/Multiselect.json")" == '["REALITY_VISION","REALITY_XHTTP","HYSTERIA2","VLESS_CDN_WS","VLESS_CDN_XHTTP"]' ]] \
+  || fail "в сохранённом профиле нет CDN-инбаундов: $(jq -c '[.inbounds[].tag]' "$NODE_DIR/Multiselect.json")"
+export ENABLE_CDN=1 CDN_TRANSPORT=grpc
+write_config_profile >/dev/null
+[[ "$(jq -c '[.inbounds[].tag]' "$NODE_DIR/Multiselect.json")" == '["REALITY_VISION","REALITY_XHTTP","HYSTERIA2","VLESS_CDN_GRPC"]' ]] \
+  || fail "CDN_TRANSPORT=grpc не оставил в профиле только gRPC-инбаунд: $(jq -c '[.inbounds[].tag]' "$NODE_DIR/Multiselect.json")"
+ok "write_config_profile: профиль сохранён в NODE_DIR/Multiselect.json"
+
+# --- условный L4-маршрут XHTTP в Caddyfile ---
+# Фрагмент извлекается из установщика как есть: с выключенным XHTTP Caddy не
+# должен уводить SNI XHTTP в 127.0.0.1:10444, где после отключения inbound'а
+# никто не слушает (иначе проверка TLS-маршрутов уронит установку).
+sed -n '/^XHTTP_L4_BLOCK=""/,/^fi$/p' "$SETUP" > "$WORK/l4-block.sh"
+grep -q '^XHTTP_L4_BLOCK=""' "$WORK/l4-block.sh" || fail "не удалось извлечь генерацию L4-блока XHTTP"
+grep -q '^fi$' "$WORK/l4-block.sh" || fail "фрагмент генерации L4-блока обрезан (нет fi)"
+export XHTTP_SNI=www.gstatic.com
+l4_block_with_xhttp() {
+  local enable="$1"
+  (
+    set -Eeuo pipefail
+    ENABLE_XHTTP="$enable"
+    # shellcheck source=/dev/null
+    . "$WORK/l4-block.sh"
+    printf '%s' "$XHTTP_L4_BLOCK"
+  )
+}
+[[ "$(l4_block_with_xhttp 1)" == *"@xhttp tls sni www.gstatic.com"* ]] \
+  || fail "с включённым XHTTP L4-маршрут XHTTP не генерируется"
+[[ -z "$(l4_block_with_xhttp 0)" ]] \
+  || fail "с выключенным XHTTP L4-маршрут XHTTP всё ещё генерируется"
+ok "Caddyfile: L4-маршрут XHTTP появляется только при включённом XHTTP"
+
+# --- условный L4-маршрут CDN ---
+# Тот же приём: без ENABLE_CDN Caddy не должен уводить SNI CDN-хоста на
+# 127.0.0.1:9444 (там нет сайта и сертификата).
+sed -n '/^CDN_L4_BLOCK=""/,/^fi$/p' "$SETUP" > "$WORK/l4-cdn.sh"
+grep -q '^CDN_L4_BLOCK=""' "$WORK/l4-cdn.sh" || fail "не удалось извлечь генерацию L4-блока CDN"
+grep -q '^fi$' "$WORK/l4-cdn.sh" || fail "фрагмент генерации L4-блока CDN обрезан (нет fi)"
+cdn_l4_block() {
+  local enable="$1"
+  (
+    set -Eeuo pipefail
+    # Значения читает извлекаемый фрагмент, поэтому здесь они экспортируются.
+    export ENABLE_CDN="$enable" CDN_HOST=cdn.example.com CDN_TLS_PORT=9444
+    # shellcheck source=/dev/null
+    . "$WORK/l4-cdn.sh"
+    printf '%s' "$CDN_L4_BLOCK"
+  )
+}
+[[ "$(cdn_l4_block 1)" == *"@cdn tls sni cdn.example.com"* ]] \
+  || fail "с включённым CDN L4-маршрут CDN не генерируется"
+[[ "$(cdn_l4_block 1)" == *"proxy 127.0.0.1:9444"* ]] \
+  || fail "L4-маршрут CDN ведёт не на CDN-сайт Caddy"
+[[ -z "$(cdn_l4_block 0)" ]] \
+  || fail "с выключенным CDN L4-маршрут CDN всё ещё генерируется"
+ok "Caddyfile: L4-маршрут CDN появляется только при включённом CDN"
+
+unset SELF_STEAL_HOST HY_HOST XHTTP_SNI XHTTP_PATH CERT_DIR ENABLE_XHTTP NODE_DIR SCRIPT_DIR
+
+# --- self_steal_template_url: тема фасада → URL шаблона ---
+# Список тем в установщике обязан совпадать с файлами self-steal-templates/:
+# иначе --self-steal-template NAME дал бы 404 прямо на ноде.
+grep -E '^SELF_STEAL_(RAW_BASE|TEMPLATES)=' "$SETUP" > "$WORK/self-steal.sh"
+grep -q '^SELF_STEAL_TEMPLATES=(' "$WORK/self-steal.sh" || fail "нет списка тем self-steal"
+# shellcheck source=/dev/null
+. "$WORK/self-steal.sh"
+mapfile -t theme_names < <(self_steal_template_list)
+(( ${#theme_names[@]} >= 2 )) || fail "список тем self-steal пуст"
+themes_checked=0
+for theme in "${theme_names[@]}"; do
+  url="$(self_steal_template_url "$theme")" || fail "тема $theme не разрешается в URL"
+  [[ "$url" == "$SELF_STEAL_RAW_BASE/self-steal-templates/$theme.html" ]] \
+    || fail "тема $theme → неожиданный URL: $url"
+  [[ -r "$SRC/self-steal-templates/$theme.html" ]] \
+    || fail "в репозитории нет файла темы $theme"
+  themes_checked=$((themes_checked + 1))
+done
+[[ "$themes_checked" == "${#theme_names[@]}" ]] || fail "проверены не все темы"
+export SELF_STEAL_TEMPLATE_URL='https://example.com/custom.html'
+[[ "$(self_steal_template_url '')" == 'https://example.com/custom.html' ]] \
+  || fail "пустая тема должна возвращать явный SELF_STEAL_TEMPLATE_URL"
+if self_steal_template_url 'no-such-theme' >/dev/null; then
+  fail "неизвестная тема не отвергается"
+fi
+unset SELF_STEAL_TEMPLATE_URL
+ok "self_steal_template_url: $themes_checked тем совпадают с файлами, чужое имя отвергается"
+
+# Резолвер темы из шага 1 установщика: тема → URL, явный URL важнее темы,
+# чужое имя останавливает установку со списком доступных тем.
+sed -n "/^# Тема фасада → URL шаблона/,/^fi\$/p" "$SETUP" > "$WORK/resolve-theme.sh"
+grep -q 'self_steal_template_url' "$WORK/resolve-theme.sh" \
+  || fail "не удалось извлечь резолвер темы из установщика"
+grep -q 'if \[\[ -z' "$WORK/resolve-theme.sh" \
+  || fail "в извлечённом резолвере нет условия (извлекли не тот фрагмент)"
+resolve_theme() { # resolve_theme <тема> <явный URL> → «URL|признак использования темы»
+  (
+    set -Eeuo pipefail
+    export SELF_STEAL_TEMPLATE="$1"
+    export SELF_STEAL_TEMPLATE_URL="$2"
+    export SELF_STEAL_THEME_USED=0
+    # shellcheck source=/dev/null
+    . "$WORK/resolve-theme.sh"
+    printf '%s|%s' "$SELF_STEAL_TEMPLATE_URL" "$SELF_STEAL_THEME_USED"
+  )
+}
+[[ "$(resolve_theme mail '')" == "$SELF_STEAL_RAW_BASE/self-steal-templates/mail.html|1" ]] \
+  || fail "тема mail не превратилась в URL: $(resolve_theme mail '')"
+[[ "$(resolve_theme '' 'https://example.com/my.html')" == 'https://example.com/my.html|0' ]] \
+  || fail "явный SELF_STEAL_TEMPLATE_URL не имеет приоритета над темой"
+if resolve_theme 'no-such-theme' '' >/dev/null 2>"$WORK/theme-err"; then
+  fail "неизвестная тема не остановила установку"
+fi
+grep -q 'Неизвестная тема self-steal: no-such-theme' "$WORK/theme-err" \
+  || fail "нет понятной ошибки про неизвестную тему: $(cat "$WORK/theme-err")"
+grep -qF vaultdrop "$WORK/theme-err" \
+  || fail "в ошибке не перечислены доступные темы: $(cat "$WORK/theme-err")"
+ok "резолвер темы: тема → URL, явный URL важнее, чужое имя → die со списком тем"
 
 # --- acme_cert_days_left: повторный запуск не должен «пропускать» битый
 #     или истекающий сертификат (регрессия P2-2) ---
