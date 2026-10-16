@@ -298,7 +298,10 @@ grpc_status="$(curl -sS -o "$WORK/grpc-body" -w '%{http_code}' -k --max-time 10 
   "https://$CDN_HOST:$CDN_HTTPS_PORT$CDN_PROBE_GRPC_PATH/Tun")" \
   || fail "gRPC-путь $CDN_PROBE_GRPC_PATH/Tun: запрос не выполнился"
 [[ "$grpc_status" == 200 ]] \
-  || { sed 's/^/   /' "$WORK/grpc-body"; fail "gRPC-путь: ожидался ответ h2c-апстрима (200), получено $grpc_status"; }
+  || { printf '%s\n' '--- лог основного Caddy ---'; tail -40 "$WORK/caddy.log" 2>/dev/null || true
+        printf '%s\n' '--- лог h2c-апстрима ---'; tail -40 "$WORK/h2c.log" 2>/dev/null || true
+        sed 's/^/   /' "$WORK/grpc-body" 2>/dev/null || true
+        fail "gRPC-путь: ожидался ответ h2c-апстрима (200), получено $grpc_status"; }
 grep -qF 'grpc-h2c-upstream' "$WORK/grpc-body" \
   || fail "gRPC-путь: до h2c-апстрима дошёл не тот запрос"
 ok "CDN-путь $CDN_PROBE_GRPC_PATH/Tun проксируется в Xray по h2c (ответ апстрима получен)"
