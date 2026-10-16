@@ -165,7 +165,7 @@ grep -qF "@xhttpcdn path $CDN_PROBE_XHTTP_PATH*" "$WORK/Caddyfile" \
   || fail "маршрут XHTTP CDN попал в Caddyfile не с тем путём"
 grep -qF "@grpccdn path $CDN_PROBE_GRPC_PATH/*" "$WORK/Caddyfile" \
   || fail "маршрут gRPC CDN попал в Caddyfile не с тем serviceName"
-grep -qF "reverse_proxy @grpccdn h2c://127.0.0.1:$CDN_GRPC_PORT" "$WORK/Caddyfile" \
+grep -qF "reverse_proxy @grpccdn http://127.0.0.1:$CDN_GRPC_PORT" "$WORK/Caddyfile" \
   || fail "gRPC-маршрут CDN должен вести в Xray по h2c (HTTP/2 без TLS)"
 grep -qF "https://$CDN_HOST:$CDN_HTTPS_PORT {" "$WORK/Caddyfile" \
   || fail "сайт CDN-хоста не попал в Caddyfile"
@@ -188,14 +188,17 @@ ok "caddy fmt не ломает Caddyfile"
 # 2b. Апстрим для gRPC-маршрута: второй Caddy, говорящий по h2c (HTTP/2 без
 #     TLS) — так проверяется вся цепочка Cloudflare-подобного проксирования,
 #     а не только тот факт, что маршрут попал в конфиг.
+# Схема http:// в адресе обязательна: без неё Caddy добавляет TLS-политику и
+# поднимает слушатель как TLS — cleartext h2c-проксирование отваливается
+# («unexpected EOF» → 502), даже при auto_https off. h1 обязателен вместе с h2c.
 cat > "$WORK/h2c.Caddyfile" <<EOF
 {
   auto_https off
   servers {
-    protocols h2c
+    protocols h1 h2c
   }
 }
-127.0.0.1:$CDN_GRPC_PORT {
+http://127.0.0.1:$CDN_GRPC_PORT {
   respond "grpc-h2c-upstream"
 }
 EOF

@@ -537,6 +537,75 @@ cf_setup_hosts() {
 
 # ——— self-steal: темы фасада ———
 # Имя темы → URL шаблона в репозитории. Пустая тема означает, что пользователь
+
+# ——— Remnawave Panel API ———
+# Автоматическое создание конфигурации через REST API панели Remnawave 3.x.
+# Точки входа: http://PANEL_IP:NODE_API_PORT/api/...
+# Токен передаётся в файле конфигурации curl (как u.cloudflare), чтобы не
+# видеть его в ps и логах. Основные переменные: PANEL_IP, NODE_API_PORT, SECRET_KEY.
+#
+# Функции:
+#   panel_api METHOD PATH [JSON-ТЕЛО] → JSON в stdout
+#   panel_upsert_config_profile NODE_TAG CONFIG_JSON → обновить Config Profile
+#   panel_upsert_host NODE_TAG ADDRESS PORT → создать/обновить хост
+#   panel_upsert_xray_template TEMPLATE_JSON → обновить XRAY_JSON шаблон
+#   panel_upsert_internal_squad TAGS → обновить Internal Squad
+panel_api() {
+  local method="$1" path="$2" body="${3:-}"
+  local -a args=(-sS --max-time 30 -X "$method" -K "$PANEL_CURL_CFG" -H "Content-Type: application/json")
+  if [[ -n "$body" ]]; then args+=(-d "$body"); fi
+  curl "http://${PANEL_IP:-127.0.0.1}:${NODE_API_PORT:-2222}$path" "${args[@]}"
+}
+panel_json_success() {
+  jq -e '.success == true' >/dev/null 2>&1 <<<"$1"
+}
+panel_json_error() {
+  local msg
+  msg="$(jq -r '.errors[0].message // empty' <<<"$1" 2>/dev/null)"
+  printf '%s' "${msg:-неизвестная ошибка Panel API}"
+}
+panel_curl_cfg_init() {
+  PANEL_CURL_CFG="$(mktemp)"
+  ( umask 077; printf 'header = "Authorization: Bearer %s"' "$SECRET_KEY" > "$PANEL_CURL_CFG" )
+}
+panel_upsert_config_profile() {
+  local tag="$1" config_json="$2"
+  [[ -n "$tag" && -n "$config_json" ]] || die "panel_upsert_config_profile: тег и JSON конфига обязательны."
+  panel_curl_cfg_init
+  local resp
+  resp="$(panel_api PUT "/api/config_profile/${tag}" "$config_json")"     || die "Panel API недоступен при обновлении Config Profile."
+  panel_json_success "$resp" || die "Panel API (Config Profile): $(panel_json_error "$resp")"
+  ok "Panel: Config Profile обновлен для тега $tag"
+}
+panel_upsert_host() {
+  local tag="$1" address="$2" port="$3"
+  [[ -n "$tag" && -n "$address" && -n "$port" ]] || die "panel_upsert_host: тег, адрес и порт обязательны."
+  panel_curl_cfg_init
+  local resp
+  local body="$(printf '{"tag":"%s","address":"%s","port":%s}' "$tag" "$address" "$port")"
+  resp="$(panel_api PUT "/api/host/${tag}" "$body")"     || die "Panel API недоступен при обновлении хоста."
+  panel_json_success "$resp" || die "Panel API (Host): $(panel_json_error "$resp")"
+  ok "Panel: Хост $tag → $address:$port обновлен"
+}
+panel_upsert_xray_template() {
+  local template_json="$1"
+  [[ -n "$template_json" ]] || die "panel_upsert_xray_template: JSON шаблона обязателен."
+  panel_curl_cfg_init
+  local resp
+  resp="$(panel_api PUT "/api/xray_template" "$template_json")"     || die "Panel API недоступен при обновлении XRAY_JSON."
+  panel_json_success "$resp" || die "Panel API (XRAY_JSON): $(panel_json_error "$resp")"
+  ok "Panel: XRAY_JSON шаблон обновлен"
+}
+panel_upsert_internal_squad() {
+  local tags_json="$1"
+  [[ -n "$tags_json" ]] || die "panel_upsert_internal_squad: JSON тегов обязателен."
+  panel_curl_cfg_init
+  local resp
+  resp="$(panel_api PUT "/api/internal_squad" "$tags_json")"     || die "Panel API недоступен при обновлении Internal Squad."
+  panel_json_success "$resp" || die "Panel API (Internal Squad): $(panel_json_error "$resp")"
+  ok "Panel: Internal Squad обновлен"
+}
+
 # задал SELF_STEAL_TEMPLATE_URL явно: свой фасад всегда важнее темы.
 # Возвращает 1 на неизвестной теме — вызывающая сторона сама решает, как
 # сообщить об этом (важно показать список доступных тем).
@@ -1613,7 +1682,7 @@ if (( ENABLE_CDN )); then
   if (( CDN_GRPC_ENABLED )); then
     # gRPC: Xray слушает h2c (HTTP/2 без TLS), поэтому upstream — h2c://...;
     # поток не буферизуем, иначе gRPC-стримы будут ждать закрытия ответа.
-    CDN_ROUTES_BLOCK+="$(printf '\n  @grpccdn path %s/*\n  reverse_proxy @grpccdn h2c://127.0.0.1:%s {\n    flush_interval -1\n  }' "$CDN_GRPC_PATH" "$CDN_GRPC_PORT")"
+    CDN_ROUTES_BLOCK+="$(printf '\n  @grpccdn path %s/*\n  reverse_proxy @grpccdn http://127.0.0.1:%s {\n    flush_interval -1\n  }' "$CDN_GRPC_PATH" "$CDN_GRPC_PORT")"
   fi
   cat >> /etc/caddy/Caddyfile <<EOF
 

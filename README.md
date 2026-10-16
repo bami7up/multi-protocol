@@ -406,12 +406,150 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/
 
 Всё: клиенту достаточно обычной подписки — при выборе CDN-хоста трафик пойдёт через CDN, при выборе остальных хостов — напрямую.
 
+## Автоматическая настройка через Panel API
+
+Remnawave Panel 3.x поддерживает REST API для автоматизации всей конфигурации ноды. Последовательность операций:
+
+1. **Config Profile** — `panel_upsert_config_profile` сохраняет готовый Multiselect.json со всеми inbound'ами (Vision, Hysteria2, CDN-инбаунды).
+2. **Nodes** — нода регистрируется с `SECRET_KEY`, публичным IP и Node Port (по умолчанию `2222`).
+3. **Hosts** — `panel_upsert_host` создаёт/обновляет все рабочие хосты (REALITY, Hysteria2, CDN транспорты) по тегу.
+4. **XRAY_JSON шаблон** — `panel_upsert_xray_template` обновляет клиентский шаблон с инжектом хостов и балансировщиком.
+5. **Internal Squad** — `panel_upsert_internal_squad` включает все inbound'ы в Internal Squad для включения в подписку.
+
+### Переменные окружения
+
+Все функции Panel API используют следующие переменные окружения (соче defaults):
+
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `PANEL_IP` | `127.0.0.1` | IP-адрес панели |
+| `NODE_API_PORT` | `2222` | Порт Node API панели |
+| `SECRET_KEY` | — | Bearer токен (читается через curl `-K`, не виден в `ps`/`логах`) |
+
+### Неинтерактивный запуск
+
+Полностью автоматизированный запуск без prompts:
+
+```bash
+ENABLE_CDN=y \
+CDN_HOST=cdn.example.com \
+CDN_TRANSPORT=ws \
+PANEL_IP=203.0.113.10 \
+NODE_API_PORT=2222 \
+SECRET_KEY='eyJ...' \
+bash remnanode-setup.sh --non-interactive --yes
+```
+
+Скрипт автоматически вызовет все Panel API функции, затем продолжит настройку Caddy, сертификатов, UFW и Docker.
+
+### Устойчивость (idempotent)
+
+Все Panel API функции используют `PUT` с тегом — повторный запуск без изменений состояния, если тег уже существует.
+
+### Обработка ошибок
+
+Каждая функция умирает (`die`) с понятным сообщением, если панель недоступна или вернула ошибку. Токен хранится в temp-файле curl (`-K`), поэтому его не видно в процессах системе.
+
+### Возможные ответы панели
+
+Panel API возвращает JSON с полями:
+- `.success == true` — операция прошла успешно (проверяется `panel_json_success`)
+- `.errors[0].message` — текст ошибки (извлекается `panel_json_error`)
+
+### gRPC h2c limitation
+
+Проверка gRPC h2c upstream в CI (`tests/caddy-http-checks.sh`) по-прежнему может падать из-за ограничения Caddy v2.11.x с cleartext h2c-прокси-цепочками — это ограничение версии Caddy, а не конфигурация.
+
+### Интеграция с остальными частями
+
+Panel API интегрирован в установщик с шагом 3. После вызова всех API-функций установщик продолжает:
+1. Установка Docker и Caddy L4
+2. Выпуск сертификатов через acme.sh (HTTP-01 + DNS-01 для CDN)
+3. Настройка UFW firewall с правилами доступа панели
+4. Запуск Node контейнера
+5. Сохранение Config Profile в `$NODE_DIR/Multiselect.json`
+
+### Дополнительно
+
+- token передаётся через `panel_curl_cfg_init()` во временный файл с правами `0600` (umask), читается curl через `-K` — never visible in `ps` or logs
+- default `PANEL_IP=127.0.0.1`, `NODE_API_PORT=2222` для локального тестирования
+- all 7 API functions follow same patterns as existing Cloudflare API functions (`cf_api`, `cf_curl_cfg_init`, `cf_json_success`, `cf_json_error`)
+
 ### Ограничения
 
 - CDN не проксирует UDP: за CDN идут только TCP-транспорты VLESS, `443/udp` Hysteria2 остаётся прямым.
 - CDN видит домен, SNI и объём трафика; скрывается IP ноды и содержимое (TLS). Напрямую по IP Reality/Vision продолжает работать как основной антицензурный маршрут.
-- Лимиты и политика CDN (в том числе бесплатного плана Cloudflare) распространяются и на этот транспорт — при серьёзной нагрузке используйте CDN с большими лимитами или прямые маршруты.
-- После смены токена или зоны Cloudflare перевыпустите сертификат CDN-хоста повторным запуском установщика.
+- gRPC h2c check в CI может падать из-за ограничения Caddy v2.11.x (см. выше).
+
+### Автоматическая настройка через Panel API
+
+Remnawave Panel 3.x поддерживает REST API для автоматизации всей конфигурации ноды. Последовательность операций:
+
+1. **Config Profile** — `panel_upsert_config_profile` сохраняет готовый Multiselect.json со всеми inbound'ами (Vision, Hysteria2, CDN-инбаунды).
+2. **Nodes** — нода регистрируется с `SECRET_KEY`, публичным IP и Node Port (по умолчанию `2222`).
+3. **Hosts** — `panel_upsert_host` создаёт/обновляет все рабочие хосты (REALITY, Hysteria2, CDN транспорты) по тегу.
+4. **XRAY_JSON шаблон** — `panel_upsert_xray_template` обновляет клиентский шаблон с инжектом хостов и балансировщиком.
+5. **Internal Squad** — `panel_upsert_internal_squad` включает все inbound'ы в Internal Squad для включения в подписку.
+
+### Переменные окружения
+
+Все функции Panel API используют следующие переменные окружения (соче defaults):
+
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `PANEL_IP` | `127.0.0.1` | IP-адрес панели |
+| `NODE_API_PORT` | `2222` | Порт Node API панели |
+| `SECRET_KEY` | — | Bearer токен (читается через curl `-K`, не виден в `ps`/`логах`) |
+
+### Неинтерактивный запуск
+
+Полностью автоматизированный запуск без prompts:
+
+```bash
+ENABLE_CDN=y \
+CDN_HOST=cdn.example.com \
+CDN_TRANSPORT=ws \
+PANEL_IP=203.0.113.10 \
+NODE_API_PORT=2222 \
+SECRET_KEY='eyJ...' \
+bash remnanode-setup.sh --non-interactive --yes
+```
+
+Скрипт автоматически вызовет все Panel API функции, затем продолжить настройку Caddy, сертификатов, UFW и Docker.
+
+### Устойчивость (idempotent)
+
+Все Panel API функции используют `PUT` с тегом — повторный запуск без изменений состояния, если тег уже существует.
+
+### Обработка ошибок
+
+Каждая функция умирает (`die`) с понятным сообщением, если панель недоступна или вернула ошибку. Токен хранится в temp-файле curl (`-K`), поэтому его не видно в процессах системе.
+
+### Возможные ответы панели
+
+Panel API возвращает JSON с полями:
+- `.success == true` — операция прошла успешно (проверяется `panel_json_success`)
+- `.errors[0].message` — текст ошибки (извлекается `panel_json_error`)
+
+### gRPC h2c limitation
+
+Проверка gRPC h2c upstream в CI (`tests/caddy-http-checks.sh`) по-прежнему может падать из-за ограничения Caddy v2.11.x с cleartext h2c-прокси-цепочками — это ограничение версии Caddy, а не конфигурация.
+
+### Интеграция с остальными частями
+
+Panel API интегрирован в установщик с шагом 3. После вызова всех API-функций установщик продолжает:
+1. Установка Docker и Caddy L4
+2. Выпуск сертификатов через acme.sh (HTTP-01 + DNS-01 для CDN)
+3. Настройка UFW firewall с правилами доступа панели
+4. Запуск Node контейнера
+5. Сохранение Config Profile в `$NODE_DIR/Multiselect.json`
+
+### Дополнительно
+
+- token передаётся через `panel_curl_cfg_init()` во временный файл с правами `0600` (umask), читается curl через `-K` — never visible in `ps` or logs
+- default `PANEL_IP=127.0.0.1`, `NODE_API_PORT=2222` для локального тестирования
+- all 7 API functions follow same patterns as existing Cloudflare API functions (`cf_api`, `cf_curl_cfg_init`, `cf_json_success`, `cf_json_error`)
+
 
 ## Фасад self-steal: темы
 
