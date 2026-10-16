@@ -58,9 +58,20 @@ pick_port() {
 }
 
 [[ -r "$SETUP" ]] || fail "не найден $SETUP"
-CADDY_VERSION="$(grep -m1 '^CADDY_VERSION=' "$SETUP" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
-[[ "$CADDY_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+# Версия для прогона: по умолчанию — пин установщика (её же собирает нода и
+# качает CI). Переопределение через env нужно локальным прогонам и кэшу
+# бинарников, иначе тест всегда ходит в GitHub Releases за релизом.
+pinned_caddy_version="$(grep -m1 '^CADDY_VERSION=' "$SETUP" \
+  | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+[[ "$pinned_caddy_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
   || fail "не удалось прочитать CADDY_VERSION из $SETUP"
+CADDY_VERSION="${CADDY_VERSION:-$pinned_caddy_version}"
+[[ "$CADDY_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+  || fail "некорректный CADDY_VERSION: $CADDY_VERSION"
+if [[ "$CADDY_VERSION" != "$pinned_caddy_version" ]]; then
+  printf '   CADDY_VERSION переопределён: %s вместо пина %s\n' \
+    "$CADDY_VERSION" "$pinned_caddy_version"
+fi
 HTTP_PORT="$(pick_port 18080)" || fail "нет свободного порта"
 HTTPS_PORT="$(pick_port 18443)" || fail "нет свободного порта"
 CDN_HTTPS_PORT="$(pick_port 19443)" || fail "нет свободного порта"
@@ -188,14 +199,27 @@ ok "caddy fmt не ломает Caddyfile"
 # 2b. Апстрим для gRPC-маршрута: второй Caddy, говорящий по h2c (HTTP/2 без
 #     TLS) — так проверяется вся цепочка Cloudflare-подобного проксирования,
 #     а не только тот факт, что маршрут попал в конфиг.
+#
+# Четыре детали, без которых мок не похож на Xray (и тест падал с 502/пустым телом):
+#   1. `http://` в адресе обязателен: без схемы Caddy считает сайт HTTPS-овым
+#      (auto_https off отключает только выпуск сертификатов) и добавляет
+#      tls_connection_policies, поэтому h2c-запрос по открытому TCP не проходит;
+#   2. `protocols h1 h2c`, а не только `h2c`: Caddy требует h1 вместе с h2c
+#      (ограничение Go), а h2c нужен, чтобы апстрим отвечал по HTTP/2 без TLS;
+#   3. адрес без хоста (`http://:порт`): `reverse_proxy` сохраняет клиентский
+#      Host (`cdn.test.local:...`), поэтому у сайта с host-матчером `127.0.0.1`
+#      ни один route не совпадает и ответом будет пустой 200 (в логе — NOP).
+#   4. `admin off`: второй Caddy в этом же тесте занимает локальный админ-порт
+#      2019, и без явного отключения владелец админки не определён.
 cat > "$WORK/h2c.Caddyfile" <<EOF
 {
+  admin off
   auto_https off
   servers {
-    protocols h2c
+    protocols h1 h2c
   }
 }
-127.0.0.1:$CDN_GRPC_PORT {
+http://:$CDN_GRPC_PORT {
   respond "grpc-h2c-upstream"
 }
 EOF
