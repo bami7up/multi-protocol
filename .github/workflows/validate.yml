@@ -22,6 +22,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y shellcheck jq
+          # Версии печатаются в лог: правила shellcheck меняются между
+          # выпусками (например, SC2317 переименован в SC2329 в 0.11), и при
+          # разборе падения важно знать, чем именно проверяли.
+          shellcheck --version | sed -n '/version:/p'
+          jq --version
 
       - name: Validate installer
         run: |
