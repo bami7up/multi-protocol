@@ -58,9 +58,20 @@ pick_port() {
 }
 
 [[ -r "$SETUP" ]] || fail "не найден $SETUP"
-CADDY_VERSION="$(grep -m1 '^CADDY_VERSION=' "$SETUP" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
-[[ "$CADDY_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+# Версия для прогона: по умолчанию — пин установщика (её же собирает нода и
+# качает CI). Переопределение через env нужно локальным прогонам и кэшу
+# бинарников, иначе тест всегда ходит в GitHub Releases за релизом.
+pinned_caddy_version="$(grep -m1 '^CADDY_VERSION=' "$SETUP" \
+  | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+[[ "$pinned_caddy_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
   || fail "не удалось прочитать CADDY_VERSION из $SETUP"
+CADDY_VERSION="${CADDY_VERSION:-$pinned_caddy_version}"
+[[ "$CADDY_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+  || fail "некорректный CADDY_VERSION: $CADDY_VERSION"
+if [[ "$CADDY_VERSION" != "$pinned_caddy_version" ]]; then
+  printf '   CADDY_VERSION переопределён: %s вместо пина %s\n' \
+    "$CADDY_VERSION" "$pinned_caddy_version"
+fi
 HTTP_PORT="$(pick_port 18080)" || fail "нет свободного порта"
 HTTPS_PORT="$(pick_port 18443)" || fail "нет свободного порта"
 CDN_HTTPS_PORT="$(pick_port 19443)" || fail "нет свободного порта"

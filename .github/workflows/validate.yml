@@ -14,7 +14,9 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        # Тег закреплён по SHA: переезд или подмена тега upstream'ом не изменит
+        # то, что выполняется в сборке (fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 = v5).
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Install validators
         run: |
@@ -29,9 +31,14 @@ jobs:
           shellcheck -x tests/caddy-http-checks.sh
           bash -n tests/installer-funcs-checks.sh
           shellcheck -x tests/installer-funcs-checks.sh
+          bash -n tests/env-flags-checks.sh
+          shellcheck -x tests/env-flags-checks.sh
 
       - name: Unit-test installer validation functions
         run: bash tests/installer-funcs-checks.sh
+
+      - name: Unit-test installer env flags and step 1 checks
+        run: bash tests/env-flags-checks.sh
 
       - name: Validate JSON5 templates
         run: |
@@ -379,3 +386,57 @@ jobs:
             || fail "tests/installer-funcs-checks.sh не прошёл после правок CDN"
 
           echo "✔ инварианты VLESS за CDN на месте"
+
+          # Проверки разбора переменных окружения и идемпотентности повторного
+          # запуска: регресс здесь молча меняет схему на уже работающей ноде.
+
+          # 41. Логические флаги нормализуются, а не сравниваются с префиксом «y»:
+          #     значение 1 (его писал в env-файл установщик прежних версий)
+          #     выключало CDN, а ответ «n» для XHTTP не сохранялся вовсе.
+          grep -q 'ask_bool ENABLE_XHTTP' remnanode-setup.sh \
+            || fail "ENABLE_XHTTP разбирается не через ask_bool (значение 1 выключит XHTTP)"
+          grep -q 'ask_bool ENABLE_CDN' remnanode-setup.sh \
+            || fail "ENABLE_CDN разбирается не через ask_bool (значение 1 выключит CDN)"
+          if grep -qE 'ENABLE_(CDN|XHTTP),,\}" (!= |== )y' remnanode-setup.sh; then
+            fail "флаги сравниваются с префиксом «y»: значения 1/yes/on будут поняты неверно"
+          fi
+          grep -q 'printf .export ENABLE_XHTTP=%s' remnanode-setup.sh \
+            || fail "решение по XHTTP не сохраняется в env-файл (повторный запуск включит XHTTP обратно)"
+          grep -q 'printf .export ENABLE_CDN=%s' remnanode-setup.sh \
+            || fail "решение по CDN не сохраняется в env-файл"
+          bash tests/env-flags-checks.sh >/dev/null \
+            || fail "tests/env-flags-checks.sh не прошёл"
+
+          # 42. SERVER_IP из env имеет приоритет над автодетектом: за NAT
+          #     внешние сервисы недоступны, а README и текст ошибки советуют
+          #     задать адрес переменной.
+          if grep -q '^SERVER_IP=""$' remnanode-setup.sh; then
+            fail "SERVER_IP из env затирается автодетектом"
+          fi
+          grep -qF '(SERVER_IP из env)' remnanode-setup.sh \
+            || fail "SERVER_IP из env не используется как приоритетное значение"
+          grep -q 'SERVER_IP, NODE_DIR, CERT_DIR, ENV_STORE' remnanode-setup.sh \
+            || fail "usage() не документирует SERVER_IP"
+
+          # 43. Порт ноды не может занять порт CDN-сайта или CDN-инбаунда.
+          grep -qF '"$CDN_TLS_PORT"|"$CDN_WS_PORT"|"$CDN_XHTTP_PORT"|"$CDN_GRPC_PORT")' \
+            remnanode-setup.sh \
+            || fail "NODE_API_PORT не проверяется на конфликт с CDN-портами"
+
+          # 44. apt_wait не полагается на fuser, который ставится позже (шаг 3).
+          grep -q 'have fuser || return 0' remnanode-setup.sh \
+            || fail "apt_wait использует fuser без проверки (ожидание dpkg-lock не работает)"
+
+          # 45. Версии сборки не разъехались: Caddy >= 2.11.6 требует для сборки
+          #     Go >= 1.26 (release notes v2.11.6), а caddy-l4 v0.1.2 объявляет
+          #     минимум Caddy v2.11.4 — то есть пины обязаны быть согласованы.
+          caddy_ver="$(sed -n 's/^CADDY_VERSION="\${CADDY_VERSION:-\(v[0-9.]*\)}".*/\1/p' remnanode-setup.sh)"
+          go_ver="$(sed -n 's/^GO_VERSION="\([0-9.]*\)".*/\1/p' remnanode-setup.sh)"
+          [[ -n "$caddy_ver" && -n "$go_ver" ]] \
+            || fail "не удалось прочитать CADDY_VERSION/GO_VERSION из установщика"
+          if [[ "$(printf '%s\n%s\n' v2.11.6 "$caddy_ver" | sort -V | head -1)" == v2.11.6 ]] \
+             && [[ "$(printf '%s\n%s\n' 1.26 "$go_ver" | sort -V | head -1)" != 1.26 ]]; then
+            fail "Caddy $caddy_ver требует для сборки Go >= 1.26, а пин — Go $go_ver"
+          fi
+
+          echo "✔ инварианты переменных окружения на месте"

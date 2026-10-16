@@ -20,7 +20,8 @@ ENV_STORE="${ENV_STORE:-/root/remnanode.env}"
 NODE_IMAGE="${NODE_IMAGE:-latest}"
 # Темы фасада self-steal: файлы self-steal-templates/<тема>.html в репозитории.
 # Дефолт — прежний «файлообменник», чтобы поведение не менялось без запроса.
-SELF_STEAL_RAW_BASE="https://raw.githubusercontent.com/bami7up/multi-protocol/main"
+# Базу URL шаблонов фасада можно переопределить (свой форк, тег или коммит):
+SELF_STEAL_RAW_BASE="${SELF_STEAL_RAW_BASE:-https://raw.githubusercontent.com/bami7up/multi-protocol/main}"
 SELF_STEAL_TEMPLATES=(vaultdrop mail cloud admin docs)
 SELF_STEAL_TEMPLATE="${SELF_STEAL_TEMPLATE:-vaultdrop}"
 # Явный URL (свой фасад) важнее имени темы; проверяется при разборе переменных.
@@ -47,10 +48,15 @@ CDN_GRPC_PORT=10448
 CDN_TLS_PORT=9444
 # Шаблон Config Profile: из него установщик сохраняет готовый Multiselect.json.
 MULTISELECT_TEMPLATE_URL="${MULTISELECT_TEMPLATE_URL:-https://raw.githubusercontent.com/bami7up/multi-protocol/main/Multiselect.json}"
-XCADDY_VERSION="${XCADDY_VERSION:-v0.4.5}"
-CADDY_VERSION="${CADDY_VERSION:-v2.11.4}"
+XCADDY_VERSION="${XCADDY_VERSION:-v0.4.7}"
+CADDY_VERSION="${CADDY_VERSION:-v2.11.7}"
 CADDY_L4_VERSION="${CADDY_L4_VERSION:-v0.1.2}"
-GO_VERSION="1.25.1"
+# Go для сборки Caddy. Caddy >= v2.11.6 требует Go >= 1.26 (release notes
+# v2.11.6: «Go 1.26 is now the minimum version for building Caddy and plugins»),
+# поэтому берём самую старую из поддерживаемых линий — 1.26 (Go сопровождает две
+# последние) и последний её патч: он содержит исправления безопасности stdlib,
+# а сам Caddy слушает публичные 80/443. Версия, архив и SHA256 меняются вместе.
+GO_VERSION="1.26.9"
 GO_INSTALL_TMP=""
 GO_ARCHIVE_TMP=""
 CADDY_RESTORE_NEEDED=0
@@ -88,9 +94,15 @@ remnanode-setup.sh — установка ноды Remnawave (VLESS + Hysteria2 
   ENABLE_CDN, CDN_HOST, CDN_TRANSPORT, CDN_WS_PATH, CDN_XHTTP_PATH, CDN_GRPC_PATH,
   PANEL_IP, NODE_API_PORT, SECRET_KEY, NODE_IMAGE,
   SELF_STEAL_TEMPLATE, SELF_STEAL_TEMPLATE_URL, MULTISELECT_TEMPLATE_URL,
+  SELF_STEAL_RAW_BASE,
   XCADDY_VERSION, CADDY_VERSION, CADDY_L4_VERSION,
   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ZONE,
-  NODE_DIR, CERT_DIR, ENV_STORE
+  SERVER_IP, NODE_DIR, CERT_DIR, ENV_STORE
+
+Логические переменные (ENABLE_XHTTP, ENABLE_CDN) понимают y/yes/1/true/on и
+n/no/0/false/off в любом регистре; пустое значение означает ответ по умолчанию.
+Значение SERVER_IP (в том числе из сохранённого env-файла) важнее автодетекта:
+задайте его, если нода за NAT или внешние сервисы определения IP недоступны.
 USAGE
 }
 
@@ -223,14 +235,17 @@ remove_managed_ufw_rules() {
 
 install_go_toolchain() {
   local go_arch go_sha go_root archive
+  # SHA256 официальных архивов go${GO_VERSION}.linux-<arch>.tar.gz (сверены с
+  # https://go.dev/dl/ через docker-library/golang, <линия>/<дистрибутив>/Dockerfile).
+  # При смене GO_VERSION хеши нужно обновить: проверка идёт до распаковки архива.
   case "$ARCH" in
     x86_64|amd64)
       go_arch=amd64
-      go_sha=7716a0d940a0f6ae8e1f3b3f4f36299dc53e31b16840dbd171254312c41ca12e
+      go_sha=42d158b4d8f7b61ac0a830567c940a86098fb7aac52e467a5ebec03ef5cc2f8d
       ;;
     aarch64|arm64)
       go_arch=arm64
-      go_sha=65a3e34fb2126f55b34e1edfc709121660e1be2dee6bdf405fc399a63a95a87d
+      go_sha=4a97373d49fcacdcf3694fea368a500b00ee3e963974f3e7514132717632f052
       ;;
     *) die "Нет Go toolchain для архитектуры $ARCH." ;;
   esac
@@ -694,6 +709,18 @@ write_config_profile() {
 
 apt_wait() {
   local -i waited=0
+  # fuser приходит из пакета psmisc: он есть в списке базовых утилит шага 0, но
+  # первый apt-get (update) идёт до их установки. Без fuser все проверки
+  # блокировки молча ничего не делают (вывод перенаправлен в /dev/null), поэтому
+  # ставим psmisc сами — напрямую apt-get, без apt_get, чтобы не уйти в рекурсию.
+  # Если поставить не удалось (например, dpkg-lock держит другой процесс), просто
+  # продолжаем: apt-get ниже сам подождёт освобождения блокировки.
+  if ! have fuser; then
+    if have apt-get; then
+      DEBIAN_FRONTEND=noninteractive apt-get install -y psmisc >/dev/null 2>&1 || true
+    fi
+    have fuser || return 0
+  fi
   while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
      || fuser /var/lib/dpkg/lock          >/dev/null 2>&1 \
      || fuser /var/lib/apt/lists/lock     >/dev/null 2>&1; do
@@ -748,6 +775,58 @@ ask_secret() {
   printf -v "$__var" '%s' "$__input"
 }
 
+# parse_bool [значение] [дефолт] → 0|1 в stdout. Логические переменные приходят
+# из трёх источников: интерактивного ответа, переменных окружения и сохранённого
+# /root/remnanode.env (установщик прежних версий писал туда «1»), поэтому все
+# распространённые написания должны пониматься одинаково, а мусор — не выключать
+# функцию молча: вызывающий сам решает, что делать (см. ask_bool).
+parse_bool() {
+  local val="${1:-}" def="${2:-0}"
+  case "${val,,}" in
+    1|y|yes|true|on)  printf '1' ;;
+    0|n|no|false|off) printf '0' ;;
+    *)                printf '%s' "$def" ;;
+  esac
+}
+
+# bool_yn 0|1 → y|n: так флаги записываются в /root/remnanode.env, чтобы файл
+# читался человеком и одинаково понимался любым парсером (y* → включено).
+bool_yn() {
+  if [[ "${1:-0}" == 1 ]]; then
+    printf 'y'
+  else
+    printf 'n'
+  fi
+}
+
+# ask_bool VAR PROMPT DEFAULT(y/n) — вопрос с нормализацией ответа к 0/1.
+# Непонятный ответ переспрашивается (или останавливает установку в
+# --non-interactive), а не трактуется как «нет»: иначе опечатка тихо выключала бы
+# CDN или XHTTP.
+ask_bool() {
+  local __var="$1" __prompt="$2" __default __val __tries=0
+  __default="$(parse_bool "${3:-n}" 0)"
+  while :; do
+    ask "$__var" "$__prompt (y/n)" "$(bool_yn "$__default")"
+    __val="${!__var}"
+    case "${__val,,}" in
+      1|y|yes|true|on|0|n|no|false|off)
+        printf -v "$__var" '%s' "$(parse_bool "$__val" "$__default")"
+        return 0
+        ;;
+    esac
+    __tries=$((__tries + 1))
+    (( __tries < 5 )) || die "Не понял ответ «$__val» на вопрос «$__prompt»: нужен y или n."
+    warn "Ответ «$__val» не похож на y/n — введите y или n."
+  done
+}
+
+# Флаги авто-режимов приходят и из env (например, ASSUME_YES=y в CI): приводим их
+# к 0/1 тем же разбором, что и остальные логические переменные. Флаг командной
+# строки главнее: -y/--yes уже выставил 1 выше, и нормализация это не отменит.
+ASSUME_YES="$(parse_bool "${ASSUME_YES:-0}" 0)"
+NONINTERACTIVE="$(parse_bool "${NONINTERACTIVE:-0}" 0)"
+
 # confirm "вопрос" "дефолт(y/n)" -> 0 если да, 1 если нет; уважает --yes/--non-interactive
 confirm() {
   local __prompt="$1" __default="${2:-n}" __ans
@@ -755,8 +834,10 @@ confirm() {
     note "(auto-yes) $__prompt"
     return 0
   fi
-  ask __ans "$__prompt (y/n)" "$__default"
-  [[ "${__ans,,}" == y* ]]
+  # Ответ нормализуется тем же ask_bool: «1», «yes» и «y» здесь равнозначны, а
+  # непонятный ответ переспрашивается, а не читается как «нет».
+  ask_bool __ans "$__prompt" "$__default"
+  [[ "$__ans" == 1 ]]
 }
 
 detect_ssh_port() {
@@ -879,9 +960,10 @@ else
   ok "Свободно на /: ${DISK_MB}MB"
 fi
 
-log "Устанавливаю базовые утилиты (curl, ca-certificates, dnsutils)"
+log "Устанавливаю базовые утилиты (curl, ca-certificates, dnsutils, jq, psmisc)"
 retry 3 5 apt_get update -y || warn "apt-get update завершился с ошибкой — продолжаю с текущими списками."
-retry 3 5 apt_get install -y curl ca-certificates dnsutils jq \
+# psmisc нужен для fuser в apt_wait: без него ожидание apt/dpkg lock не работает.
+retry 3 5 apt_get install -y curl ca-certificates dnsutils jq psmisc \
   || warn "Не удалось установить базовые утилиты — некоторые проверки будут ограничены."
 
 step 1 "Переменные окружения"
@@ -895,19 +977,34 @@ if [[ -f "$ENV_STORE" ]]; then
   fi
 fi
 
-SERVER_IP=""
-if have curl; then
-  SERVER_IP="$(curl -4 -sS --max-time 10 https://ifconfig.me 2>/dev/null || true)"
-  [[ -n "$SERVER_IP" ]] || SERVER_IP="$(curl -4 -sS --max-time 10 https://api.ipify.org 2>/dev/null || true)"
-fi
-if is_ipv4 "$SERVER_IP"; then
-  ok "Публичный IPv4: $SERVER_IP"
+# SERVER_IP нужен для A-записей Cloudflare и для сверки DNS. Значение из env (в
+# том числе из сохранённого env-файла) приоритетнее автодетекта: за NAT внешние
+# сервисы могут быть недоступны, а README и текст ошибки обещают возможность
+# задать адрес вручную. Приватный адрес для A-записей не годится — его заменяет
+# автодетект с предупреждением.
+if is_ipv4 "${SERVER_IP:-}"; then
   if is_private_ipv4 "$SERVER_IP"; then
-    warn "Определённый адрес $SERVER_IP выглядит приватным — вероятно, сервер за NAT. Сравнение A-записей с ним будет непоказательным; сверяйте DNS вручную или продолжайте с --force-dns."
+    warn "SERVER_IP=$SERVER_IP выглядит приватным — для A-записей нужен публичный IPv4, определяю автоматически."
+    SERVER_IP=""
+  else
+    ok "Публичный IPv4 (SERVER_IP из env): $SERVER_IP"
   fi
-else
+fi
+if [[ -z "${SERVER_IP:-}" ]]; then
   SERVER_IP=""
-  warn "Не удалось определить IP (проверка DNS будет мягкой)."
+  if have curl; then
+    SERVER_IP="$(curl -4 -sS --max-time 10 https://ifconfig.me 2>/dev/null || true)"
+    [[ -n "$SERVER_IP" ]] || SERVER_IP="$(curl -4 -sS --max-time 10 https://api.ipify.org 2>/dev/null || true)"
+  fi
+  if is_ipv4 "$SERVER_IP"; then
+    ok "Публичный IPv4: $SERVER_IP"
+    if is_private_ipv4 "$SERVER_IP"; then
+      warn "Определённый адрес $SERVER_IP выглядит приватным — вероятно, сервер за NAT. Сравнение A-записей с ним будет непоказательным; сверяйте DNS вручную или продолжайте с --force-dns."
+    fi
+  else
+    SERVER_IP=""
+    warn "Не удалось определить IP (проверка DNS будет мягкой). Задайте SERVER_IP через env."
+  fi
 fi
 
 ask BASE_DOMAIN "Базовый домен (напр. example.com)" "${BASE_DOMAIN:-}"
@@ -939,23 +1036,18 @@ ask SELF_STEAL_HOST "Домен self-steal для Vision/Reality" "${SELF_STEAL_
 # Обратная совместимость с шаблонами/старыми env: для Vision SNI всегда равен
 # домену локального TLS-сайта. Иначе это снова будет обычный внешний REALITY target.
 VISION_SNI="$SELF_STEAL_HOST"
-ask ENABLE_XHTTP "Включить XHTTP в selfsteal?"         "${ENABLE_XHTTP:-y}"
-if [[ "${ENABLE_XHTTP,,}" != y* ]]; then
+ask_bool ENABLE_XHTTP "Включить XHTTP в selfsteal?"     "${ENABLE_XHTTP:-y}"
+if (( ENABLE_XHTTP )); then
+  ask XHTTP_SNI  "Маскировочный SNI для XHTTP"        "${XHTTP_SNI:-www.gstatic.com}"
+  ask XHTTP_PATH "Путь XHTTP"                         "${XHTTP_PATH:-/api/v3/sync/r1}"
+else
   warn "XHTTP в selfsteal отключён — будет использован режим только Vision (Reality)."
-  ENABLE_XHTTP=0
   # Без XHTTP SNI и path нигде не нужны: не спрашиваем и не сохраняем их.
   XHTTP_SNI=""
   XHTTP_PATH=""
-else
-  ENABLE_XHTTP=1
-  ask XHTTP_SNI  "Маскировочный SNI для XHTTP"        "${XHTTP_SNI:-www.gstatic.com}"
-  ask XHTTP_PATH "Путь XHTTP"                         "${XHTTP_PATH:-/api/v3/sync/r1}"
 fi
-ask ENABLE_CDN "Добавить VLESS за CDN (Cloudflare и др.)?" "${ENABLE_CDN:-n}"
-if [[ "${ENABLE_CDN,,}" != y* ]]; then
-  ENABLE_CDN=0
-else
-  ENABLE_CDN=1
+ask_bool ENABLE_CDN "Добавить VLESS за CDN (Cloudflare и др.)?" "${ENABLE_CDN:-n}"
+if (( ENABLE_CDN )); then
   note "CDN прячет origin: клиент идёт на CDN-хост по 443, сам CDN — на :443 ноды,"
   note "где Caddy отвечает сертификатом для этого хоста (ACME DNS-01 через Cloudflare)."
   note "Пути транспортов уходят в Xray на loopback; gRPC — по h2c, без своего TLS."
@@ -1000,8 +1092,12 @@ fi
   || die "Некорректный IP панели: $PANEL_IP (нужен IPv4 или IPv6)"
 { [[ "$NODE_API_PORT" =~ ^[0-9]+$ ]] && (( NODE_API_PORT >= 1 && NODE_API_PORT <= 65535 )); } \
   || die "Некорректный порт ноды: $NODE_API_PORT"
+# Порты, занятые самой схемой: 80 и 443 — Caddy, 9443 — локальный сайт
+# self-steal, 10443/10444 — Vision и XHTTP в Xray. CDN-порты (сайт CDN-хоста и
+# его инбаунды) берём из констант, чтобы список не разъезжался с ними: иначе
+# Node API занял бы порт CDN-сайта или инбаунда и нода молча не поднялась бы.
 case "$NODE_API_PORT" in
-  80|443|9443|10443|10444)
+  80|443|9443|10443|10444|"$CDN_TLS_PORT"|"$CDN_WS_PORT"|"$CDN_XHTTP_PORT"|"$CDN_GRPC_PORT")
     die "Node API port $NODE_API_PORT занят этой схемой; выберите другой, например 2222."
     ;;
 esac
@@ -1095,12 +1191,15 @@ fi
     printf 'export ACME_EMAIL=%q\n' "$ACME_EMAIL"
     printf 'export SELF_STEAL_HOST=%q\n' "$SELF_STEAL_HOST"
     printf 'export VISION_SNI=%q\n' "$VISION_SNI"
+    # Оба решения (и «да», и «нет») сохраняются в читаемом виде y/n: иначе
+    # ответ «n» терялся бы и повторный запуск включал функцию обратно по дефолту.
+    printf 'export ENABLE_XHTTP=%s\n' "$(bool_yn "$ENABLE_XHTTP")"
     if (( ENABLE_XHTTP )); then
       printf 'export XHTTP_SNI=%q\n' "$XHTTP_SNI"
       printf 'export XHTTP_PATH=%q\n' "$XHTTP_PATH"
     fi
+    printf 'export ENABLE_CDN=%s\n' "$(bool_yn "$ENABLE_CDN")"
     if (( ENABLE_CDN )); then
-      printf 'export ENABLE_CDN=1\n'
       printf 'export CDN_HOST=%q\n' "$CDN_HOST"
       printf 'export CDN_TRANSPORT=%q\n' "$CDN_TRANSPORT"
       printf 'export CDN_WS_PATH=%q\n' "$CDN_WS_PATH"
