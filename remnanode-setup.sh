@@ -791,9 +791,259 @@ write_xray_template() {
 }
 
 # ——— Авто-настройка панели через API (если выбран REMNAWAVE_AUTO_SETUP) ———
+panel_find_profile_by_name() {
+  local name="$1" resp uuid
+  resp="$(panel_api GET "/config-profiles" 2>/dev/null || true)"
+  # Список может быть в .response[], .data[] или прямо массив
+  uuid="$(jq -r --arg n "$name" '(.response // .data // .) | if type=="array" then .[] else . end | select(.name==$n) | .uuid // empty' <<<"$resp" 2>/dev/null | head -1)"
+  printf '%s' "$uuid"
+}
+
+panel_get_inbounds() {
+  local profile_uuid="$1" resp
+  resp="$(panel_api GET "/config-profiles/$profile_uuid/inbounds" 2>/dev/null || true)"
+  # Иногда панель отдаёт inbounds в /config-profiles/{uuid}, фолбэк
+  if ! jq -e '.. | objects | has("uuid") and has("tag")' >/dev/null 2>&1 <<<"$resp"; then
+    resp="$(panel_api GET "/config-profiles/$profile_uuid" 2>/dev/null || true)"
+  fi
+  # Выводим строки uuid|tag
+  jq -r '.. | objects | select(has("uuid") and has("tag")) | "\(.uuid)|\(.tag)"' <<<"$resp" 2>/dev/null | sort -u
+}
+
+panel_find_node_by_address() {
+  local addr="$1" port="$2" resp uuid
+  resp="$(panel_api GET "/nodes" 2>/dev/null || true)"
+  uuid="$(jq -r --arg a "$addr" --arg p "$port" '(.response // .data // .) | if type=="array" then .[] else . end | select(.address==$a and (.port|tostring)==$p) | .uuid // empty' <<<"$resp" 2>/dev/null | head -1)"
+  printf '%s' "$uuid"
+}
+
+panel_find_host_by_remark() {
+  local remark="$1" resp uuid
+  resp="$(panel_api GET "/hosts" 2>/dev/null || true)"
+  uuid="$(jq -r --arg r "$remark" '(.response // .data // .) | if type=="array" then .[] else . end | select(.remark==$r) | .uuid // empty' <<<"$resp" 2>/dev/null | head -1)"
+  printf '%s' "$uuid"
+}
+
+panel_upsert_config_profile() {
+  local profile_name="$1" profile_json="$2"
+  local existing_uuid payload resp result_uuid
+  existing_uuid="$(panel_find_profile_by_name "$profile_name" || true)"
+  payload="$(jq -n --arg name "$profile_name" --argjson config "$profile_json" '{name: $name, config: $config}' 2>/dev/null || true)"
+  if [[ -z "$payload" ]]; then
+    warn "Не удалось собрать payload для Config Profile $profile_name"
+    return 1
+  fi
+  if [[ -n "$existing_uuid" ]]; then
+    # PATCH — полный replace, нужен uuid + config + name
+    local patch_payload
+    patch_payload="$(jq -n --arg uuid "$existing_uuid" --arg name "$profile_name" --argjson config "$profile_json" '{uuid: $uuid, name: $name, config: $config}' 2>/dev/null || true)"
+    resp="$(panel_api_retry PATCH "/config-profiles/$existing_uuid" "$patch_payload" 2>/dev/null || true)"
+    if panel_api_success "$resp"; then
+      result_uuid="$existing_uuid"
+      ok "Config Profile обновлён: $profile_name ($result_uuid)"
+    else
+      # Фолбэк PATCH без uuid в пути (разные версии API)
+      resp="$(panel_api_retry PATCH "/config-profiles" "$patch_payload" 2>/dev/null || true)"
+      if panel_api_success "$resp"; then
+        result_uuid="$existing_uuid"
+        ok "Config Profile обновлён: $profile_name ($result_uuid)"
+      else
+        warn "Не удалось обновить Config Profile $profile_name: $(panel_api_error "$resp")"
+        return 1
+      fi
+    fi
+  else
+    resp="$(panel_api_retry POST "/config-profiles" "$payload" 2>/dev/null || true)"
+    if panel_api_success "$resp"; then
+      result_uuid="$(jq -r '.response.uuid // .response.id // .data.uuid // .uuid // .id // empty' <<<"$resp" 2>/dev/null || true)"
+      if [[ -z "$result_uuid" ]]; then result_uuid="(created)"; else result_uuid="$result_uuid"; fi
+      ok "Config Profile создан: $profile_name ($result_uuid)"
+    else
+      # Попытка создать без retry если ошибка 4xx с сообщением о дубликате — ищем снова
+      if grep -qi "already exists\|duplicate\|conflict" <<<"$(panel_api_error "$resp")"; then
+        existing_uuid="$(panel_find_profile_by_name "$profile_name" || true)"
+        if [[ -n "$existing_uuid" ]]; then
+          ok "Config Profile найден после конфликта дубликата: $profile_name ($existing_uuid)"
+          result_uuid="$existing_uuid"
+        else
+          warn "Не удалось создать Config Profile (дубликат): $(panel_api_error "$resp")"
+          return 1
+        fi
+      else
+        warn "Не удалось создать Config Profile: $(panel_api_error "$resp")"
+        return 1
+      fi
+    fi
+  fi
+  printf '%s' "$result_uuid"
+}
+
+panel_upsert_node() {
+  local profile_uuid="$1" profile_inbounds_csv="$2" # comma-separated uuids
+  local node_name="node-${PREFIX:-auto}-${BASE_DOMAIN}"
+  node_name="${node_name:0:30}" # имя 3-30 символов в API
+  local existing_uuid resp result_uuid
+  existing_uuid="$(panel_find_node_by_address "$SERVER_IP" "$NODE_API_PORT" || true)"
+  # Собираем activeInbounds как массив UUID
+  local inbounds_json
+  inbounds_json="$(printf '%s' "$profile_inbounds_csv" | jq -R 'split(",") | map(select(length>0))' 2>/dev/null || echo '[]')"
+  local payload
+  payload="$(jq -n --arg name "$node_name" --arg address "$SERVER_IP" --argjson port "$NODE_API_PORT" --arg uuid "$profile_uuid" --argjson inbounds "$inbounds_json" '{name: $name, address: $address, port: $port, countryCode: "XX", configProfile: {activeConfigProfileUuid: $uuid, activeInbounds: $inbounds}}' 2>/dev/null || true)"
+  if [[ -z "$payload" ]]; then warn "Не удалось собрать payload ноды"; return 1; fi
+  if [[ -n "$existing_uuid" ]]; then
+    # PATCH существующей
+    local patch_payload
+    patch_payload="$(jq -n --arg uuid "$existing_uuid" --arg name "$node_name" --arg address "$SERVER_IP" --argjson port "$NODE_API_PORT" --arg prof "$profile_uuid" --argjson inbs "$inbounds_json" '{uuid: $uuid, name: $name, address: $address, port: $port, configProfile: {activeConfigProfileUuid: $prof, activeInbounds: $inbs}}' 2>/dev/null || true)"
+    resp="$(panel_api_retry PATCH "/nodes/$existing_uuid" "$patch_payload" 2>/dev/null || true)"
+    if panel_api_success "$resp"; then
+      result_uuid="$existing_uuid"
+      ok "Нода обновлена: $node_name ($result_uuid) → профиль $profile_uuid"
+    else
+      # Фолбэк PATCH /nodes без uuid в пути
+      resp="$(panel_api_retry PATCH "/nodes" "$patch_payload" 2>/dev/null || true)"
+      if panel_api_success "$resp"; then
+        result_uuid="$existing_uuid"
+        ok "Нода обновлена: $node_name ($result_uuid)"
+      else
+        warn "Не удалось обновить ноду: $(panel_api_error "$resp")"
+        return 1
+      fi
+    fi
+  else
+    resp="$(panel_api_retry POST "/nodes" "$payload" 2>/dev/null || true)"
+    if panel_api_success "$resp"; then
+      result_uuid="$(jq -r '.response.uuid // .data.uuid // .uuid // empty' <<<"$resp" 2>/dev/null || true)"
+      if [[ -z "$result_uuid" ]]; then result_uuid="(created)"; fi
+      ok "Нода создана: $node_name ($result_uuid) → профиль $profile_uuid"
+    else
+      warn "Не удалось создать ноду: $(panel_api_error "$resp")"
+      note "Создайте вручную: Nodes → Management → + (IP $SERVER_IP, порт $NODE_API_PORT, профиль $profile_uuid)"
+      return 1
+    fi
+  fi
+  printf '%s' "$result_uuid"
+}
+
+panel_upsert_host() {
+  local profile_uuid="$1" inbound_uuid="$2" remark="$3" address="$4" port="$5" extra_json="${6:-}"
+  local existing_uuid resp payload result_uuid
+  existing_uuid="$(panel_find_host_by_remark "$remark" || true)"
+  # Базовый payload
+  payload="$(jq -n --arg r "$remark" --arg a "$address" --argjson p "$port" --arg pu "$profile_uuid" --arg iu "$inbound_uuid" '{remark: $r, address: $a, port: $p, inbound: {configProfileUuid: $pu, configProfileInboundUuid: $iu}}' 2>/dev/null || true)"
+  # Добавляем extra (securityLayer, sni, path, tag и т.п.) если переданы
+  if [[ -n "$extra_json" && "$extra_json" != "null" ]]; then
+    payload="$(jq --argjson e "$extra_json" '. * $e' <<<"$payload" 2>/dev/null || echo "$payload")"
+  fi
+  if [[ -z "$payload" ]]; then warn "Не удалось собрать payload хоста $remark"; return 1; fi
+  if [[ -n "$existing_uuid" ]]; then
+    local patch_payload
+    patch_payload="$(jq --arg uuid "$existing_uuid" '. + {uuid: $uuid}' <<<"$payload" 2>/dev/null || true)"
+    resp="$(panel_api_retry PATCH "/hosts/$existing_uuid" "$patch_payload" 2>/dev/null || true)"
+    if panel_api_success "$resp"; then
+      ok "Хост обновлён: $remark → $address:$port (inbound $inbound_uuid)"
+      result_uuid="$existing_uuid"
+    else
+      resp="$(panel_api_retry PATCH "/hosts" "$patch_payload" 2>/dev/null || true)"
+      if panel_api_success "$resp"; then
+        ok "Хост обновлён: $remark"
+        result_uuid="$existing_uuid"
+      else
+        warn "Не удалось обновить хост $remark: $(panel_api_error "$resp")"
+        return 1
+      fi
+    fi
+  else
+    resp="$(panel_api_retry POST "/hosts" "$payload" 2>/dev/null || true)"
+    if panel_api_success "$resp"; then
+      result_uuid="$(jq -r '.response.uuid // .data.uuid // .uuid // empty' <<<"$resp" 2>/dev/null || true)"
+      ok "Хост создан: $remark → $address:$port"
+    else
+      # Дубликат remark — пробуем найти снова
+      if grep -qi "already exists\|duplicate\|conflict" <<<"$(panel_api_error "$resp")"; then
+        existing_uuid="$(panel_find_host_by_remark "$remark" || true)"
+        if [[ -n "$existing_uuid" ]]; then
+          ok "Хост найден после дубликата: $remark ($existing_uuid)"
+          result_uuid="$existing_uuid"
+        else
+          warn "Не удалось создать хост $remark: $(panel_api_error "$resp")"
+          return 1
+        fi
+      else
+        warn "Не удалось создать хост $remark: $(panel_api_error "$resp")"
+        return 1
+      fi
+    fi
+  fi
+  printf '%s' "$result_uuid"
+}
+
+panel_upsert_internal_squad() {
+  local -a inbounds=("$@")
+  local resp squad_uuid inbounds_json payload
+  resp="$(panel_api GET "/internal-squads" 2>/dev/null || true)"
+  squad_uuid="$(jq -r '(.response // .data // .) | if type=="array" then .[0].uuid // empty else .uuid // empty end' <<<"$resp" 2>/dev/null || true)"
+  if [[ -z "$squad_uuid" ]]; then
+    note "Internal Squad не найден — создайте его вручную и включите inbound'ы"
+    return 0
+  fi
+  inbounds_json="$(printf '%s\n' "${inbounds[@]}" | jq -R . | jq -s 'map(select(length>0))' 2>/dev/null || echo '[]')"
+  payload="$(jq -n --arg uuid "$squad_uuid" --argjson inbounds "$inbounds_json" '{uuid: $uuid, inbounds: $inbounds}' 2>/dev/null || true)"
+  resp="$(panel_api_retry PATCH "/internal-squads/$squad_uuid" "$payload" 2>/dev/null || true)"
+  if panel_api_success "$resp"; then
+    ok "Internal Squad обновлён: добавлены inbound'ы ($squad_uuid)"
+  else
+    resp="$(panel_api_retry PATCH "/internal-squads" "$payload" 2>/dev/null || true)"
+    if panel_api_success "$resp"; then
+      ok "Internal Squad обновлён (fallback): $squad_uuid"
+    else
+      warn "Не удалось обновить Internal Squad: $(panel_api_error "$resp") — включите inbound'ы вручную"
+    fi
+  fi
+}
+
+panel_upsert_subscription_template() {
+  local choice="$1" src="" tname="XRAY $choice $(date +%Y-%m-%d)"
+  if [[ "$choice" == "split" ]]; then
+    src="$NODE_DIR/Xray_template.json"
+    tname="XRAY split $(date +%Y-%m-%d)"
+  else
+    src="$NODE_DIR/Xray_template.json"
+    tname="XRAY standard $(date +%Y-%m-%d)"
+  fi
+  if [[ ! -r "$src" ]]; then
+    note "Шаблон подписки не найден: $src — пропускаю загрузку в панель"
+    return 0
+  fi
+  local content
+  content="$(cat "$src" 2>/dev/null || true)"
+  if [[ -z "$content" ]]; then return 0; fi
+  # Проверяем дубликат по имени
+  local resp existing_uuid
+  resp="$(panel_api GET "/subscription-templates" 2>/dev/null || true)"
+  if ! panel_api_success "$resp"; then
+    # Пробуем альтернативный путь
+    resp="$(panel_api GET "/templates" 2>/dev/null || true)"
+  fi
+  existing_uuid="$(jq -r --arg n "$tname" '(.response // .data // .) | if type=="array" then .[] else . end | select(.name==$n or .templateName==$n) | .uuid // empty' <<<"$resp" 2>/dev/null | head -1 || true)"
+  if [[ -n "$existing_uuid" ]]; then
+    note "Шаблон подписки уже существует: $tname ($existing_uuid) — пропускаю создание"
+    return 0
+  fi
+  # Пробуем несколько вариантов API (разные версии панели)
+  local payload resp2
+  payload="$(jq -n --arg name "$tname" --argjson tmpl "$content" '{name: $name, template: $tmpl, isEnabled: true}' 2>/dev/null || true)"
+  for path in "/subscription-templates" "/templates" "/subscription_template"; do
+    resp2="$(panel_api_retry POST "$path" "$payload" 2>/dev/null || true)"
+    if panel_api_success "$resp2"; then
+      ok "Шаблон подписки создан: $tname"
+      return 0
+    fi
+  done
+  # Не критично — только warning
+  note "Шаблон подписки ($choice) сохранён в $src — загрузите вручную: Templates → XRAY_JSON"
+}
+
 panel_auto_setup() {
-  # Вызывается после того как нода поднята и сертификаты готовы.
-  # Не роняет установку при ошибках — только предупреждает.
   if (( ! REMNAWAVE_AUTO_SETUP )); then
     return 0
   fi
@@ -805,51 +1055,116 @@ panel_auto_setup() {
     warn "Для авто-настройки нужен jq и curl — пропускаю."
     return 0
   fi
-  # Токен уже в PANEL_CURL_CFG с шага 1, но если повторный запуск — создаём заново
   if [[ -z "${PANEL_CURL_CFG:-}" || ! -f "$PANEL_CURL_CFG" ]]; then
     panel_curl_cfg_init
   fi
-  log "Авто-настройка панели Remnawave через API..."
+  # Нормализуем URL (убираем хвостовой слэш)
+  REMNAWAVE_PANEL_URL="${REMNAWAVE_PANEL_URL%/}"
+  log "Авто-настройка панели Remnawave через API ($REMNAWAVE_PANEL_URL)..."
 
-  # 1) Config Profile — загружаем Multiselect.json как есть
-  local profile_json="" profile_resp="" profile_id=""
+  local profile_json="" profile_uuid="" profile_name=""
+  profile_name="multi-${BASE_DOMAIN:-auto}-$(date +%Y%m%d)"
+  # Ограничим имя 30 символов (лимит API)
+  profile_name="${profile_name:0:30}"
+
   if [[ -r "$NODE_DIR/Multiselect.json" ]]; then
     profile_json="$(cat "$NODE_DIR/Multiselect.json" 2>/dev/null || true)"
   fi
-  if [[ -n "$profile_json" ]]; then
-    # Экранируем JSON для вставки в тело запроса
-    local payload
-    payload="$(jq -n --arg name "Multi-protocol $(date +%Y-%m-%d)" --argjson config "$profile_json" '{name: $name, config: $config}' 2>/dev/null || true)"
-    if [[ -n "$payload" ]]; then
-      profile_resp="$(panel_api POST "/config-profiles" "$payload" 2>/dev/null || true)"
-      if panel_api_success "$profile_resp"; then
-        profile_id="$(jq -r '.response.uuid // .data.uuid // .uuid // empty' <<<"$profile_resp" 2>/dev/null || true)"
-        if [[ -n "$profile_id" ]]; then
-          ok "Config Profile создан в панели: $profile_id"
-        else
-          ok "Config Profile создан в панели (ответ получен)"
-        fi
-      else
-        warn "Не удалось создать Config Profile: $(panel_api_error "$profile_resp")"
-        note "Создайте профиль вручную: Config Profiles → Create → вставьте $NODE_DIR/Multiselect.json"
-      fi
+  if [[ -z "$profile_json" ]]; then
+    warn "Config Profile не найден: $NODE_DIR/Multiselect.json — пропускаю авто-настройку"
+    return 0
+  fi
+  # 1) Config Profile upsert
+  profile_uuid="$(panel_upsert_config_profile "$profile_name" "$profile_json" 2>/dev/null || true)"
+  # Если функция печатала ok/warn и вернула uuid в последней строке, достаём uuid
+  profile_uuid="$(printf '%s' "$profile_uuid" | tail -1 | tr -d '[:space:]')"
+  if [[ -z "$profile_uuid" || "$profile_uuid" == "(created)" ]]; then
+    # Попробуем найти по имени если создание вернуло пустышку
+    profile_uuid="$(panel_find_profile_by_name "$profile_name" || true)"
+  fi
+  if [[ -z "$profile_uuid" || "$profile_uuid" == "(created)" ]]; then
+    warn "Не удалось определить UUID Config Profile — хосты/нода не будут созданы автоматически"
+    note "Создайте вручную: Config Profiles → Create → вставьте $NODE_DIR/Multiselect.json"
+    return 0
+  fi
+  kv "Panel: Config Profile" "$profile_name ($profile_uuid)"
+
+  # 2) Собираем inbounds профиля
+  local inbounds_raw=""
+  inbounds_raw="$(panel_get_inbounds "$profile_uuid" 2>/dev/null || true)"
+  declare -A INBOUND_UUID_BY_TAG=()
+  while IFS='|' read -r uuid tag; do
+    [[ -n "$uuid" && -n "$tag" ]] || continue
+    INBOUND_UUID_BY_TAG["$tag"]="$uuid"
+  done <<<"$inbounds_raw"
+
+  if (( ${#INBOUND_UUID_BY_TAG[@]} == 0 )); then
+    warn "Не удалось получить inbound'ы профиля $profile_uuid — нода/хосты будут созданы без привязки"
+    note "Проверьте панель: Config Profiles → $profile_name → inbounds"
+  else
+    ok "Профиль содержит inbound'ы: ${!INBOUND_UUID_BY_TAG[*]}"
+  fi
+
+  # 3) Нода — собираем все inbound uuid для activeInbounds
+  local inbounds_csv=""
+  for tag in "${!INBOUND_UUID_BY_TAG[@]}"; do
+    if [[ -n "$inbounds_csv" ]]; then inbounds_csv+=","; fi
+    inbounds_csv+="${INBOUND_UUID_BY_TAG[$tag]}"
+  done
+  local node_uuid=""
+  if [[ -n "$inbounds_csv" ]]; then
+    node_uuid="$(panel_upsert_node "$profile_uuid" "$inbounds_csv" 2>/dev/null | tail -1 || true)"
+    node_uuid="$(printf '%s' "$node_uuid" | tail -1 | tr -d '[:space:]')"
+    if [[ -n "$node_uuid" && "$node_uuid" != "(created)" ]]; then
+      kv "Panel: Node" "$node_uuid ($SERVER_IP:$NODE_API_PORT)"
     fi
   fi
 
-  # 2) Шаблон подписки — информация для пользователя (API шаблонов может отличаться по версиям)
-  note "Шаблон подписки ($XRAY_TEMPLATE_CHOICE) сохранён в $NODE_DIR/Xray_template.json"
-  note "Загрузите его в панели: Templates → XRAY_JSON (скопируйте содержимое файла)"
-
-  # 3) Нода — создаётся уже с SECRET_KEY, но требует выбора профиля в панели
-  note "Нода Remnawave: IP $SERVER_IP, порт $NODE_API_PORT — создайте её в панели (Nodes → Management → +)"
-  note "Используйте SECRET_KEY из шага 9 и выберите созданный Config Profile"
-
-  # 4) Общая инструкция
-  if [[ -n "$profile_id" ]]; then
-    ok "Авто-настройка панели завершена (профиль создан, остальное — по инструкции README шаги 5–8)"
-  else
-    warn "Авто-настройка частично завершена — проверьте панель вручную"
+  # 4) Хосты — по одному на каждый inbound
+  local host_count=0
+  # REALITY_VISION
+  if [[ -n "${INBOUND_UUID_BY_TAG[REALITY_VISION]:-}" ]]; then
+    panel_upsert_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[REALITY_VISION]}" "VLESS Vision $PREFIX" "$VLESS_HOST" "443" '{"securityLayer":"REALITY","tag":"USA"}' >/dev/null 2>&1 || true
+    host_count=$((host_count+1))
   fi
+  if [[ -n "${INBOUND_UUID_BY_TAG[REALITY_XHTTP]:-}" && -n "$XHTTP_SNI" ]]; then
+    local extra
+    extra="$(jq -n --arg sni "$XHTTP_SNI" --arg path "$XHTTP_PATH" '{securityLayer:"REALITY", tag:"USA", sni: $sni, path: $path}' 2>/dev/null || echo '{"securityLayer":"REALITY","tag":"USA"}')"
+    panel_upsert_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[REALITY_XHTTP]}" "VLESS XHTTP $PREFIX" "$VLESS_HOST" "443" "$extra" >/dev/null 2>&1 || true
+    host_count=$((host_count+1))
+  fi
+  if [[ -n "${INBOUND_UUID_BY_TAG[HYSTERIA2]:-}" ]]; then
+    panel_upsert_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[HYSTERIA2]}" "Hysteria2 $PREFIX" "$HY_HOST" "443" '{"securityLayer":"TLS","tag":"USA"}' >/dev/null 2>&1 || true
+    host_count=$((host_count+1))
+  fi
+  # CDN хосты
+  if [[ -n "${INBOUND_UUID_BY_TAG[VLESS_CDN_WS]:-}" ]]; then
+    panel_upsert_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[VLESS_CDN_WS]}" "VLESS CDN WS $PREFIX" "$CDN_HOST" "443" '{"securityLayer":"TLS","tag":"USA","path":"'"${CDN_WS_PATH:-/api/v1/stream}"'"}' >/dev/null 2>&1 || true
+    host_count=$((host_count+1))
+  fi
+  if [[ -n "${INBOUND_UUID_BY_TAG[VLESS_CDN_XHTTP]:-}" ]]; then
+    panel_upsert_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[VLESS_CDN_XHTTP]}" "VLESS CDN XHTTP $PREFIX" "$CDN_HOST" "443" '{"securityLayer":"TLS","tag":"USA","path":"'"${CDN_XHTTP_PATH:-/api/v3/sync/c1}"'"}' >/dev/null 2>&1 || true
+    host_count=$((host_count+1))
+  fi
+  if [[ -n "${INBOUND_UUID_BY_TAG[VLESS_CDN_GRPC]:-}" ]]; then
+    panel_upsert_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[VLESS_CDN_GRPC]}" "VLESS CDN gRPC $PREFIX" "$CDN_HOST" "443" '{"securityLayer":"TLS","tag":"USA"}' >/dev/null 2>&1 || true
+    host_count=$((host_count+1))
+  fi
+  if (( host_count > 0 )); then
+    ok "Хосты созданы/обновлены: $host_count шт. (проверьте Hosts в панели)"
+  fi
+
+  # 5) Internal Squad — включить все inbounds
+  if (( ${#INBOUND_UUID_BY_TAG[@]} > 0 )); then
+    local -a squad_inbounds=()
+    for tag in "${!INBOUND_UUID_BY_TAG[@]}"; do squad_inbounds+=("${INBOUND_UUID_BY_TAG[$tag]}"); done
+    panel_upsert_internal_squad "${squad_inbounds[@]}" || true
+  fi
+
+  # 6) Шаблон подписки
+  panel_upsert_subscription_template "$XRAY_TEMPLATE_CHOICE" || true
+
+  ok "Авто-настройка панели завершена: профиль=$profile_name, нода=$SERVER_IP:$NODE_API_PORT, хостов=$host_count"
   return 0
 }
 
@@ -1041,30 +1356,89 @@ panel_curl_cfg_init() {
   ( umask 077; printf 'header = "Authorization: Bearer %s"\n' "$REMNAWAVE_API_TOKEN" > "$PANEL_CURL_CFG" )
 }
 
+# panel_api делает запрос и сохраняет HTTP-код в PANEL_HTTP_CODE, тело — в stdout.
+# Успех определяется отдельно через panel_api_success (проверяет код 2xx + JSON success).
+PANEL_HTTP_CODE=""
+PANEL_HTTP_BODY=""
 panel_api() {
   local method="$1" path="$2" body="${3:-}"
   local url="${REMNAWAVE_PANEL_URL%/}/api$path"
-  local -a args=(-sS --max-time 20 -X "$method" -K "$PANEL_CURL_CFG" -H "Content-Type: application/json")
+  local -a args=(-sS --max-time 20 -X "$method" -K "$PANEL_CURL_CFG" -H "Content-Type: application/json" -w "\n%{http_code}")
   if [[ -n "$body" ]]; then args+=(-d "$body"); fi
-  curl "${args[@]}" "$url"
+  local raw
+  raw="$(curl "${args[@]}" "$url" 2>/dev/null || true)"
+  # Последняя строка — HTTP код, остальное — тело
+  PANEL_HTTP_CODE="${raw##*$'\n'}"
+  PANEL_HTTP_BODY="${raw%$'\n'*}"
+  if ! [[ "$PANEL_HTTP_CODE" =~ ^[0-9]{3}$ ]]; then
+    PANEL_HTTP_CODE="000"
+    PANEL_HTTP_BODY="$raw"
+  fi
+  printf '%s' "$PANEL_HTTP_BODY"
 }
 
 panel_api_success() {
-  jq -e '.response != null or .success == true or .data != null' >/dev/null 2>&1 <<<"$1" ||   jq -e 'has("response") or has("data") or .success == true' >/dev/null 2>&1 <<<"$1"
+  # Код должен быть 2xx и JSON без errors
+  if ! [[ "${PANEL_HTTP_CODE:-000}" =~ ^2[0-9]{2}$ ]]; then return 1; fi
+  # Успешный ответ панели содержит либо response, либо success:true, и не содержит ошибок
+  local body="${1:-$PANEL_HTTP_BODY}"
+  if jq -e '.success == false' >/dev/null 2>&1 <<<"$body"; then return 1; fi
+  if jq -e '.errors and (.errors|length>0)' >/dev/null 2>&1 <<<"$body"; then return 1; fi
+  jq -e '.response != null or .success == true or .data != null or has("response") or has("data")' >/dev/null 2>&1 <<<"$body"
 }
 
 panel_api_error() {
-  local msg
-  msg="$(jq -r '.message // .error // .errors[0].message // empty' <<<"$1" 2>/dev/null)"
-  printf '%s' "${msg:-неизвестная ошибка Panel API}"
+  local msg body="${1:-$PANEL_HTTP_BODY}"
+  # Пробуем достать человекочитаемую ошибку
+  msg="$(jq -r '.message // .error // .errors[0].message // .errors[0] // empty' <<<"$body" 2>/dev/null)"
+  if [[ -n "$msg" && "$msg" != "null" ]]; then
+    if [[ "${PANEL_HTTP_CODE:-}" != "200" && -n "$PANEL_HTTP_CODE" ]]; then
+      printf '%s (HTTP %s)' "$msg" "$PANEL_HTTP_CODE"
+    else
+      printf '%s' "$msg"
+    fi
+  else
+    if [[ -n "${PANEL_HTTP_CODE:-}" && "$PANEL_HTTP_CODE" != "200" ]]; then
+      printf 'неизвестная ошибка Panel API (HTTP %s)' "$PANEL_HTTP_CODE"
+    else
+      printf 'неизвестная ошибка Panel API'
+    fi
+  fi
 }
 
 panel_check_connection() {
   local resp
   resp="$(panel_api GET "/config-profiles")" || return 1
   if panel_api_success "$resp"; then return 0; fi
+  # Фолбэк: если профили недоступны, проверим ноды
   resp="$(panel_api GET "/nodes")" || return 1
   panel_api_success "$resp"
+}
+
+# Повтор с бэкофом для сетевых сбоев панели (001/000/5xx)
+panel_api_retry() {
+  local tries=3 delay=5 n=1 resp code
+  while :; do
+    resp="$(panel_api "$@" || true)"
+    code="${PANEL_HTTP_CODE:-000}"
+    if panel_api_success "$resp"; then
+      printf '%s' "$resp"
+      return 0
+    fi
+    # Не ретраим 4xx кроме 429
+    if [[ "$code" =~ ^4[0-9]{2}$ && "$code" != "429" ]]; then
+      printf '%s' "$resp"
+      return 1
+    fi
+    if (( n >= tries )); then
+      printf '%s' "$resp"
+      return 1
+    fi
+    warn "Panel API $1 $2 → HTTP $code, повтор $n/$tries через ${delay}s"
+    sleep "$delay"
+    n=$((n+1))
+    delay=$((delay*2))
+  done
 }
 
 detect_ssh_port() {
@@ -1206,6 +1580,12 @@ if [[ -f "$ENV_STORE" ]]; then
     ok "Переменные загружены из $ENV_STORE"
   fi
 fi
+# Нормализуем флаги из ENV_STORE (там y/n, логика ожидает 0/1). Повторный запуск
+# без этого ломал (( CF_MODE )) и (( REMNAWAVE_AUTO_SETUP )).
+CF_MODE="$(parse_bool "${CF_MODE:-0}" 0)"
+REMNAWAVE_AUTO_SETUP="$(parse_bool "${REMNAWAVE_AUTO_SETUP:-n}" 0)"
+ENABLE_XHTTP="$(parse_bool "${ENABLE_XHTTP:-y}" 0)"
+ENABLE_CDN="$(parse_bool "${ENABLE_CDN:-n}" 0)"
 
 # Короткое объяснение для новичка: что сейчас будет.
 if has_tty; then
@@ -1350,6 +1730,7 @@ note "VLESS Reality/Vision и Hysteria2 включены всегда. Допо�
 note "  • XHTTP — современный транспорт, лучше работает в некоторых сетях"
 note "  • VLESS за CDN — прячет IP ноды за Cloudflare/аналогами (требует отдельный домен)"
 : "${C_B:=}" "${C_CYN:=}" "${C_RST:=}" "${C_DIM:=}" "${C_GRY:=}" "${C_MAG:=}"
+# === flags block start ===
 ask_bool ENABLE_XHTTP "Включить XHTTP (рекомендуется: да)?" "${ENABLE_XHTTP:-y}"
 if (( ENABLE_XHTTP )); then
   ask XHTTP_SNI  "Маскировочный SNI для XHTTP (сайт для REALITY-handshake)" "${XHTTP_SNI:-www.gstatic.com}"
@@ -1394,6 +1775,7 @@ fi
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 if has_tty; then printf '\n %s%s━━━ Блок 4/4: Панель Remnawave ━━━%s\n' "${C_B:-}" "${C_CYN:-}" "${C_RST:-}" > /dev/tty 2>/dev/null || true; fi
 note "Панель управляет нодами, пользователями и подписками. Укажите её IP для firewall и API-порт ноды."
+# === flags block end ===
 ask PANEL_IP   "IP панели Remnawave (IPv4 или IPv6)"  "${PANEL_IP:-}"
 ask NODE_API_PORT "Порт ноды для связи с панелью (обычно 2222)" "${NODE_API_PORT:-2222}"
 
@@ -1588,6 +1970,9 @@ fi
 grep -qF "source $ENV_STORE" /root/.bashrc 2>/dev/null \
   || printf '[ -f %q ] && source %q\n' "$ENV_STORE" "$ENV_STORE" >> /root/.bashrc
 ok "Переменные сохранены в $ENV_STORE (0600, подхват в .bashrc)"
+if [[ -n "${CLOUDFLARE_API_TOKEN:-}" || -n "${REMNAWAVE_API_TOKEN:-}" ]]; then
+  note "Токены сохранены в $ENV_STORE (0600) — ограничьте доступ к файлу и ротируйте при утечке; в логе токены не пишутся."
+fi
 write_config_profile
 write_xray_template
 

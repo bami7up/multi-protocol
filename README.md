@@ -17,7 +17,7 @@ Caddy L4 на `443/tcp` раскладывает соединения по SNI, 
 
 | Способ | Кому подходит | Что делает установщик |
 |---|---|---|
-| **[Автоустановка](#-автоустановка-рекомендуется)** | Есть домен в Cloudflare и доступ к панели Remnawave | Сам создаёт поддомены, выпускает сертификаты, сохраняет Config Profile и помогает настроить панель через API |
+| **[Автоустановка](#-автоустановка-рекомендуется)** | Есть домен в Cloudflare и доступ к панели Remnawave | Сам создаёт поддомены, выпускает сертификаты, создаёт Config Profile, ноду, хосты, squad и шаблон подписки через API — без ручных шагов 1–8 |
 | **[Ручная установка](#-ручная-установка-пошагово)** | Нет Cloudflare или хотите всё контролировать вручную | Вы создаёте DNS и записи в панели по инструкции, установщик ставит только ноду |
 
 Оба способа ставят одну и ту же схему — разница только в том, сколько шагов вы делаете руками.
@@ -33,10 +33,8 @@ Caddy L4 на `443/tcp` раскладывает соединения по SNI, 
 Обычная установка требует 8 ручных шагов в панели. Автоустановка убирает самые скучные:
 
 - **Авто-домены:** вместо ручного создания `usa1.example.com`/`usa3.example.com` установщик сам заводит в Cloudflare две случайные записи вида `quiet-otter.example.com` / `brisk-lantern.example.com` (DNS only, без прокси). **Куда:** Cloudflare → DNS вашей зоны. **Зачем:** имена не пересекаются, не нужно лезть в DNS, сертификаты сразу совпадают с записями.
-- **Авто-панель:** если дадите URL панели и API-токен, установщик создаст Config Profile в панели через Remnawave API (`POST /api/config-profiles`). **Куда:** Remnawave → Config Profiles. **Зачем:** не копировать JSON руками, профиль сразу с вашими доменами, SNI и портами.
-- **Авто-шаблоны:** выбор темы фасада и шаблона подписки (`standard` — весь трафик через VPN, `split` — только RU/частные через VPN) прямо в мастере. **Куда:** `$NODE_DIR/Multiselect.json` и `$NODE_DIR/Xray_template.json`. **Зачем:** не искать файлы в репозитории.
-
-Остальные шаги (нода, хосты, squad) — по желанию: мастер предложит сделать их вручную по подсказкам.
+- **Авто-панель:** если дадите URL панели и API-токен, установщик через Remnawave API создаст всё нужное: Config Profile (`POST /api/config-profiles`), ноду (`POST /api/nodes` с `activeConfigProfileUuid` и всеми inbound'ами), хосты (`POST /api/hosts` по одному на каждый inbound — Vision, XHTTP, Hysteria2 + CDN), включит inbound'ы в Internal Squad и загрузит шаблон подписки (`POST /api/subscription-templates`). **Куда:** Remnawave → Config Profiles / Nodes / Hosts / Squads / Templates. **Зачем:** не делать 8 ручных шагов, нода сразу `Online` с готовыми хостами. Повторный запуск идемпотентен (находит по имени/remark и делает `PATCH` вместо дубля).
+- **Авто-шаблоны:** выбор темы фасада и шаблона подписки (`standard` — весь трафик через VPN, `split` — только RU/частные через VPN) прямо в мастере. **Куда:** `$NODE_DIR/Multiselect.json` и `$NODE_DIR/Xray_template.json` + загрузка в панель. **Зачем:** не искать файлы в репозитории — шаблон сразу в Templates.
 
 ### Что нужно заранее
 
@@ -80,7 +78,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/
 
 **Блок 4/4 — Панель Remnawave:**
 - `IP панели` и `Порт ноды` (обычно `2222`) — нужны для UFW (открыть `NODE_PORT` только с IP панели). **Куда:** firewall ноды.
-- `Настроить панель автоматически через Remnawave API?` — `y`/`n`. При `y` — `URL панели` (`https://panel.example.com`) и `API токен` (скрытый ввод). Мастер проверит соединение и после установки ноды создаст Config Profile.
+- `Настроить панель автоматически через Remnawave API?` — `y`/`n`. При `y` — `URL панели` (`https://panel.example.com`) и `API токен` (скрытый ввод, нужны права `config-profiles:write`, `nodes:write`, `hosts:write`, `internal-squads:write`). Мастер проверит соединение и после установки ноды полностью настроит панель: создаст/обновит Config Profile, ноду, хосты, squad и шаблон подписки.
 
 После блоков мастер покажет сводку (`SERVER_IP`, `VLESS`, `HYSTERIA2`, `SELF_STEAL`, `Фасад`, `XHTTP`, `CDN`, `DNS`, `Авто-панель`) и спросит `Всё верно, продолжаем?`.
 
@@ -92,9 +90,10 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/
 - Сертификаты в `/etc/remna-certs/<домен>/` (автопродление через `acme.sh` cron).
 - `Caddyfile` с L4-маршрутами и локальными сайтами `127.0.0.1:9443` (self-steal) и `127.0.0.1:9444` (CDN).
 - `docker-compose.yml` в `/opt/remnanode` и ноду `remnanode` (host network).
-- `Multiselect.json` и `Xray_template.json` в `/opt/remnanode` — готовы для панели.
+- `Multiselect.json` и `Xray_template.json` в `/opt/remnanode`.
+- **В панели (при авто-режиме):** Config Profile (`multi-example.com-YYYYMMDD`), нода (`node-usa-example.com` → `SERVER_IP:2222`), хосты по каждому inbound (Vision/XHTTP/Hysteria2/CDN, `Hide ON`, `Tag USA`, `Port 443`), Internal Squad с включёнными inbound'ами, шаблон подписки. Нода сразу `Online` — без ручных шагов 1–8. Повторный запуск обновляет существующие объекты, не дублируя.
 
-Проверьте `Online` в **Nodes → Management** и продолжите с [шага 5 ручной инструкции](#шаг-5-создайте-рабочие-хосты) (хосты, virtual host, squad, клиент).
+Ручной режим: проверьте `Online` в **Nodes → Management** и продолжите с [шага 5 ручной инструкции](#шаг-5-создайте-рабочие-хосты) (хосты, virtual host, squad, клиент). В авто-режиме эти шаги уже выполнены — проверьте хосты и выдайте подписку пользователю.
 
 ### Неинтерактивный вариант (CI)
 
@@ -114,6 +113,8 @@ bash remnanode-setup.sh --non-interactive --yes --cloudflare
 ```
 
 Для воспроизводимости зафиксируйте образ: `NODE_IMAGE=remnawave/node:3.1.1`.
+
+> **Безопасность токенов:** `CLOUDFLARE_API_TOKEN` и `REMNAWAVE_API_TOKEN` сохраняются в `/root/remnanode.env` (0600) для идемпотентного повторного запуска — ограничьте доступ к файлу и ротируйте токены при утечке. В логе `/var/log/remnanode-setup-*.log` токены не пишутся (ввод скрыт).
 
 ---
 
