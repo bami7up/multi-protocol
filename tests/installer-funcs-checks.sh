@@ -883,7 +883,7 @@ ok "panel_profile_name: домен с точками санируется, дл�
 
 # Ответы-обёртки Remnawave 3.x: {response:{configProfiles:[...]}}.
 found="$( (
-  # shellcheck disable=SC2329  # вызывается косвенно из panel_find_profile_by_name
+  # shellcheck disable=SC2317,SC2329  # вызывается косвенно; код зависит от версии shellcheck
   panel_api() { printf '%s' '{"response":{"total":1,"configProfiles":[{"uuid":"p-1","name":"multi-example-com"}]}}'; }
   panel_find_profile_by_name 'multi-example-com'
 ) )"
@@ -911,7 +911,7 @@ res="$(panel_result_uuid '  ▲ Не удалось создать Config Profil
 [[ -z "$res" ]] || fail "panel_result_uuid: текст ошибки принят за uuid: '$res'"
 ok "panel_result_uuid: uuid берётся только из успешного вызова"
 
-# shellcheck disable=SC2329  # вызывается косвенно из panel_try_host
+# shellcheck disable=SC2317,SC2329  # вызывается косвенно; код зависит от версии shellcheck
 panel_upsert_host() { return "${HOST_STUB_RC:-0}"; }
 out="$(panel_try_host a b c)"
 [[ -z "$out" ]] || fail "panel_try_host: в консоль попал вывод успешного вызова: '$out'"
