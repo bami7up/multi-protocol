@@ -112,7 +112,11 @@ ok "confirm: 1/yes/n и ASSUME_YES понимаются одинаково"
 # --- 2. Запись /root/remnanode.env и повторный запуск ------------------------
 # Извлекаем ровно те фрагменты установщика, которые читают ответы шага 1 и
 # пишут env-файл: сначала разбор флагов, затем блок записи.
-sed -n '/^ask_bool ENABLE_XHTTP/,/^ask PANEL_IP /p' "$SETUP" | sed '$d' > "$WORK/flags.sh"
+if grep -q '^# === flags block start ===' "$SETUP"; then
+  sed -n '/^# === flags block start ===/,/^# === flags block end ===/p' "$SETUP" > "$WORK/flags.sh"
+else
+  sed -n '/^ask_bool ENABLE_XHTTP/,/^ask PANEL_IP /p' "$SETUP" | sed '$d' > "$WORK/flags.sh"
+fi
 grep -q 'ask_bool ENABLE_CDN' "$WORK/flags.sh" || fail "не удалось извлечь разбор флагов из установщика"
 grep -q 'ask_bool ENABLE_XHTTP' "$WORK/flags.sh" || fail "в извлечённом фрагменте нет разбора XHTTP"
 awk '/^\( umask 077$/,/^\)$/' "$SETUP" > "$WORK/env-store.sh"
