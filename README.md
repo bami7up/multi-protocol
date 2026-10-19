@@ -58,7 +58,21 @@ bash remnanode-setup.sh
 bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/remnanode-setup.sh)
 ```
 
-### Что спросит мастер (4 блока)
+### Что спросит мастер
+
+Первым делом мастер спросит **режим установки** (пропускается флагами `--quick`/`--advanced` или env `QUICK_SETUP=y/n`; выбор сохраняется в `/root/remnanode.env`):
+
+- **Быстрая автоустановка (рекомендуется)** — всего **5 вводов**, остальное установщик выбирает сам — меньше действий, меньше ошибок:
+  1. `Базовый домен` — просто домен без `https://`, `www` и слэшей (например `example.com`); вставленный «как из браузера» вид (`https://Example.COM/`) установщик сам приведёт к чистому.
+  2. `Cloudflare API Token` (скрытый ввод) — после этого поддомены VLESS/Hysteria2 создадутся сами со случайными именами, а CDN-домен `cdn.<ваш домен>` — с проксируемой записью.
+  3. `Домен панели` — **полным URL с `https://`**: правильно `https://panel.example.com` (можно ввести просто `panel.example.com` — `https://` добавится сам; неправильно — с путём или слэшем в конце: `https://panel.example.com/`).
+  4. `API токен панели` (скрытый ввод) — соединение сразу проверяется.
+  5. `IP сервера панели` для firewall — обычно уже подставлен автоматически (определяется по домену панели), остаётся нажать Enter. Если панель за Cloudflare-прокси, мастер предупредит: нужен реальный IP сервера, а не IP Cloudflare.
+
+  Автоматически и без вопросов: XHTTP включён (SNI `www.gstatic.com`), пути транспортов XHTTP/CDN — случайные, CDN включён (`cdn.<домен>`, транспорт `ws`, запись создаёт сам установщик), тема фасада на свежей установке — случайная из пяти, шаблон подписки — `standard`, **порт ноды — случайный** из диапазона 11000–59999 (показывается в сводке и сохраняется; повторный запуск порт, пути и тему не меняет). Остаётся только создать ноду в панели с этим портом на шаге запуска ноды и вставить её `SECRET_KEY` — профиль, хосты и шаблон установщик привяжет сам через API.
+- **Расширенная настройка** — прежние 4 блока с полным ручным контролем (ниже). Нужна, если нет Cloudflare, поддомены создаёте вручную или хотите свои пути/транспорт CDN/шаблон `split`.
+
+**Расширенный режим — 4 блока:**
 
 Мастер специально разбит на блоки простым языком — отвечаете `y`/`n` или выбираете номер:
 
@@ -91,7 +105,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/
 - `Caddyfile` с L4-маршрутами и локальными сайтами `127.0.0.1:9443` (self-steal) и `127.0.0.1:9444` (CDN).
 - `docker-compose.yml` в `/opt/remnanode` и ноду `remnanode` (host network).
 - `Multiselect.json` и `Xray_template.json` в `/opt/remnanode`.
-- **В панели (при авто-режиме):** Config Profile (`multi-example.com-YYYYMMDD`), нода (`node-usa-example.com` → `SERVER_IP:2222`), хосты по каждому inbound (Vision/XHTTP/Hysteria2/CDN, `Hide ON`, `Tag USA`, `Port 443`), Internal Squad с включёнными inbound'ами, шаблон подписки. Нода сразу `Online` — без ручных шагов 1–8. Повторный запуск обновляет существующие объекты, не дублируя.
+- **В панели (при авто-режиме):** Config Profile (`multi-example.com-YYYYMMDD`), нода (`node-usa-example.com` → `SERVER_IP:<порт ноды>`; в быстром режиме порт случайный и показывается в сводке мастера, в расширенном по умолчанию `2222`), хосты по каждому inbound (Vision/XHTTP/Hysteria2/CDN, `Hide ON`, `Tag USA`, `Port 443`), Internal Squad с включёнными inbound'ами, шаблон подписки. Нода сразу `Online` — без ручных шагов 1–8. Повторный запуск обновляет существующие объекты, не дублируя.
 
 Ручной режим: проверьте `Online` в **Nodes → Management** и продолжите с [шага 5 ручной инструкции](#шаг-5-создайте-рабочие-хосты) (хосты, virtual host, squad, клиент). В авто-режиме эти шаги уже выполнены — проверьте хосты и выдайте подписку пользователю.
 
@@ -110,6 +124,16 @@ ENABLE_CDN=y CDN_HOST=cdn.example.com CDN_TRANSPORT=ws \
 REMNAWAVE_PANEL_URL=https://panel.example.com REMNAWAVE_API_TOKEN=xxxx REMNAWAVE_AUTO_SETUP=y \
 PANEL_IP=203.0.113.10 NODE_API_PORT=2222 SECRET_KEY='eyJ...' \
 bash remnanode-setup.sh --non-interactive --yes --cloudflare
+```
+
+Тот же быстрый режим без вопросов (`--quick`): нужны только домен, токены и панель — пути, CDN-домен и поддомены выберутся автоматически (`PANEL_IP` можно не задавать, если домен панели резолвится в её реальный IP). `NODE_API_PORT` здесь зафиксирован тем портом, с которым нода уже создана в панели ради `SECRET_KEY`; без него порт сгенерируется случайно и сохранится для повторных запусков:
+
+```bash
+BASE_DOMAIN=example.com \
+CLOUDFLARE_API_TOKEN=xxxx \
+REMNAWAVE_PANEL_URL=https://panel.example.com REMNAWAVE_API_TOKEN=xxxx \
+NODE_API_PORT=2222 SECRET_KEY='eyJ...' \
+bash remnanode-setup.sh --quick --non-interactive --yes
 ```
 
 Для воспроизводимости зафиксируйте образ: `NODE_IMAGE=remnawave/node:3.1.1`.
@@ -203,7 +227,7 @@ bash remnanode-setup.sh
 bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/remnanode-setup.sh)
 ```
 
-Мастер задаст 4 блока (см. автоустановку выше). Ответы сохранятся в `/root/remnanode.env` (0600) и подхватятся в `.bashrc`.
+В начале мастера выберите **расширенный режим** (или запустите с `--advanced`) — он задаст 4 блока вопросов (см. автоустановку выше); быстрый режим рассчитан на Cloudflare и авто-панель. Ответы сохранятся в `/root/remnanode.env` (0600) и подхватятся в `.bashrc`.
 
 Неинтерактивно — см. [Неинтерактивный запуск](#неинтерактивный-запуск).
 
@@ -389,7 +413,7 @@ ENABLE_CDN=y CDN_HOST=cdn.example.com CDN_TRANSPORT=ws CLOUDFLARE_API_TOKEN=xxxx
 BASE_DOMAIN=example.com PANEL_IP=... bash remnanode-setup.sh --non-interactive --yes
 ```
 
-При `--cloudflare` A-запись CDN создаётся проксируемой (`proxied:true`) — единственная такая в схеме. При `ENABLE_CDN=n` CDN-инбаунды вырезаются из профиля и Caddyfile.
+Проксируемая A-запись CDN (`proxied:true`, единственная такая в схеме) создаётся установщиком автоматически при включённом CDN и заданном токене Cloudflare — в быстром режиме и в расширенном, даже если поддомены VLESS/Hysteria2 вы создавали вручную (без `--cloudflare`): зона для CDN-домена находится по его суффиксам, поэтому работает и CDN-домен в другой зоне. Ручной вариант остался только при явном `--no-cloudflare` (или если токен зону не видит) — тогда мастер предупредит и покажет в сводке строку `CDN DNS: ВРУЧНУЮ`, а запись нужно завести самому. При `ENABLE_CDN=n` CDN-инбаунды вырезаются из профиля и Caddyfile.
 
 **Что изменить в панели (куда и зачем):**
 
@@ -495,12 +519,14 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/
 --no-cloudflare       не использовать Cloudflare
 --panel-url URL       URL панели Remnawave (для авто-настройки)
 --api-token TOKEN     API токен панели
+--quick               быстрый режим мастера: 5 вопросов, остальное — авто/случайно
+--advanced            расширенный режим мастера: все вопросы по блокам
 -y, --yes             подтвердить yes/no
 --non-interactive     из env/дефолтов
 -h, --help            справка
 ```
 
-Переменные: `BASE_DOMAIN`, `PREFIX`, `SELF_STEAL_HOST`, `ENABLE_XHTTP`, `XHTTP_SNI`, `XHTTP_PATH`, `ENABLE_CDN`, `CDN_HOST`, `CDN_TRANSPORT`, `CDN_WS_PATH`, `CDN_XHTTP_PATH`, `CDN_GRPC_PATH`, `PANEL_IP`, `NODE_API_PORT`, `SECRET_KEY`, `NODE_IMAGE`, `SELF_STEAL_TEMPLATE`, `SELF_STEAL_TEMPLATE_URL`, `MULTISELECT_TEMPLATE_URL`, `XCADDY_VERSION`, `CADDY_VERSION`, `CADDY_L4_VERSION`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ZONE`, `REMNAWAVE_PANEL_URL`, `REMNAWAVE_API_TOKEN`, `REMNAWAVE_AUTO_SETUP`, `XRAY_TEMPLATE_CHOICE`, `NODE_DIR`, `CERT_DIR`, `ENV_STORE`. Логические понимают `y/yes/1/true/on`/`n/no/0/false/off`. `SERVER_IP` из env важнее автодетекта (для NAT).
+Переменные: `BASE_DOMAIN`, `PREFIX`, `SELF_STEAL_HOST`, `ENABLE_XHTTP`, `XHTTP_SNI`, `XHTTP_PATH`, `ENABLE_CDN`, `CDN_HOST`, `CDN_TRANSPORT`, `CDN_WS_PATH`, `CDN_XHTTP_PATH`, `CDN_GRPC_PATH`, `PANEL_IP`, `NODE_API_PORT`, `SECRET_KEY`, `NODE_IMAGE`, `SELF_STEAL_TEMPLATE`, `SELF_STEAL_TEMPLATE_URL`, `MULTISELECT_TEMPLATE_URL`, `XCADDY_VERSION`, `CADDY_VERSION`, `CADDY_L4_VERSION`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ZONE`, `REMNAWAVE_PANEL_URL`, `REMNAWAVE_API_TOKEN`, `REMNAWAVE_AUTO_SETUP`, `QUICK_SETUP`, `XRAY_TEMPLATE_CHOICE`, `NODE_DIR`, `CERT_DIR`, `ENV_STORE`. Логические понимают `y/yes/1/true/on`/`n/no/0/false/off`. `SERVER_IP` из env важнее автодетекта (для NAT).
 
 ## Внешние источники и воспроизводимость
 
@@ -536,6 +562,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/
 | Нет 301 на `:80` | Caddyfile, UFW, `curl` | 301 обязателен |
 | IPv6 панель | `IPV6=yes` в `/etc/default/ufw` | иначе правило не сработает |
 | Cloudflare не создаёт | права токена, `CLOUDFLARE_ZONE` | ошибка API в логе |
+| CDN-домена нет в Cloudflare | сводка мастера, строка `CDN DNS`: при `ВРУЧНУЮ` запись не создавалась (`--no-cloudflare`, нет токена или токен не видит зону CDN-домена) | без проксируемой A-записи CDN не заработает — создайте её или перезапустите без `--no-cloudflare` |
 
 ## IPv6, UFW и ACME
 

@@ -18,7 +18,9 @@
 # SC2317 (shellcheck <= 0.10) и SC2329 (переименован в 0.11): заглушки внешних
 #   команд (have/ok/warn) вызываются кодом установщика, который подключается
 #   ниже, — shellcheck считает их недостижимыми и не может увидеть вызовы.
-# shellcheck disable=SC2016,SC2317,SC2329
+# SC2030/SC2031: каждый «запуск установщика» намеренно изолирован в subshell,
+#   чтобы переменные одного запуска не протекали в другой.
+# shellcheck disable=SC2016,SC2030,SC2031,SC2317,SC2329
 set -Eeuo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -121,6 +123,8 @@ grep -q 'ask_bool ENABLE_CDN' "$WORK/flags.sh" || fail "не удалось из
 grep -q 'ask_bool ENABLE_XHTTP' "$WORK/flags.sh" || fail "в извлечённом фрагменте нет разбора XHTTP"
 awk '/^\( umask 077$/,/^\)$/' "$SETUP" > "$WORK/env-store.sh"
 grep -qF 'export ENABLE_CDN=' "$WORK/env-store.sh" || fail "не удалось извлечь запись env-файла"
+grep -qF 'export QUICK_SETUP=' "$WORK/env-store.sh" \
+  || fail "режим мастера не сохраняется в env-файл (повторный запуск будет спрашивать заново)"
 grep -qF '} > "$ENV_STORE"' "$WORK/env-store.sh" \
   || fail "извлечённый блок записи env-файла не пишет в ENV_STORE"
 for fn in ask ask_secret cdn_transport_enabled bool_yn parse_bool; do
@@ -236,7 +240,7 @@ printf 'export ENABLE_XHTTP=1\nexport ENABLE_CDN=1\nexport CDN_HOST=cdn.example.
 ok "совместимость: ENABLE_CDN=1 из старого env-файла по-прежнему включает CDN"
 
 # --- 3. SERVER_IP из env важнее автодетекта ----------------------------------
-awk '/^# SERVER_IP нужен для A-записей/,/^ask BASE_DOMAIN /' "$SETUP" | sed '$d' > "$WORK/server-ip.sh"
+awk '/^# SERVER_IP нужен для A-записей/,/^# Выбор режима мастера/' "$SETUP" | sed '$d' > "$WORK/server-ip.sh"
 grep -q 'ifconfig.me' "$WORK/server-ip.sh" || fail "не удалось извлечь блок определения SERVER_IP"
 for fn in is_ipv4 is_private_ipv4; do
   extract "$fn"
@@ -293,5 +297,59 @@ for var in CDN_TLS_PORT CDN_WS_PORT CDN_XHTTP_PORT CDN_GRPC_PORT; do
     || fail "$var не исключён из NODE_API_PORT (конфликт портов с CDN)"
 done
 ok "NODE_API_PORT: занятые порты схемы, включая CDN, отвергаются"
+
+# --- 5. Быстрый режим: блок протоколов без вопросов -------------------------
+# QUICK_SETUP=1 обязан включать XHTTP и CDN сам: домен CDN — cdn.<базовый>,
+# пути на свежей установке — случайные, а сохранённые значения (повторный
+# запуск, ENV_STORE_LOADED=1) не затираются новыми случайными.
+for fn in cf_rand_index random_hex gen_random_api_path; do
+  extract "$fn"
+done
+run_quick_flags() {
+  (
+    set -Eeuo pipefail
+    export NONINTERACTIVE=1 QUICK_SETUP=1
+    export BASE_DOMAIN=example.com
+    export CLOUDFLARE_API_TOKEN=test-token
+    export CDN_WS_ENABLED=0 CDN_XHTTP_ENABLED=0 CDN_GRPC_ENABLED=0
+    # shellcheck source=/dev/null
+    . "$WORK/ask.sh"
+    # shellcheck source=/dev/null
+    . "$WORK/cdn_transport_enabled.sh"
+    # shellcheck source=/dev/null
+    . "$WORK/cf_rand_index.sh"
+    # shellcheck source=/dev/null
+    . "$WORK/random_hex.sh"
+    # shellcheck source=/dev/null
+    . "$WORK/gen_random_api_path.sh"
+    # shellcheck source=/dev/null
+    . "$WORK/flags.sh"
+    printf '%s|%s|%s|%s|%s|%s\n' "$ENABLE_XHTTP" "$ENABLE_CDN" "$XHTTP_SNI" \
+      "$XHTTP_PATH" "$CDN_HOST" "$CDN_WS_PATH"
+  ) 2>/dev/null
+}
+
+export XHTTP_SNI='' XHTTP_PATH='' CDN_HOST='' CDN_TRANSPORT=''
+export CDN_WS_PATH=/api/v1/stream CDN_XHTTP_PATH=/api/v3/sync/c1 CDN_GRPC_PATH=/api/v4/stream
+export ENV_STORE_LOADED=0
+quick_out="$(run_quick_flags)" || fail "быстрый режим: блок флагов завершился ошибкой"
+IFS='|' read -r q_xhttp q_cdn q_sni q_path q_host q_wspath <<< "$quick_out"
+[[ "$q_xhttp" == 1 && "$q_cdn" == 1 ]] \
+  || fail "быстрый режим не включил XHTTP/CDN сам: «$quick_out»"
+[[ "$q_sni" == "www.gstatic.com" ]] || fail "быстрый режим: SNI не дефолтный: «$q_sni»"
+[[ "$q_host" == "cdn.example.com" ]] || fail "быстрый режим: CDN-домен не cdn.<домен>: «$q_host»"
+[[ "$q_path" =~ ^/api/v3/sync/[0-9a-f]{8}$ ]] \
+  || fail "быстрый режим: путь XHTTP не случайный на свежей установке: «$q_path»"
+[[ "$q_wspath" =~ ^/api/v1/[0-9a-f]{8}$ ]] \
+  || fail "быстрый режим: путь CDN WS не случайный на свежей установке: «$q_wspath»"
+ok "быстрый режим: XHTTP+CDN без вопросов, домен и случайные пути — автоматически"
+
+export XHTTP_PATH=/custom/sync CDN_HOST=cdn2.example.com ENV_STORE_LOADED=1
+export CDN_WS_PATH=/api/v1/stream
+quick_out="$(run_quick_flags)" || fail "быстрый режим (повтор): блок флагов завершился ошибкой"
+IFS='|' read -r q_xhttp q_cdn q_sni q_path q_host q_wspath <<< "$quick_out"
+[[ "$q_path" == "/custom/sync" && "$q_host" == "cdn2.example.com" && "$q_wspath" == "/api/v1/stream" ]] \
+  || fail "быстрый режим затёр сохранённые значения при повторном запуске: «$quick_out»"
+ok "быстрый режим: сохранённые пути и домен при повторном запуске не меняются"
 
 printf 'все проверки переменных окружения и шага 1 прошли\n'

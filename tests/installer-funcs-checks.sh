@@ -18,7 +18,8 @@ ok()   { printf '✔ %s\n' "$*"; }
 for fn in is_ipv4 is_ipv6 is_private_ipv4 is_fqdn is_safe_xhttp_path \
            acme_cert_days_left cf_rand_index cf_make_hosts cf_valid_saved_host \
            multiselect_filter cdn_transport_enabled write_config_profile self_steal_template_url \
-           self_steal_template_list; do
+           self_steal_template_list random_hex gen_random_api_path random_node_port \
+           normalize_domain_input normalize_panel_url panel_url_host resolve_ipv4_host; do
   sed -n "/^${fn}() {\$/,/^}\$/p" "$SETUP" > "$WORK/$fn.sh"
   grep -q "^${fn}() {" "$WORK/$fn.sh" || fail "не удалось извлечь $fn из установщика"
   grep -q '^}$' "$WORK/$fn.sh" || fail "тело $fn обрезано (нет закрывающей скобки)"
@@ -161,7 +162,8 @@ ok "cf_valid_saved_host"
 # при ошибке API, отсутствии зоны и исчерпании перебора имён. curl подменяется
 # моком ПОСЛЕ извлечения функций.
 for fn in cf_api cf_json_success cf_json_error cf_curl_cfg_init \
-         cf_upsert_a cf_a_exists cf_setup_hosts; do
+         cf_upsert_a cf_a_exists cf_setup_hosts cf_zone_id_for_host \
+         cf_setup_cdn_host; do
   sed -n "/^${fn}() {\$/,/^}\$/p" "$SETUP" > "$WORK/$fn.sh"
   grep -q "^${fn}() {" "$WORK/$fn.sh" || fail "не удалось извлечь $fn из установщика"
   # shellcheck source=/dev/null
@@ -185,6 +187,7 @@ dig()  { printf '%s\n' "$SERVER_IP"; }
 
 CF_MOCK_LOG="$WORK/cf-mock.log"
 CF_MOCK_ZONE_FOUND=1
+CF_MOCK_ZONE_NAME=example.com
 CF_MOCK_ZONE_ERROR=0
 CF_MOCK_ALL_TAKEN=0
 CF_MOCK_COLLIDE_ONCE=0
@@ -196,7 +199,7 @@ cf_api() { # мок Cloudflare API: пишет журнал вызовов, от
   if [[ "$method" == GET && "$path" == /zones?name=* ]]; then
     if [[ "$CF_MOCK_ZONE_ERROR" == 1 ]]; then
       printf '{"success":false,"errors":[{"message":"мок: нет прав"}]}'
-    elif [[ "$CF_MOCK_ZONE_FOUND" == 1 ]]; then
+    elif [[ "$CF_MOCK_ZONE_FOUND" == 1 && "$path" == "/zones?name=${CF_MOCK_ZONE_NAME:-example.com}&status=active" ]]; then
       printf '{"success":true,"result":[{"id":"zone123"}]}'
     else
       printf '{"success":true,"result":[]}'
@@ -307,7 +310,127 @@ rm -f "$CF_CURL_CFG"
 CF_CURL_CFG=""
 ok "cf_upsert_a: CDN-хост создаётся проксируемым (proxied=on)"
 
-unset BASE_DOMAIN SERVER_IP CLOUDFLARE_API_TOKEN VLESS_HOST HY_HOST
+# Случай 7 (регрессия «не создаёт домен для CDN»): cf_setup_hosts не
+# вызывался (CF_MODE=n, хосты VLESS/Hysteria2 созданы вручную), токен
+# задан только ради CDN. Проксируемая запись обязана создаться, а зона —
+# найтись перебором суффиксов CDN-хоста.
+export CDN_HOST=cdn.example.com
+export CF_ZONE_ID="" CF_ZONE_NAME="" CDN_DNS_MANAGED=""
+CF_MOCK_ZONE_FOUND=1 CF_MOCK_ZONE_ERROR=0 CF_MOCK_ALL_TAKEN=0
+CF_MOCK_COLLIDE_ONCE=0 CF_MOCK_SAVED_TAKEN=0 CF_MOCK_ZONE_NAME=example.com
+: > "$CF_MOCK_LOG"
+cf_setup_cdn_host
+[[ "$CDN_DNS_MANAGED" == cloudflare ]] || fail "CDN-запись без CF_MODE не помечена созданной (CDN_DNS_MANAGED=$CDN_DNS_MANAGED)"
+[[ "$(grep -c '^POST ' "$CF_MOCK_LOG")" == 1 ]] || fail "ожидался ровно один POST (CDN-запись), журнал: $(cat "$CF_MOCK_LOG")"
+grep -q '"proxied":true' "$CF_MOCK_LOG" || fail "CDN-запись без CF_MODE создаётся без proxied:true"
+grep -q '^GET /zones?name=example.com&status=active' "$CF_MOCK_LOG" \
+  || fail "зона CDN-хоста не искалась суффиксами, журнал: $(cat "$CF_MOCK_LOG")"
+[[ -z "$CF_CURL_CFG" ]] || fail "CF_CURL_CFG не очищен после cf_setup_cdn_host"
+ok "cf_setup_cdn_host: запись создаётся без CF_MODE, зона найдена суффиксами хоста"
+
+# Случай 8: зона, уже найденная cf_setup_hosts, переиспользуется —
+# повторных запросов /zones не нужно.
+CF_ZONE_ID=zone123 CF_ZONE_NAME=example.com
+: > "$CF_MOCK_LOG"
+cf_setup_cdn_host
+[[ "$CDN_DNS_MANAGED" == cloudflare ]] || fail "переиспользование зоны не помечено созданной записью"
+if grep -q '^GET /zones?' "$CF_MOCK_LOG"; then
+  fail "при готовой зоне выполнен лишний поиск /zones: $(cat "$CF_MOCK_LOG")"
+fi
+[[ "$(grep -c '^POST ' "$CF_MOCK_LOG")" == 1 ]] || fail "при готовой зоне запись CDN не создалась: $(cat "$CF_MOCK_LOG")"
+ok "cf_setup_cdn_host: зона cf_setup_hosts переиспользуется без поиска"
+
+# Случай 9: CDN-хост в другой зоне, чем BASE_DOMAIN: готовая зона не
+# подходит, нужна своя — запись должна уйти в зону CDN-хоста.
+CDN_HOST=cdn.other.org CF_MOCK_ZONE_NAME=other.org
+: > "$CF_MOCK_LOG"
+cf_setup_cdn_host
+[[ "$CDN_DNS_MANAGED" == cloudflare ]] || fail "CDN-хост в чужой зоне не помечен созданным"
+grep -q '^GET /zones?name=other.org&status=active' "$CF_MOCK_LOG" \
+  || fail "зона CDN-хоста other.org не искалась: $(cat "$CF_MOCK_LOG")"
+grep -qF 'cdn.other.org' "$CF_MOCK_LOG" || fail "в запросах нет CDN-хоста другой зоны"
+CDN_HOST=cdn.example.com CF_MOCK_ZONE_NAME=example.com
+ok "cf_setup_cdn_host: CDN-хост в другой зоне получает свою зону"
+
+# Случай 10: токен зону CDN-хоста не видит → установка не падает, но
+# результат честно manual (пользователь увидит действие в сводке),
+# а не тишина, как раньше.
+CF_ZONE_ID="" CF_ZONE_NAME="" CF_MOCK_ZONE_FOUND=0
+: > "$CF_MOCK_LOG"
+cf_setup_cdn_host
+[[ "$CDN_DNS_MANAGED" == manual ]] || fail "невидимая зона не помечена manual (получено: $CDN_DNS_MANAGED)"
+[[ "$(grep -c '^POST ' "$CF_MOCK_LOG")" == 0 ]] \
+  || fail "при невидимой зоне запись всё равно создавалась"
+CF_MOCK_ZONE_FOUND=1
+ok "cf_setup_cdn_host: невидимая токеном зона → manual без записи"
+
+# Случай 11: явный --no-cloudflare → ни одного вызова API, запись manual.
+export CF_MODE_SETTING=0
+: > "$CF_MOCK_LOG"
+cf_setup_cdn_host
+[[ "$CDN_DNS_MANAGED" == manual ]] || fail "--no-cloudflare не помечен manual"
+[[ ! -s "$CF_MOCK_LOG" ]] || fail "--no-cloudflare всё равно ходил в API: $(cat "$CF_MOCK_LOG")"
+unset CF_MODE_SETTING
+ok "cf_setup_cdn_host: --no-cloudflare не трогает Cloudflare API"
+
+# Мастер обязан предлагать CDN-домен сам (Enter — cdn.<базовый домен>),
+# а не требовать выдумывать его с пустым дефолтом.
+# shellcheck disable=SC2016 # ищем литеральный фрагмент кода установщика, подстановка не нужна
+grep -qF 'cdn.${BASE_DOMAIN' "$SETUP" \
+  || fail "мастер не предлагает CDN-домен по умолчанию (cdn.<базовый домен>)"
+ok "CDN_HOST: по умолчанию предлагается cdn.<BASE_DOMAIN>"
+
+# --- Быстрый режим: нормализация вводов и случайные значения ---------------
+# Домен и URL панели люди вставляют «как из браузера»: со схемой, слэшем в
+# конце, в верхнем регистре. Мастер обязан приводить это к рабочему виду,
+# а не умирать с непонятной ошибкой Cloudflare/панели.
+[[ "$(normalize_domain_input 'https://Example.COM/')" == "example.com" ]] \
+  || fail "normalize_domain_input: https://Example.COM/ не приведён к example.com"
+[[ "$(normalize_domain_input 'example.com.')" == "example.com" ]] \
+  || fail "normalize_domain_input: хвостовая точка не срезана"
+[[ "$(normalize_domain_input 'www.example.com/path')" == "example.com" ]] \
+  || fail "normalize_domain_input: www и путь не срезаны"
+[[ "$(normalize_panel_url 'panel.example.com')" == "https://panel.example.com" ]] \
+  || fail "normalize_panel_url: без схемы должен добавляться https://"
+[[ "$(normalize_panel_url 'https://panel.example.com/')" == "https://panel.example.com" ]] \
+  || fail "normalize_panel_url: хвостовой слэш не срезан"
+[[ "$(normalize_panel_url 'http://203.0.113.5:3000/')" == "http://203.0.113.5:3000" ]] \
+  || fail "normalize_panel_url: http с IP и портом должен сохраняться"
+if normalize_panel_url 'ftp://panel.example.com' >/dev/null; then
+  fail "normalize_panel_url: чужая схема принята"
+fi
+if normalize_panel_url 'https://' >/dev/null; then
+  fail "normalize_panel_url: пустой хост принят"
+fi
+[[ "$(panel_url_host 'https://panel.example.com:8443')" == "panel.example.com" ]] \
+  || fail "panel_url_host: порт не срезан"
+ok "нормализация домена и URL панели (https:// добавляется, слэш/путь срезаются)"
+
+# IP панели по её домену: dig подменён стабом выше (отвечает SERVER_IP).
+[[ "$(resolve_ipv4_host '203.0.113.7')" == "203.0.113.7" ]] \
+  || fail "resolve_ipv4_host: готовый IPv4 должен возвращаться как есть"
+[[ "$(resolve_ipv4_host 'panel.example.com')" == "$SERVER_IP" ]] \
+  || fail "resolve_ipv4_host: A-запись домена панели не определилась"
+ok "resolve_ipv4_host: IP панели определяется по её домену"
+
+# Случайные значения быстрого режима: формат и диапазон, а не конкретные числа.
+hex8="$(random_hex 8)"
+[[ "$hex8" =~ ^[0-9a-f]{8}$ ]] || fail "random_hex 8 выдал «$hex8»"
+rand_path="$(gen_random_api_path /api/v3/sync)"
+[[ "$rand_path" =~ ^/api/v3/sync/[0-9a-f]{8}$ ]] || fail "gen_random_api_path выдал «$rand_path»"
+is_safe_xhttp_path "$rand_path" || fail "случайный путь не проходит is_safe_xhttp_path: $rand_path"
+for _ in $(seq 1 30); do
+  rand_port="$(random_node_port)"
+  [[ "$rand_port" =~ ^[0-9]+$ ]] || fail "random_node_port выдал «$rand_port»"
+  (( rand_port >= 11000 && rand_port <= 59999 )) \
+    || fail "случайный порт вне безопасного диапазона: $rand_port"
+  case "$rand_port" in
+    10443|10444|10446|10447|10448|9443|9444) fail "случайный порт совпал с портом схемы: $rand_port" ;;
+  esac
+done
+ok "случайные путь и порт быстрого режима (формат и диапазон)"
+
+unset BASE_DOMAIN SERVER_IP CLOUDFLARE_API_TOKEN VLESS_HOST HY_HOST CDN_HOST CF_ZONE_ID CF_ZONE_NAME CDN_DNS_MANAGED CF_MOCK_ZONE_NAME
 
 # --- multiselect_filter: готовый Config Profile для панели ---
 # Профиль обязан следовать режиму XHTTP: с выключенным XHTTP inbound
