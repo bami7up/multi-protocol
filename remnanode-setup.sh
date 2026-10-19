@@ -752,7 +752,8 @@ write_xray_template() {
     fi
     # Если запускаем не из репозитория, пробуем скачать
     if [[ ! -r "$src" ]]; then
-      local tmp2="$(mktemp)"
+      local tmp2
+      tmp2="$(mktemp)"
       if retry 3 3 curl -fsSL "${SELF_STEAL_RAW_BASE}/Xray_template_split.json" -o "$tmp2" 2>/dev/null; then
         src="$tmp2"
       else
@@ -767,7 +768,8 @@ write_xray_template() {
       src="$SCRIPT_DIR/../Xray_template.json"
     fi
     if [[ ! -r "$src" ]]; then
-      local tmp2="$(mktemp)"
+      local tmp2
+      tmp2="$(mktemp)"
       if retry 3 3 curl -fsSL "${SELF_STEAL_RAW_BASE}/Xray_template.json" -o "$tmp2" 2>/dev/null; then
         src="$tmp2"
       else
@@ -856,7 +858,7 @@ panel_upsert_config_profile() {
     resp="$(panel_api_retry POST "/config-profiles" "$payload" 2>/dev/null || true)"
     if panel_api_success "$resp"; then
       result_uuid="$(jq -r '.response.uuid // .response.id // .data.uuid // .uuid // .id // empty' <<<"$resp" 2>/dev/null || true)"
-      if [[ -z "$result_uuid" ]]; then result_uuid="(created)"; else result_uuid="$result_uuid"; fi
+      if [[ -z "$result_uuid" ]]; then result_uuid="(created)"; fi
       ok "Config Profile создан: $profile_name ($result_uuid)"
     else
       # Попытка создать без retry если ошибка 4xx с сообщением о дубликате — ищем снова
@@ -1002,7 +1004,10 @@ panel_upsert_internal_squad() {
 }
 
 panel_upsert_subscription_template() {
-  local choice="$1" src="" tname="XRAY $choice $(date +%Y-%m-%d)"
+  local choice="$1"
+  local src=""
+  local tname
+  tname="XRAY $choice $(date +%Y-%m-%d)"
   if [[ "$choice" == "split" ]]; then
     src="$NODE_DIR/Xray_template.json"
     tname="XRAY split $(date +%Y-%m-%d)"

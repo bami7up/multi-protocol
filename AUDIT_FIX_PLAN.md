@@ -1,7 +1,7 @@
 # Аудит установщика и план исправлений — авто должно быть авто
 
-Дата: 2026-10-19  
-Ветка: `arena/ec6913c9-multi-protocol` (коммиты `eff5d2b` + `41be3e9`, PR #5)  
+Дата: 2026-10-19
+Ветка: `arena/ec6913c9-multi-protocol` (коммиты `eff5d2b` + `41be3e9`, PR #5)
 Статус: план зафиксирован для реализации
 
 ## Контекст
@@ -14,62 +14,62 @@ PR #5 добавил 4-блочный мастер (`ask_choice`, `write_xray_te
 
 ### P0 — блокируют «авто» / ломают установку
 
-1. **panel_auto_setup создаёт только Config Profile, остальное — подсказки.**  
+1. **panel_auto_setup создаёт только Config Profile, остальное — подсказки.**
    Код `panel_auto_setup()` в `remnanode-setup.sh` (~строки 793–880) делает `POST /api/config-profiles` и печатает `note` про ноду/хосты/шаблон. README же говорит «сам создаёт поддомены, сохраняет Config Profile и помогает настроить панель через API». Пользователь ожидает полный авто-сетап без ручных шагов 1–8. Сейчас это полуавто.
 
-2. **Неверный payload Config Profile.**  
+2. **Неверный payload Config Profile.**
    Текущий payload: `jq -n --argjson config "$profile_json" '{name: $name, config: $config}'` где `profile_json` — весь `Multiselect.json` (уже отфильтрованный). По контракту Remnawave `POST /api/config-profiles` ожидает `{ name, config: <full Xray JSON> }` — это совпадает, но поле `config` в ответах панели вложено, а успех проверяется как `'.response != null or .success == true or .data != null'` — слишком широкое, маскирует ошибки валидации (A061: Config doesn't have inbounds и т.п.). Также имя `Multi-protocol $(date +%Y-%m-%d)` не идемпотентно и не проверяет дубликаты.
 
-3. **Xray_template не попадает в панель вообще.**  
+3. **Xray_template не попадает в панель вообще.**
    `write_xray_template` сохраняет файл локально, `panel_auto_setup` только пишет `note` «Загрузите вручную → Templates → XRAY_JSON». Эндпоинт панели — `POST /api/subscription-templates` (или `/api/templates` в зависимости от версии, в контракте 3.3.x — subscription-templates). Авто не делает запрос.
 
-4. **Нода не создаётся.**  
+4. **Нода не создаётся.**
    После `docker compose up` нода работает, но в панели её нет. Для настоящего авто нужен `POST /api/nodes` с `{ name, address: SERVER_IP, port: NODE_API_PORT, configProfile: { activeConfigProfileUuid, activeInbounds }, countryCode }`. Требуется получить UUID инбаундов из созданного профиля (`GET /api/config-profiles/{uuid}/inbounds`).
 
-5. **Хосты не создаются.**  
+5. **Хосты не создаются.**
    Нужен `POST /api/hosts` на каждый inbound: `{ inbound: { configProfileUuid, configProfileInboundUuid }, remark, address, port: 443, ... }`. Для CDN — отдельные хосты с `securityLayer: TLS`, SNI, path. Сейчас только `note`.
 
-6. **Токен и URL не нормализуются.**  
+6. **Токен и URL не нормализуются.**
    `CF_MODE`/`REMNAWAVE_AUTO_SETUP` пишутся в `ENV_STORE` как `bool_yn` (y/n), но читаются позже как `(( VAR ))` без `parse_bool`. В `panel_auto_setup` проверяется `(( ! REMNAWAVE_AUTO_SETUP ))` — для `y`/`n` это арифметическая ошибка / неверное ветвление. Аналогично `CF_MODE` после `source ENV_STORE` остаётся строкой `y/n`, а `if (( CF_MODE ))` ожидает 0/1.
 
-7. **Отсутствует обработка существующих ресурсов (идемпотентность).**  
+7. **Отсутствует обработка существующих ресурсов (идемпотентность).**
    Повторный запуск с тем же доменом должен находить существующий профиль по имени (`GET /api/config-profiles` → фильтр по name) и делать `PATCH` вместо `POST`, иначе дубли. То же для нод (`GET /api/nodes` по address/port) и хостов (`GET /api/hosts`). Иначе замусоривание панели.
 
 ### P1 — важно для надёжности
 
-8. **panel_api_success слабая.**  
+8. **panel_api_success слабая.**
    `jq -e '.response != null or .success == true or .data != null' or 'has("response")...'` — пропускает ошибки, где поле `response` пустое или `errors[]` есть параллельно. Должен проверять `success == true` или отсутствие `errors` + http код 2xx.
 
-9. **panel_api не проверяет HTTP код.**  
+9. **panel_api не проверяет HTTP код.**
    `curl -sS --max-time 20 ...` без `-w %{http_code}` и без `fail`. 401/403/422 выглядят как «успех» если тело JSON парсится.
 
-10. **Отсутствует retry и таймаут для panel API.**  
+10. **Отсутствует retry и таймаут для panel API.**
     Сетевой сбой роняет авто-настройку без повтора. Нужен `retry 3 5 panel_api ...` как у Docker/Caddy.
 
-11. **Не сохраняется связь профиль→нода→хосты для отката.**  
+11. **Не сохраняется связь профиль→нода→хосты для отката.**
     Если создание хостов частично упало, нет лога какие UUID созданы, чтобы удалить/пересоздать.
 
-12. **Валидация PANEL_URL слабая.**  
+12. **Валидация PANEL_URL слабая.**
     Только `=~ ^https?://`, без удаления trailing `/`, без проверки что URL достижим до запроса токена. `panel_check_connection` делает `GET /config-profiles` и `GET /nodes` — но обе могут вернуть 200 с пустым `success=false`; проверка должна требовать именно success.
 
-13. **Токен в ENV_STORE — риск утечки.**  
+13. **Токен в ENV_STORE — риск утечки.**
     Сохранение `CLOUDFLARE_API_TOKEN` и `REMNAWAVE_API_TOKEN` в `/root/remnanode.env` (0600) удобно для повтора, но токен живёт в plaintext. Нужен комментарий про ротацию и опция не сохранять (`--no-save-token`). Минимум — предупредить в `note` и в README.
 
-14. **flags.sh в тестах хрупкий.**  
+14. **flags.sh в тестах хрупкий.**
     `sed -n '/^ask_bool ENABLE_XHTTP/,/^ask PANEL_IP /p' | sed '$d'` зависит от порядка строк. После добавления `ask_choice` порядок может поехать. Нужен маркер `# -- flags block --` или явный range по комментарию.
 
-15. **write_xray_template не проверяет выбор.**  
+15. **write_xray_template не проверяет выбор.**
     `XRAY_TEMPLATE_CHOICE` нормализуется к `standard|split` только в `write_xray_template`, но `ask_choice` уже пишет ключ `standard`/`split` напрямую. Если пользователь задаст `XRAY_TEMPLATE_CHOICE=Split` через env, `case "${choice,,}"` сработает, но `ask_choice` в non-interactive режиме берёт номер варианта, а не ключ — расхождение.
 
 ### P2 — полировка
 
-16. **Имя профиля неинформативно.**  
+16. **Имя профиля неинформативно.**
     `Multi-protocol YYYY-MM-DD` без указания домена/префикса. Лучше `multi-protocol-<BASE_DOMAIN>-YYYYMMDD` или как в README.
 
-17. **Нет вывода итогов авто-настройки.**  
+17. **Нет вывода итогов авто-настройки.**
     После `panel_auto_setup` не печатается сводка UUID ноды/профиля/хостов для проверки в панели.
 
-18. **Squad не трогается.**  
+18. **Squad не трогается.**
     Даже после создания ноды и хостов inbound'ы не попадут в подписку без включения в Internal Squad. Нужен `GET /api/internal-squads` → `PATCH /api/internal-squads/{uuid}` с добавлением inbound UUIDs.
 
 ---
