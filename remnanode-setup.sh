@@ -14,11 +14,31 @@ CF_MODE_SETTING=""
 CF_MODE=0
 CF_CURL_CFG=""
 CF_ZONE_ID=""
+CF_ZONE_NAME=""
+# Как появилась A-запись CDN-хоста: "cloudflare" — установщик создал
+# проксируемую запись сам, "manual"/"" — запись должен создать пользователь.
+# Значение показывается в сводке, чтобы отсутствие записи не было тихим.
+CDN_DNS_MANAGED=""
+# Быстрый режим мастера (--quick / QUICK_SETUP=y): только 5 вопросов —
+# домен, токен Cloudflare, домен панели, токен панели и IP панели.
+# Поддомены, CDN, пути, тема фасада и порт ноды выбираются автоматически.
+# QUICK_SETUP_SETTING: "" — решать по env/сохранённому/вопросу, 1 — --quick,
+# 0 — --advanced. ENV_STORE_LOADED отличает свежую установку от повторной
+# (случайные значения генерируются только на свежей).
+QUICK_SETUP_SETTING=""
+QUICK_SETUP_ENV_PRESENT=0
+[[ -n "${QUICK_SETUP:-}" ]] && QUICK_SETUP_ENV_PRESENT=1
+QUICK_SETUP="${QUICK_SETUP:-}"
+ENV_STORE_LOADED=0
 # Remnawave Panel API: автоматическая настройка панели (профили, ноды, хосты, шаблоны).
 REMNAWAVE_PANEL_URL="${REMNAWAVE_PANEL_URL:-}"
 REMNAWAVE_API_TOKEN="${REMNAWAVE_API_TOKEN:-}"
 REMNAWAVE_AUTO_SETUP="${REMNAWAVE_AUTO_SETUP:-n}"
 PANEL_CURL_CFG=""
+# Префикс ручных поддоменов (<prefix>1/<prefix>3) и имён объектов в панели.
+# Дефолт нужен и в Cloudflare-режиме: раньше при чистой установке PREFIX был
+# не задана вовсе и валидация падала с unbound variable под set -u.
+PREFIX="${PREFIX:-usa}"
 # Шаблон подписки: standard (весь трафик через VPN) или split (только RU/частные сети через VPN).
 XRAY_TEMPLATE_CHOICE="${XRAY_TEMPLATE_CHOICE:-standard}"
 NODE_DIR="${NODE_DIR:-/opt/remnanode}"
@@ -30,6 +50,10 @@ NODE_IMAGE="${NODE_IMAGE:-latest}"
 # Базу URL шаблонов фасада можно переопределить (свой форк, тег или коммит):
 SELF_STEAL_RAW_BASE="${SELF_STEAL_RAW_BASE:-https://raw.githubusercontent.com/bami7up/multi-protocol/main}"
 SELF_STEAL_TEMPLATES=(vaultdrop mail cloud admin docs)
+# Тема задана явно (env/--self-steal-template)? Тогда быстрый режим не вправе
+# заменять её случайной на свежей установке.
+SELF_STEAL_TEMPLATE_EXPLICIT=0
+[[ -n "${SELF_STEAL_TEMPLATE:-}" ]] && SELF_STEAL_TEMPLATE_EXPLICIT=1
 SELF_STEAL_TEMPLATE="${SELF_STEAL_TEMPLATE:-vaultdrop}"
 # Явный URL (свой фасад) важнее имени темы; проверяется при разборе переменных.
 SELF_STEAL_TEMPLATE_URL="${SELF_STEAL_TEMPLATE_URL:-}"
@@ -95,6 +119,8 @@ remnanode-setup.sh — установка ноды Remnawave (VLESS + Hysteria2 
   --no-cloudflare       не использовать Cloudflare, даже если токен в env
   --panel-url URL       URL панели Remnawave (напр. https://panel.example.com)
   --api-token TOKEN     API токен панели для авто-настройки
+  --quick               быстрый режим мастера: 5 вопросов, остальное — авто/случайно
+  --advanced            расширенный режим мастера: все вопросы (как раньше)
   -y | --yes            авто-подтверждение всех «y/n» вопросов
   --non-interactive     не задавать вопросы: все значения из env/дефолтов
   -h | --help           показать эту справку
@@ -108,18 +134,18 @@ remnanode-setup.sh — установка ноды Remnawave (VLESS + Hysteria2 
   XCADDY_VERSION, CADDY_VERSION, CADDY_L4_VERSION,
   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ZONE,
   REMNAWAVE_PANEL_URL, REMNAWAVE_API_TOKEN, REMNAWAVE_AUTO_SETUP,
-  SERVER_IP, NODE_DIR, CERT_DIR, ENV_STORE
+  QUICK_SETUP, SERVER_IP, NODE_DIR, CERT_DIR, ENV_STORE
 
-Логические переменные (ENABLE_XHTTP, ENABLE_CDN, REMNAWAVE_AUTO_SETUP) понимают
+Логические переменные (ENABLE_XHTTP, ENABLE_CDN, REMNAWAVE_AUTO_SETUP, QUICK_SETUP) понимают
 y/yes/1/true/on и n/no/0/false/off в любом регистре; пустое значение означает ответ по умолчанию.
 Значение SERVER_IP (в том числе из сохранённого env-файла) важнее автодетекта:
 задайте его, если нода за NAT или внешние сервисы определения IP недоступны.
 
-Интерактивный мастер задаст 4 блока вопросов понятным языком:
-  1) Домен и авто-создание поддоменов через Cloudflare,
-  2) Тема маскировочного сайта и шаблон подписки,
-  3) Протоколы (XHTTP, CDN),
-  4) Панель Remnawave и авто-настройка через API.
+Интерактивный мастер сначала спросит режим:
+  быстрый (рекомендуется): всего 5 вопросов — домен, токен Cloudflare,
+    домен панели (полным URL: https://panel.example.com), токен панели
+    и IP панели; поддомены, CDN, пути, тема и порт ноды — автоматически;
+  расширенный: прежние 4 блока вопросов со всеми настройками.
 USAGE
 }
 
@@ -141,6 +167,7 @@ while [[ $# -gt 0 ]]; do
       [[ -n "$NODE_IMAGE" ]] || { echo "--node-image требует значение" >&2; exit 2; }
       shift ;;
     --self-steal-template)
+      SELF_STEAL_TEMPLATE_EXPLICIT=1
       SELF_STEAL_TEMPLATE="${2:-}"
       [[ -n "$SELF_STEAL_TEMPLATE" ]] || { echo "--self-steal-template требует значение (тема фасада)" >&2; exit 2; }
       shift ;;
@@ -158,6 +185,8 @@ while [[ $# -gt 0 ]]; do
       shift ;;
     --cloudflare)    CF_MODE_SETTING=1 ;;
     --no-cloudflare) CF_MODE_SETTING=0 ;;
+    --quick)         QUICK_SETUP_SETTING=1 ;;
+    --advanced)      QUICK_SETUP_SETTING=0 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Неизвестный аргумент: $1" >&2; usage; exit 2 ;;
   esac
@@ -401,6 +430,116 @@ cf_rand_index() {
   printf '%s' $(( raw % n ))
 }
 
+# N случайных hex-символов из /dev/urandom — суффиксы случайных путей
+# транспортов в быстром режиме (путь не должен быть одинаковым у всех нод).
+random_hex() {
+  local n="${1:-8}" bytes hex
+  [[ "$n" =~ ^[1-9][0-9]*$ ]] || return 1
+  bytes=$(( (n + 1) / 2 ))
+  hex="$(od -An -N"$bytes" -tx1 </dev/urandom 2>/dev/null | tr -d '[:space:]')"
+  [[ "$hex" =~ ^[0-9a-f]+$ ]] || return 1
+  printf '%s' "${hex:0:$n}"
+}
+
+# Случайный API-подобный путь вида <префикс>/<8 hex> для транспортов.
+gen_random_api_path() {
+  local prefix="${1:-/api/v3/sync}" suffix
+  suffix="$(random_hex 8)" || return 1
+  printf '%s/%s' "$prefix" "$suffix"
+}
+
+# Случайный порт Node API для быстрого режима: диапазон 11000–59999 не
+# пересекается с портами схемы (80/443/9443/9444/10443–10448), а SSH-порт
+# дополнительно исключается, если его удалось определить.
+random_node_port() {
+  local idx port guard=0 ssh_port=""
+  if declare -F detect_ssh_port >/dev/null 2>&1; then
+    ssh_port="$(detect_ssh_port 2>/dev/null || true)"
+  fi
+  while (( guard < 50 )); do
+    idx="$(cf_rand_index 49000)" || return 1
+    port=$(( 11000 + idx ))
+    if [[ "$port" != "$ssh_port" && "$port" != "${SSH_PORT_OVERRIDE:-}" ]]; then
+      printf '%s' "$port"
+      return 0
+    fi
+    guard=$((guard + 1))
+  done
+  return 1
+}
+
+# Домен, как его вводят люди (https://Example.COM/, www.example.com.),
+# приводим к чистому виду example.com: без схемы, www, путей, порта и
+# хвостовой точки. Валидацию не делаем — её выполнит is_fqdn у вызывающего.
+normalize_domain_input() {
+  local d="${1:-}"
+  d="$(printf '%s' "$d" | tr -d '[:space:]')"
+  d="${d,,}"
+  d="${d#https://}"
+  d="${d#http://}"
+  d="${d%%/*}"
+  d="${d%%:*}"
+  d="${d%.}"
+  d="${d#www.}"
+  printf '%s' "$d"
+}
+
+# URL панели приводим к виду https://panel.example.com: схему добавляем,
+# если её нет (панель почти всегда за HTTPS), хвостовой слэш срезаем.
+# Возврат 1 — из ввода нельзя получить осмысленный URL.
+normalize_panel_url() {
+  local u="${1:-}" rest host
+  u="$(printf '%s' "$u" | tr -d '[:space:]')"
+  [[ -n "$u" ]] || return 1
+  case "$u" in
+    http://*|https://*) ;;
+    *://*) return 1 ;;
+    *) u="https://$u" ;;
+  esac
+  u="${u%/}"
+  rest="${u#*://}"
+  if [[ "$rest" == \[* ]]; then
+    host="${rest%%]*}"
+    host="${host#\[}"
+    is_ipv6 "$host" || return 1
+  else
+    host="${rest%%/*}"
+    host="${host%%:*}"
+    { is_fqdn "$host" || is_ipv4 "$host"; } || return 1
+  fi
+  printf '%s' "$u"
+}
+
+# Хост из URL панели (без схемы, порта и пути) — чтобы определить IP панели.
+panel_url_host() {
+  local rest="${1:-}" host
+  rest="${rest#*://}"
+  if [[ "$rest" == \[* ]]; then
+    host="${rest%%]*}"
+    printf '%s' "${host#\[}"
+    return 0
+  fi
+  host="${rest%%/*}"
+  host="${host%%:*}"
+  printf '%s' "$host"
+}
+
+# Первый IPv4 хоста по DNS (сам IPv4 возвращается как есть): дефолт для
+# PANEL_IP, чтобы пользователь не вводил адрес панели второй раз.
+resolve_ipv4_host() {
+  local host="${1:-}" ip
+  [[ -n "$host" ]] || return 1
+  if is_ipv4 "$host"; then
+    printf '%s' "$host"
+    return 0
+  fi
+  have dig || return 1
+  ip="$(dig +short "$host" A 2>/dev/null \
+        | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/{print; exit}')"
+  is_ipv4 "$ip" || return 1
+  printf '%s' "$ip"
+}
+
 # Два непохожих хоста «прилагательное-существительное.BASE_DOMAIN»:
 # прилагательные и существительные не повторяются, поэтому хосты различаются
 # в обеих частях. В stdout — ровно две строки.
@@ -517,9 +656,10 @@ cf_setup_hosts() {
   zone_id="$(jq -r '.result[0].id // empty' <<<"$resp")"
   [[ -n "$zone_id" ]] \
     || die "Токен не видит зону $zone_name: нужны права Zone:Read и Zone:DNS:Edit; если BASE_DOMAIN — поддомен, задайте CLOUDFLARE_ZONE."
-  # Идентификатор зоны нужен и после cf_setup_hosts: для проксируемой записи
-  # CDN-хоста и для ACME DNS-01 сертификата этого хоста.
+  # Идентификатор и имя зоны нужны и после cf_setup_hosts: cf_setup_cdn_host
+  # переиспользует зону для проксируемой записи CDN-хоста, если тот в ней лежит.
   CF_ZONE_ID="$zone_id"
+  CF_ZONE_NAME="$zone_name"
   ok "Cloudflare: зона $zone_name найдена"
 
   local -a cand=()
@@ -577,6 +717,81 @@ cf_setup_hosts() {
   note "Готовый Config Profile с этими хостами сохраняется на шаге 1; в Hosts панели хосты впишите вручную (README, раздел Cloudflare)."
   rm -f "$CF_CURL_CFG"
   CF_CURL_CFG=""
+}
+
+# cf_zone_id_for_host HOST → id зоны в stdout (пустая строка и возврат 1,
+# если токен не видит ни одной подходящей зоны или API недоступен). Зону
+# ищем суффиксами хоста от длинного к короткому: для cdn.sub.example.com
+# спрашиваем sub.example.com, затем example.com. Явный CLOUDFLARE_ZONE,
+# накрывающий хост, спрашиваем первым.
+cf_zone_id_for_host() {
+  local host="${1:-}" zone resp id
+  host="${host%.}"
+  local -a candidates=()
+  if [[ -n "${CLOUDFLARE_ZONE:-}" ]] \
+      && { [[ "$host" == "$CLOUDFLARE_ZONE" ]] || [[ "$host" == *".${CLOUDFLARE_ZONE}" ]]; }; then
+    candidates+=("$CLOUDFLARE_ZONE")
+  fi
+  zone="$host"
+  while [[ "$zone" == *.* ]]; do
+    candidates+=("$zone")
+    zone="${zone#*.}"
+  done
+  for zone in "${candidates[@]}"; do
+    resp="$(cf_api GET "/zones?name=${zone}&status=active")" || return 1
+    cf_json_success "$resp" || return 1
+    id="$(jq -r '.result[0].id // empty' <<<"$resp")"
+    if [[ -n "$id" ]]; then
+      printf '%s' "$id"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Точка входа для CDN-хоста: проксируемая A-запись (оранжевое облако)
+# через Cloudflare API. Намеренно НЕ зависит от CF_MODE: режим авто-ДНС
+# блока 1 отвечает только за случайные хосты VLESS/Hysteria2, а CDN
+# включается позже (блок 3) и токен там спрашивают отдельно. Раньше
+# создание записи гейтилось на CF_MODE, поэтому при ответе «n» в блоке 1
+# CDN-домен молча не создавался вообще, хотя токен для DNS-01 был введён.
+# Исходы без создания (--no-cloudflare, нет токена, токен не видит зону)
+# не останавливают установку, но обязаны быть громкими: CDN_DNS_MANAGED
+# остаётся "manual" и показывается в сводке как действие для пользователя.
+cf_setup_cdn_host() {
+  CDN_DNS_MANAGED="manual"
+  if [[ "${CF_MODE_SETTING:-}" == "0" ]]; then
+    warn "CDN: A-запись для $CDN_HOST не создаю (--no-cloudflare): создайте вручную проксируемую A-запись $CDN_HOST → $SERVER_IP (оранжевое облако), иначе CDN не заработает."
+    return 0
+  fi
+  if [[ -z "${CLOUDFLARE_API_TOKEN:-}" ]]; then
+    warn "CDN: нет CLOUDFLARE_API_TOKEN — A-запись для $CDN_HOST не создана: создайте вручную проксируемую A-запись $CDN_HOST → $SERVER_IP (оранжевое облако), иначе CDN не заработает."
+    return 0
+  fi
+  have jq || die "Для создания A-записи CDN-хоста через Cloudflare нужен jq — он не установился на шаге 0."
+  have curl || die "Для создания A-записи CDN-хоста через Cloudflare нужен curl."
+  is_ipv4 "$SERVER_IP" \
+    || die "Для A-записи CDN-хоста $CDN_HOST нужен публичный IPv4 (SERVER_IP), но он не определён. Задайте SERVER_IP через env."
+
+  cf_curl_cfg_init
+  local zone_id=""
+  if [[ -n "${CF_ZONE_ID:-}" && -n "${CF_ZONE_NAME:-}" ]] \
+      && { [[ "$CDN_HOST" == "$CF_ZONE_NAME" ]] || [[ "$CDN_HOST" == *".${CF_ZONE_NAME}" ]]; }; then
+    zone_id="$CF_ZONE_ID"
+    log "CDN: домен $CDN_HOST лежит в уже найденной зоне $CF_ZONE_NAME — создаю запись в ней"
+  else
+    zone_id="$(cf_zone_id_for_host "$CDN_HOST")" || zone_id=""
+  fi
+  if [[ -z "$zone_id" ]]; then
+    rm -f "$CF_CURL_CFG"
+    CF_CURL_CFG=""
+    warn "CDN: токен Cloudflare не видит зону домена $CDN_HOST — A-запись не создана: создайте вручную проксируемую A-запись $CDN_HOST → $SERVER_IP (оранжевое облако) или проверьте права токена (Zone:Read) и CLOUDFLARE_ZONE. Без записи CDN не заработает."
+    return 0
+  fi
+  cf_upsert_a "$zone_id" "$CDN_HOST" proxied
+  rm -f "$CF_CURL_CFG"
+  CF_CURL_CFG=""
+  CDN_DNS_MANAGED="cloudflare"
 }
 
 # ——— self-steal: темы фасада ———
@@ -1582,12 +1797,14 @@ if [[ -f "$ENV_STORE" ]]; then
     # ENV_STORE — намеренно настраиваемый путь.
     # shellcheck disable=SC1090
     source "$ENV_STORE" || warn "Не удалось прочитать $ENV_STORE — продолжаю без него."
+    ENV_STORE_LOADED=1
     ok "Переменные загружены из $ENV_STORE"
   fi
 fi
 # Нормализуем флаги из ENV_STORE (там y/n, логика ожидает 0/1). Повторный запуск
 # без этого ломал (( CF_MODE )) и (( REMNAWAVE_AUTO_SETUP )).
 CF_MODE="$(parse_bool "${CF_MODE:-0}" 0)"
+QUICK_SETUP="$(parse_bool "${QUICK_SETUP:-n}" 0)"
 REMNAWAVE_AUTO_SETUP="$(parse_bool "${REMNAWAVE_AUTO_SETUP:-n}" 0)"
 ENABLE_XHTTP="$(parse_bool "${ENABLE_XHTTP:-y}" 0)"
 ENABLE_CDN="$(parse_bool "${ENABLE_CDN:-n}" 0)"
@@ -1597,7 +1814,7 @@ if has_tty; then
 {
   printf '\n'
   printf ' %s%s Добро пожаловать в мастер установки! %s\n' "${C_B:-}${C_CYN:-}" "${C_RST:-}" ""
-  printf ' %sМы зададим 4 блока вопросов простым языком. На каждом шаге есть подсказки.%s\n' "${C_DIM:-}${C_GRY:-}" "${C_RST:-}"
+  printf ' %sБыстрый режим задаст всего 5 вопросов; расширенный — все настройки по блокам.%s\n' "${C_DIM:-}${C_GRY:-}" "${C_RST:-}"
   printf ' %sЕсли не знаете что ответить — жмите Enter для значения по умолчанию.%s\n' "${C_DIM:-}${C_GRY:-}" "${C_RST:-}"
   printf '\n'
 } > /dev/tty 2>/dev/null || true
@@ -1635,16 +1852,56 @@ if [[ -z "${SERVER_IP:-}" ]]; then
   fi
 fi
 
+# Выбор режима мастера. Приоритет: --quick/--advanced → env QUICK_SETUP →
+# сохранённый env-файл → вопрос. В --non-interactive вопрос не задаётся:
+# быстрый режим включается только явно (QUICK_SETUP=y/--quick), чтобы
+# существующие CI-запуски не меняли поведение молча.
+if [[ -n "$QUICK_SETUP_SETTING" ]]; then
+  QUICK_SETUP="$QUICK_SETUP_SETTING"
+elif [[ "$NONINTERACTIVE" == 1 ]] || (( QUICK_SETUP_ENV_PRESENT )) \
+    || { (( ENV_STORE_LOADED )) && grep -q '^export QUICK_SETUP=' "$ENV_STORE" 2>/dev/null; }; then
+  : # QUICK_SETUP уже нормализован из env/сохранённых переменных (дефолт 0)
+else
+  SETUP_MODE="quick"
+  ask_choice SETUP_MODE "Режим установки" "1" \
+    "quick: Быстрая автоустановка — всего 5 вопросов (домен, токены, панель), остальное автоматически (рекомендуется)" \
+    "advanced: Расширенная настройка — все вопросы по блокам, полный ручной контроль"
+  if [[ "$SETUP_MODE" == "quick" ]]; then QUICK_SETUP=1; else QUICK_SETUP=0; fi
+fi
+if (( QUICK_SETUP )); then
+  [[ "$CF_MODE_SETTING" != "0" ]] \
+    || die "Быстрый режим требует Cloudflare (поддомены и CDN создаются через API): уберите --no-cloudflare или запустите с --advanced."
+  ok "Режим: быстрая автоустановка — спрошу только домен, токен Cloudflare, домен/IP/токен панели"
+  note "Поддомены, CDN-домен, пути транспортов, тема фасада и порт ноды выберутся автоматически"
+  note "(случайно, где это уместно) и сохранятся — повторный запуск их не изменит."
+else
+  log "Режим: расширенная настройка (все вопросы по блокам)"
+fi
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # БЛОК 1/4: Домен и автоматическое создание поддоменов
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-if has_tty; then printf '\n %s%s━━━ Блок 1/4: Домены и DNS ━━━%s\n' "${C_B:-}" "${C_CYN:-}" "${C_RST:-}" > /dev/tty 2>/dev/null || true; fi
-note "Базовый домен — это ваш основной домен, например example.com. На его основе создаются поддомены для протоколов."
+if (( QUICK_SETUP )); then
+  if has_tty; then printf '\n %s%s━━━ Быстрая автоустановка: домен и Cloudflare ━━━%s\n' "${C_B:-}" "${C_CYN:-}" "${C_RST:-}" > /dev/tty 2>/dev/null || true; fi
+else
+  if has_tty; then printf '\n %s%s━━━ Блок 1/4: Домены и DNS ━━━%s\n' "${C_B:-}" "${C_CYN:-}" "${C_RST:-}" > /dev/tty 2>/dev/null || true; fi
+fi
+note "Базовый домен — ваш домен в Cloudflare. Пишите просто домен: без https://, без www и без слэшей."
+note "На его основе создаются поддомены для протоколов."
 ask BASE_DOMAIN "Базовый домен (напр. example.com)" "${BASE_DOMAIN:-}"
+# Люди вставляют домен и как https://Example.COM/ — приводим к чистому виду
+# сразу, иначе Cloudflare-зона не найдётся и ошибка будет непонятной.
+BASE_DOMAIN="$(normalize_domain_input "$BASE_DOMAIN")"
+is_fqdn "$BASE_DOMAIN" \
+  || die "Некорректный домен: «$BASE_DOMAIN» — нужен вид example.com (без https://, www и путей)."
 
 # Явный вопрос про авто-создание доменов — понятно обычному пользователю.
 # Если флаг --cloudflare/--no-cloudflare уже задан — не спрашиваем, используем его.
-if [[ -z "$CF_MODE_SETTING" ]]; then
+# В быстром режиме вопрос не нужен: Cloudflare обязателен (проверено выше).
+if (( QUICK_SETUP )); then
+  CF_MODE=1
+  note "Поддомены ноды создаст Cloudflare API автоматически (случайные непохожие имена)."
+elif [[ -z "$CF_MODE_SETTING" ]]; then
   note "Поддомены можно создать автоматически через Cloudflare API (рекомендуется для новичков)"
   note "или вручную — тогда нужно заранее создать A-записи на IP ноды ($SERVER_IP)."
   ask_bool CF_MODE "Создавать поддомены автоматически через Cloudflare?" "${CF_MODE:-n}"
@@ -1679,18 +1936,35 @@ ok "Домены ноды: $VLESS_HOST / $HY_HOST"
 ACME_EMAIL="admin@${BASE_DOMAIN}"
 ok "Email для Let's Encrypt: $ACME_EMAIL"
 
-ask SELF_STEAL_HOST "Домен self-steal для Vision/Reality (обычно = VLESS домен)" "${SELF_STEAL_HOST:-$VLESS_HOST}"
+if (( QUICK_SETUP )); then
+  SELF_STEAL_HOST="${SELF_STEAL_HOST:-$VLESS_HOST}"
+  note "Self-steal домен для Vision/Reality: $SELF_STEAL_HOST (авто)"
+else
+  ask SELF_STEAL_HOST "Домен self-steal для Vision/Reality (обычно = VLESS домен)" "${SELF_STEAL_HOST:-$VLESS_HOST}"
+fi
 VISION_SNI="$SELF_STEAL_HOST"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # БЛОК 2/4: Шаблоны — маскировочный сайт и шаблон подписки
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-if has_tty; then printf '\n %s%s━━━ Блок 2/4: Шаблоны — маскировка и подписка ━━━%s\n' "${C_B:-}" "${C_CYN:-}" "${C_RST:-}" > /dev/tty 2>/dev/null || true; fi
-note "Маскировочный сайт показывается сканерам вместо заглушки — выберите тему, похожую на обычный веб-сайт."
-note "Шаблон подписки определяет, как клиенты получают настройки: весь трафик через VPN или только часть."
+if (( ! QUICK_SETUP )); then
+  if has_tty; then printf '\n %s%s━━━ Блок 2/4: Шаблоны — маскировка и подписка ━━━%s\n' "${C_B:-}" "${C_CYN:-}" "${C_RST:-}" > /dev/tty 2>/dev/null || true; fi
+  note "Маскировочный сайт показывается сканерам вместо заглушки — выберите тему, похожую на обычный веб-сайт."
+  note "Шаблон подписки определяет, как клиенты получают настройки: весь трафик через VPN или только часть."
+fi
 
-# Выбор темы фасада — меню с описаниями (понятно обычному пользователю)
+# Выбор темы фасада — меню с описаниями (понятно обычному пользователю).
+# В быстром режиме тема на свежей установке выбирается случайно (фасады нод
+# не выглядят одинаково), на повторной — сохраняется прежняя из env-файла.
 if [[ -z "${SELF_STEAL_TEMPLATE_URL:-}" ]]; then
+  if (( QUICK_SETUP )); then
+    if (( ! SELF_STEAL_TEMPLATE_EXPLICIT && ! ENV_STORE_LOADED )); then
+      if __theme_idx="$(cf_rand_index "${#SELF_STEAL_TEMPLATES[@]}")"; then
+        SELF_STEAL_TEMPLATE="${SELF_STEAL_TEMPLATES[$__theme_idx]}"
+      fi
+    fi
+    note "Тема маскировочного сайта: $SELF_STEAL_TEMPLATE (авто)"
+  else
   # Определяем дефолтный номер для меню: vaultdrop=1, mail=2, cloud=3, admin=4, docs=5
   __default_theme_num=1
   for __i in "${!SELF_STEAL_TEMPLATES[@]}"; do
@@ -1706,16 +1980,20 @@ if [[ -z "${SELF_STEAL_TEMPLATE_URL:-}" ]]; then
     "admin: Админ-панель — панель управления сервером" \
     "docs: Документация — сайт с документацией"
   note "Выбрана тема: $SELF_STEAL_TEMPLATE"
+  fi
 else
   ok "Используется кастомный фасад: $SELF_STEAL_TEMPLATE_URL"
 fi
 
-# Выбор шаблона подписки — full vs split
+# Выбор шаблона подписки — full vs split. В быстром режиме не спрашиваем:
+# берётся сохранённый выбор, а на свежей установке — standard (весь трафик).
 __default_tpl_num=1
 if [[ "${XRAY_TEMPLATE_CHOICE,,}" == "split" ]]; then __default_tpl_num=2; fi
-ask_choice XRAY_TEMPLATE_CHOICE "Выберите шаблон подписки для клиентов" "$__default_tpl_num" \
-  "standard: Весь трафик через VPN (рекомендуется для обхода блокировок)" \
-  "split: Только RU/частные сети через VPN, остальное напрямую (экономия трафика)"
+if (( ! QUICK_SETUP )); then
+  ask_choice XRAY_TEMPLATE_CHOICE "Выберите шаблон подписки для клиентов" "$__default_tpl_num" \
+    "standard: Весь трафик через VPN (рекомендуется для обхода блокировок)" \
+    "split: Только RU/частные сети через VPN, остальное напрямую (экономия трафика)"
+fi
 # Нормализуем к стандартным значениям
 case "${XRAY_TEMPLATE_CHOICE,,}" in
   split|2) XRAY_TEMPLATE_CHOICE="split" ;;
@@ -1730,27 +2008,56 @@ fi
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # БЛОК 3/4: Протоколы
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-if has_tty; then printf '\n %s%s━━━ Блок 3/4: Протоколы ━━━%s\n' "${C_B:-}" "${C_CYN:-}" "${C_RST:-}" > /dev/tty 2>/dev/null || true; fi
-note "VLESS Reality/Vision и Hysteria2 включены всегда. Дополнительно можно включить:"
-note "  • XHTTP — современный транспорт, лучше работает в некоторых сетях"
-note "  • VLESS за CDN — прячет IP ноды за Cloudflare/аналогами (требует отдельный домен)"
+if (( ! QUICK_SETUP )); then
+  if has_tty; then printf '\n %s%s━━━ Блок 3/4: Протоколы ━━━%s\n' "${C_B:-}" "${C_CYN:-}" "${C_RST:-}" > /dev/tty 2>/dev/null || true; fi
+  note "VLESS Reality/Vision и Hysteria2 включены всегда. Дополнительно можно включить:"
+  note "  • XHTTP — современный транспорт, лучше работает в некоторых сетях"
+  note "  • VLESS за CDN — прячет IP ноды за Cloudflare/аналогами (требует отдельный домен)"
+fi
 : "${C_B:=}" "${C_CYN:=}" "${C_RST:=}" "${C_DIM:=}" "${C_GRY:=}" "${C_MAG:=}"
 # === flags block start ===
-ask_bool ENABLE_XHTTP "Включить XHTTP (рекомендуется: да)?" "${ENABLE_XHTTP:-y}"
+# Быстрый режим (QUICK_SETUP=1): XHTTP и CDN включены без вопросов; SNI —
+# проверенный дефолт, пути на свежей установке — случайные, CDN-домен —
+# cdn.<базовый домен>. Значения из env/сохранённого env-файла не затираются.
+if [[ "${QUICK_SETUP:-0}" == 1 ]]; then
+  ENABLE_XHTTP=1
+else
+  ask_bool ENABLE_XHTTP "Включить XHTTP (рекомендуется: да)?" "${ENABLE_XHTTP:-y}"
+fi
 if (( ENABLE_XHTTP )); then
-  ask XHTTP_SNI  "Маскировочный SNI для XHTTP (сайт для REALITY-handshake)" "${XHTTP_SNI:-www.gstatic.com}"
-  ask XHTTP_PATH "Путь XHTTP (случайный URL-путь)" "${XHTTP_PATH:-/api/v3/sync/r1}"
+  if [[ "${QUICK_SETUP:-0}" == 1 ]]; then
+    XHTTP_SNI="${XHTTP_SNI:-www.gstatic.com}"
+    if [[ -z "${XHTTP_PATH:-}" ]]; then
+      XHTTP_PATH="$(gen_random_api_path /api/v3/sync 2>/dev/null || printf '/api/v3/sync/r1')"
+    fi
+    note "XHTTP: включён автоматически (SNI $XHTTP_SNI, путь $XHTTP_PATH)"
+  else
+    ask XHTTP_SNI  "Маскировочный SNI для XHTTP (сайт для REALITY-handshake)" "${XHTTP_SNI:-www.gstatic.com}"
+    ask XHTTP_PATH "Путь XHTTP (случайный URL-путь)" "${XHTTP_PATH:-/api/v3/sync/r1}"
+  fi
 else
   warn "XHTTP отключён — будет использован только Vision (Reality)."
   XHTTP_SNI=""
   XHTTP_PATH=""
 fi
-ask_bool ENABLE_CDN "Добавить VLESS за CDN (прячет IP ноды)?" "${ENABLE_CDN:-n}"
+if [[ "${QUICK_SETUP:-0}" == 1 ]]; then
+  ENABLE_CDN=1
+else
+  ask_bool ENABLE_CDN "Добавить VLESS за CDN (прячет IP ноды)?" "${ENABLE_CDN:-n}"
+fi
 if (( ENABLE_CDN )); then
   note "CDN прячет origin: клиент идёт на CDN-домен по 443, CDN — на :443 ноды."
   note "Публичный TLS терминирует CDN, между CDN и нодой — сертификат origin (DNS-01 через Cloudflare)."
-  ask CDN_HOST "Домен, проксируемый CDN (A-запись под оранжевым облаком)" "${CDN_HOST:-}"
-  ask CDN_TRANSPORT "Транспорт CDN: ws, xhttp, grpc, both (ws+xhttp) или all" "${CDN_TRANSPORT:-ws}"
+  note "Проксируемую A-запись для CDN-домена установщик создаст сам в Cloudflare (оранжевое облако) —"
+  note "вручную её создавать не нужно. Исключение — запуск с --no-cloudflare: тогда запись делаете вы."
+  if [[ "${QUICK_SETUP:-0}" == 1 ]]; then
+    CDN_HOST="${CDN_HOST:-cdn.${BASE_DOMAIN:-}}"
+    CDN_TRANSPORT="${CDN_TRANSPORT:-ws}"
+    note "CDN: включён автоматически (домен $CDN_HOST, транспорт ${CDN_TRANSPORT,,})"
+  else
+    ask CDN_HOST "Домен, проксируемый CDN (A-запись под оранжевым облаком)" "${CDN_HOST:-cdn.${BASE_DOMAIN:-}}"
+    ask CDN_TRANSPORT "Транспорт CDN: ws, xhttp, grpc, both (ws+xhttp) или all" "${CDN_TRANSPORT:-ws}"
+  fi
   CDN_TRANSPORT="${CDN_TRANSPORT,,}"
   case "$CDN_TRANSPORT" in
     ws|xhttp|grpc|both|all) ;;
@@ -1758,43 +2065,75 @@ if (( ENABLE_CDN )); then
   esac
   if cdn_transport_enabled ws; then
     CDN_WS_ENABLED=1
-    ask CDN_WS_PATH "Путь WebSocket для CDN" "${CDN_WS_PATH:-/api/v1/stream}"
+    if [[ "${QUICK_SETUP:-0}" == 1 ]]; then
+      # На свежей установке дефолтный путь заменяем случайным; сохранённый
+      # (повторный запуск, ENV_STORE_LOADED=1) не трогаем.
+      if [[ "${ENV_STORE_LOADED:-0}" != 1 && "${CDN_WS_PATH:-}" == "/api/v1/stream" ]]; then
+        CDN_WS_PATH="$(gen_random_api_path /api/v1 2>/dev/null || printf '/api/v1/stream')"
+      fi
+    else
+      ask CDN_WS_PATH "Путь WebSocket для CDN" "${CDN_WS_PATH:-/api/v1/stream}"
+    fi
   fi
   if cdn_transport_enabled xhttp; then
     CDN_XHTTP_ENABLED=1
-    ask CDN_XHTTP_PATH "Путь XHTTP для CDN" "${CDN_XHTTP_PATH:-/api/v3/sync/c1}"
+    if [[ "${QUICK_SETUP:-0}" == 1 ]]; then
+      if [[ "${ENV_STORE_LOADED:-0}" != 1 && "${CDN_XHTTP_PATH:-}" == "/api/v3/sync/c1" ]]; then
+        CDN_XHTTP_PATH="$(gen_random_api_path /api/v3/sync 2>/dev/null || printf '/api/v3/sync/c1')"
+      fi
+    else
+      ask CDN_XHTTP_PATH "Путь XHTTP для CDN" "${CDN_XHTTP_PATH:-/api/v3/sync/c1}"
+    fi
   fi
   if cdn_transport_enabled grpc; then
     CDN_GRPC_ENABLED=1
-    ask CDN_GRPC_PATH "serviceName gRPC для CDN" "${CDN_GRPC_PATH:-/api/v4/stream}"
+    if [[ "${QUICK_SETUP:-0}" == 1 ]]; then
+      if [[ "${ENV_STORE_LOADED:-0}" != 1 && "${CDN_GRPC_PATH:-}" == "/api/v4/stream" ]]; then
+        CDN_GRPC_PATH="$(gen_random_api_path /api/v4 2>/dev/null || printf '/api/v4/stream')"
+      fi
+    else
+      ask CDN_GRPC_PATH "serviceName gRPC для CDN" "${CDN_GRPC_PATH:-/api/v4/stream}"
+    fi
   fi
   if [[ -z "${CLOUDFLARE_API_TOKEN:-}" ]]; then
-    note "Для CDN нужен Cloudflare Token с Zone:Read + DNS:Edit (сертификат origin по DNS-01)."
+    note "Для CDN нужен Cloudflare Token с Zone:Read + DNS:Edit: им установщик создаст проксируемую"
+    note "A-запись CDN-домена и выпустит сертификат origin по DNS-01."
     ask_secret CLOUDFLARE_API_TOKEN \
-      "Cloudflare API Token (для DNS-01 сертификата CDN)" ""
+      "Cloudflare API Token (для A-записи и DNS-01 сертификата CDN)" ""
   fi
 fi
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # БЛОК 4/4: Панель Remnawave
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-if has_tty; then printf '\n %s%s━━━ Блок 4/4: Панель Remnawave ━━━%s\n' "${C_B:-}" "${C_CYN:-}" "${C_RST:-}" > /dev/tty 2>/dev/null || true; fi
-note "Панель управляет нодами, пользователями и подписками. Укажите её IP для firewall и API-порт ноды."
+if [[ "${QUICK_SETUP:-0}" == 1 ]]; then
+  if has_tty; then printf '\n %s%s━━━ Быстрая автоустановка: панель Remnawave ━━━%s\n' "${C_B:-}" "${C_CYN:-}" "${C_RST:-}" > /dev/tty 2>/dev/null || true; fi
+else
+  if has_tty; then printf '\n %s%s━━━ Блок 4/4: Панель Remnawave ━━━%s\n' "${C_B:-}" "${C_CYN:-}" "${C_RST:-}" > /dev/tty 2>/dev/null || true; fi
+fi
+note "Панель управляет нодами, пользователями и подписками."
 # === flags block end ===
-ask PANEL_IP   "IP панели Remnawave (IPv4 или IPv6)"  "${PANEL_IP:-}"
-ask NODE_API_PORT "Порт ноды для связи с панелью (обычно 2222)" "${NODE_API_PORT:-2222}"
 
-# Явный запрос на авто-настройку панели через API — то, чего не хватало.
-note "Панель можно настроить автоматически (создать Config Profile, ноду, хосты) через API,"
-note "или вручную — через веб-интерфейс панели (инструкция в README, шаги 1–8)."
-ask_bool REMNAWAVE_AUTO_SETUP "Настроить панель автоматически через Remnawave API?" "${REMNAWAVE_AUTO_SETUP:-n}"
+# Авто-настройка панели спрашивается до IP/порта: по домену панели IP для
+# firewall чаще всего определяется сам, а порт в быстром режиме — случайный.
+if [[ "${QUICK_SETUP:-0}" == 1 ]]; then
+  REMNAWAVE_AUTO_SETUP=1
+else
+  note "Панель можно настроить автоматически (создать Config Profile, ноду, хосты) через API,"
+  note "или вручную — через веб-интерфейс панели (инструкция в README, шаги 1–8)."
+  ask_bool REMNAWAVE_AUTO_SETUP "Настроить панель автоматически через Remnawave API?" "${REMNAWAVE_AUTO_SETUP:-n}"
+fi
 if (( REMNAWAVE_AUTO_SETUP )); then
-  note "Нужны: URL панели (https://panel.example.com) и API токен (Панель → Settings → API Tokens)."
-  ask REMNAWAVE_PANEL_URL "URL панели Remnawave" "${REMNAWAVE_PANEL_URL:-}"
-  # Валидация URL — должен начинаться с http
-  if [[ ! "$REMNAWAVE_PANEL_URL" =~ ^https?:// ]]; then
-    warn "URL панели должен начинаться с https:// или http:// — проверьте."
-  fi
+  note "Домен панели пишите полным URL — с https:// в начале, без слэша и пути в конце:"
+  note "правильно: https://panel.example.com — если введёте просто panel.example.com,"
+  note "установщик сам добавит https://. Неправильно: panel.example.com/login, https://panel.example.com/"
+  note "API-токен создаётся в панели: Settings → API Tokens (права config-profiles:write,"
+  note "nodes:write, hosts:write, internal-squads:write)."
+  ask REMNAWAVE_PANEL_URL "Домен панели (URL, напр. https://panel.example.com)" "${REMNAWAVE_PANEL_URL:-}"
+  __normalized_panel_url="$(normalize_panel_url "$REMNAWAVE_PANEL_URL")" \
+    || die "Некорректный домен панели «$REMNAWAVE_PANEL_URL»: нужен URL вида https://panel.example.com (https:// можно не писать — добавится сам, а вот путь и слэш в конце не нужны)."
+  REMNAWAVE_PANEL_URL="$__normalized_panel_url"
+  ok "URL панели: $REMNAWAVE_PANEL_URL"
   if [[ -z "${REMNAWAVE_API_TOKEN:-}" ]]; then
     ask_secret REMNAWAVE_API_TOKEN "API токен панели Remnawave (скрытый ввод)" ""
   fi
@@ -1815,6 +2154,36 @@ else
   if [[ -n "${PANEL_CURL_CFG:-}" && -f "$PANEL_CURL_CFG" ]]; then
     rm -f "$PANEL_CURL_CFG"; PANEL_CURL_CFG=""
   fi
+fi
+
+# IP панели нужен только firewall'у (порт ноды открывается лишь с него).
+# Если адрес не задан, пробуем получить его из домена панели — пользователю
+# останется нажать Enter. Подвох: панель за Cloudflare-прокси резолвится в IP
+# Cloudflare, а не сервера, — об этом предупреждаем прямо в вопросе.
+__panel_ip_default="${PANEL_IP:-}"
+if [[ -z "$__panel_ip_default" && -n "${REMNAWAVE_PANEL_URL:-}" ]]; then
+  __panel_host="$(panel_url_host "$REMNAWAVE_PANEL_URL")"
+  if is_ipv4 "$__panel_host" || is_ipv6 "$__panel_host"; then
+    __panel_ip_default="$__panel_host"
+    note "IP панели взят из её URL: $__panel_ip_default"
+  elif __resolved_panel_ip="$(resolve_ipv4_host "$__panel_host")"; then
+    __panel_ip_default="$__resolved_panel_ip"
+    note "IP панели определён по домену $__panel_host: $__panel_ip_default (Enter — оставить)"
+    note "Если панель за Cloudflare-прокси, это IP Cloudflare — вместо него введите реальный IP сервера панели."
+  fi
+fi
+ask PANEL_IP "IP сервера панели Remnawave (IPv4 или IPv6, для firewall)" "$__panel_ip_default"
+
+# Порт Node API: в быстром режиме случайный (и сохраняется), в расширенном —
+# прежний вопрос с дефолтом 2222.
+if [[ "${QUICK_SETUP:-0}" == 1 ]]; then
+  if [[ -z "${NODE_API_PORT:-}" ]]; then
+    NODE_API_PORT="$(random_node_port)" \
+      || die "Не удалось сгенерировать случайный порт ноды — задайте NODE_API_PORT через env."
+  fi
+  ok "Порт ноды: $NODE_API_PORT (авто) — укажите его при создании ноды в панели; он есть в сводке ниже"
+else
+  ask NODE_API_PORT "Порт ноды для связи с панелью (обычно 2222)" "${NODE_API_PORT:-2222}"
 fi
 
 is_fqdn "$BASE_DOMAIN"       || die "Некорректный домен: $BASE_DOMAIN"
@@ -1904,21 +2273,20 @@ if (( ENABLE_CDN )); then
 fi
 export XRAY_TEMPLATE_CHOICE SELF_STEAL_TEMPLATE SELF_STEAL_TEMPLATE_URL
 export REMNAWAVE_PANEL_URL REMNAWAVE_API_TOKEN REMNAWAVE_AUTO_SETUP
-export CF_MODE CLOUDFLARE_API_TOKEN CLOUDFLARE_ZONE
+export CF_MODE CLOUDFLARE_API_TOKEN CLOUDFLARE_ZONE QUICK_SETUP
 
 # Запись CDN-хоста создаётся проксируемой: именно оранжевое облако направляет
-# трафик через CDN на origin. Токен нужен и для DNS-01 сертификата, поэтому всё,
-# что могло потребовать токена, выполняется здесь; затем временный конфиг curl
-# удаляется (и в on_exit, если установка прервётся раньше).
-if (( CF_MODE )); then
-  if (( ENABLE_CDN )); then
-    cf_curl_cfg_init
-    cf_upsert_a "$CF_ZONE_ID" "$CDN_HOST" proxied
-  fi
-  if [[ -n "$CF_CURL_CFG" ]]; then
-    rm -f "$CF_CURL_CFG"
-    CF_CURL_CFG=""
-  fi
+# трафик через CDN на origin. Это делается при каждом включённом CDN, а не
+# только в режиме авто-ДНС (CF_MODE): блок 1 мог быть ручным (usa1/usa3
+# созданы руками), а токен для CDN введён позже, в блоке 3, — запись всё
+# равно обязана появиться. cf_setup_cdn_host сама убирает временный конфиг
+# curl (и on_exit — если установка прервётся раньше); страховочная уборка ниже.
+if (( ENABLE_CDN )); then
+  cf_setup_cdn_host
+fi
+if [[ -n "$CF_CURL_CFG" ]]; then
+  rm -f "$CF_CURL_CFG"
+  CF_CURL_CFG=""
 fi
 
 ( umask 077
@@ -1955,6 +2323,7 @@ fi
     fi
     printf 'export XRAY_TEMPLATE_CHOICE=%q\n' "${XRAY_TEMPLATE_CHOICE:-standard}"
     printf 'export CF_MODE=%s\n' "$(bool_yn "${CF_MODE:-0}")"
+    printf 'export QUICK_SETUP=%s\n' "$(bool_yn "${QUICK_SETUP:-0}")"
     if [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]]; then
       printf 'export CLOUDFLARE_API_TOKEN=%q\n' "$CLOUDFLARE_API_TOKEN"
     fi
@@ -2000,13 +2369,23 @@ else
 fi
 if (( ENABLE_CDN )); then
   kv "CDN"           "$CDN_HOST (транспорт: $CDN_TRANSPORT)"
+  if [[ "$CDN_DNS_MANAGED" == "cloudflare" ]]; then
+    kv "CDN DNS"       "Cloudflare: проксируемая A-запись $CDN_HOST создана (proxied=on)"
+  else
+    kv "CDN DNS"       "ВРУЧНУЮ: создайте проксируемую A-запись $CDN_HOST → $SERVER_IP (оранжевое облако)"
+  fi
 fi
 kv "Config Profile" "$NODE_DIR/Multiselect.json"
 kv "Шаблон подписки" "$XRAY_TEMPLATE_CHOICE ($NODE_DIR/Xray_template.json)"
 kv "PANEL_IP"      "$PANEL_IP"
 kv "NODE_API_PORT" "$NODE_API_PORT"
+if (( QUICK_SETUP )); then
+  kv "Режим"           "быстрая автоустановка (пути, порт и тема выбраны автоматически)"
+else
+  kv "Режим"           "расширенная настройка"
+fi
 if (( CF_MODE )); then
-  kv "DNS"            "Cloudflare: A-записи созданы API (DNS only, proxied=off)"
+  kv "DNS"            "Cloudflare: A-записи VLESS/Hysteria2 созданы API (DNS only, proxied=off)"
 fi
 if (( REMNAWAVE_AUTO_SETUP )); then
   kv "Авто-панель"     "$REMNAWAVE_PANEL_URL (API)"
@@ -2564,6 +2943,10 @@ step 9 "Нода Remnawave (compose)"
 mkdir -p "$NODE_DIR"
 echo
 note "Создайте ноду в панели (Nodes -> Add) с IP $SERVER_IP и портом $NODE_API_PORT."
+if (( REMNAWAVE_AUTO_SETUP )); then
+  note "Профиль, хосты и шаблон подписки установщик привяжет сам через API после запуска ноды —"
+  note "вручную в панели нужна только сама нода (адрес и порт выше)."
+fi
 note "Панель выдаст SECRET_KEY (публичный ключ ноды). Вставьте его целиком."
 note "Можно как чистое значение (eyJ...), так и строку 'SECRET_KEY=...'."
 echo
@@ -2853,6 +3236,11 @@ else
 fi
 if (( ENABLE_CDN )); then
   kv "VLESS за CDN"   "$CDN_HOST  →  origin 127.0.0.1:$CDN_TLS_PORT  ($CDN_TRANSPORT)"
+  if [[ "$CDN_DNS_MANAGED" == "cloudflare" ]]; then
+    kv "  CDN: DNS"  "проксируемая A-запись в Cloudflare создана (proxied=on)"
+  else
+    kv "  CDN: DNS"  "ВРУЧНУЮ: проксируемая A-запись $CDN_HOST → $SERVER_IP ещё не создана!"
+  fi
   if (( CDN_WS_ENABLED )); then kv "  CDN: ws" "path $CDN_WS_PATH  →  127.0.0.1:$CDN_WS_PORT"; fi
   if (( CDN_XHTTP_ENABLED )); then kv "  CDN: xhttp" "path $CDN_XHTTP_PATH  →  127.0.0.1:$CDN_XHTTP_PORT"; fi
   if (( CDN_GRPC_ENABLED )); then kv "  CDN: grpc" "serviceName $CDN_GRPC_PATH  →  h2c 127.0.0.1:$CDN_GRPC_PORT"; fi
