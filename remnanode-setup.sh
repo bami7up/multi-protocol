@@ -14,6 +14,13 @@ CF_MODE_SETTING=""
 CF_MODE=0
 CF_CURL_CFG=""
 CF_ZONE_ID=""
+# Remnawave Panel API: автоматическая настройка панели (профили, ноды, хосты, шаблоны).
+REMNAWAVE_PANEL_URL="${REMNAWAVE_PANEL_URL:-}"
+REMNAWAVE_API_TOKEN="${REMNAWAVE_API_TOKEN:-}"
+REMNAWAVE_AUTO_SETUP="${REMNAWAVE_AUTO_SETUP:-n}"
+PANEL_CURL_CFG=""
+# Шаблон подписки: standard (весь трафик через VPN) или split (только RU/частные сети через VPN).
+XRAY_TEMPLATE_CHOICE="${XRAY_TEMPLATE_CHOICE:-standard}"
 NODE_DIR="${NODE_DIR:-/opt/remnanode}"
 CERT_DIR="${CERT_DIR:-/etc/remna-certs}"
 ENV_STORE="${ENV_STORE:-/root/remnanode.env}"
@@ -83,8 +90,11 @@ remnanode-setup.sh — установка ноды Remnawave (VLESS + Hysteria2 
   --node-image REF      образ ноды (по умолчанию latest)
   --self-steal-template T
                         тема фасада self-steal (vaultdrop, mail, cloud, admin, docs)
+  --xray-template T     шаблон подписки: standard (весь трафик через VPN) или split
   --cloudflare          создать A-записи через Cloudflare API
   --no-cloudflare       не использовать Cloudflare, даже если токен в env
+  --panel-url URL       URL панели Remnawave (напр. https://panel.example.com)
+  --api-token TOKEN     API токен панели для авто-настройки
   -y | --yes            авто-подтверждение всех «y/n» вопросов
   --non-interactive     не задавать вопросы: все значения из env/дефолтов
   -h | --help           показать эту справку
@@ -94,15 +104,22 @@ remnanode-setup.sh — установка ноды Remnawave (VLESS + Hysteria2 
   ENABLE_CDN, CDN_HOST, CDN_TRANSPORT, CDN_WS_PATH, CDN_XHTTP_PATH, CDN_GRPC_PATH,
   PANEL_IP, NODE_API_PORT, SECRET_KEY, NODE_IMAGE,
   SELF_STEAL_TEMPLATE, SELF_STEAL_TEMPLATE_URL, MULTISELECT_TEMPLATE_URL,
-  SELF_STEAL_RAW_BASE,
+  SELF_STEAL_RAW_BASE, XRAY_TEMPLATE_CHOICE,
   XCADDY_VERSION, CADDY_VERSION, CADDY_L4_VERSION,
   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ZONE,
+  REMNAWAVE_PANEL_URL, REMNAWAVE_API_TOKEN, REMNAWAVE_AUTO_SETUP,
   SERVER_IP, NODE_DIR, CERT_DIR, ENV_STORE
 
-Логические переменные (ENABLE_XHTTP, ENABLE_CDN) понимают y/yes/1/true/on и
-n/no/0/false/off в любом регистре; пустое значение означает ответ по умолчанию.
+Логические переменные (ENABLE_XHTTP, ENABLE_CDN, REMNAWAVE_AUTO_SETUP) понимают
+y/yes/1/true/on и n/no/0/false/off в любом регистре; пустое значение означает ответ по умолчанию.
 Значение SERVER_IP (в том числе из сохранённого env-файла) важнее автодетекта:
 задайте его, если нода за NAT или внешние сервисы определения IP недоступны.
+
+Интерактивный мастер задаст 4 блока вопросов понятным языком:
+  1) Домен и авто-создание поддоменов через Cloudflare,
+  2) Тема маскировочного сайта и шаблон подписки,
+  3) Протоколы (XHTTP, CDN),
+  4) Панель Remnawave и авто-настройка через API.
 USAGE
 }
 
@@ -126,6 +143,18 @@ while [[ $# -gt 0 ]]; do
     --self-steal-template)
       SELF_STEAL_TEMPLATE="${2:-}"
       [[ -n "$SELF_STEAL_TEMPLATE" ]] || { echo "--self-steal-template требует значение (тема фасада)" >&2; exit 2; }
+      shift ;;
+    --xray-template)
+      XRAY_TEMPLATE_CHOICE="${2:-}"
+      [[ -n "$XRAY_TEMPLATE_CHOICE" ]] || { echo "--xray-template требует значение (standard или split)" >&2; exit 2; }
+      shift ;;
+    --panel-url)
+      REMNAWAVE_PANEL_URL="${2:-}"
+      [[ -n "$REMNAWAVE_PANEL_URL" ]] || { echo "--panel-url требует значение" >&2; exit 2; }
+      shift ;;
+    --api-token)
+      REMNAWAVE_API_TOKEN="${2:-}"
+      [[ -n "$REMNAWAVE_API_TOKEN" ]] || { echo "--api-token требует значение" >&2; exit 2; }
       shift ;;
     --cloudflare)    CF_MODE_SETTING=1 ;;
     --no-cloudflare) CF_MODE_SETTING=0 ;;
@@ -155,23 +184,23 @@ fi
 RULE='────────────────────────────────────────────────────────────────'
 STEP_TOTAL=10
 
-hr()   { printf '%s%s%s\n' "$C_DIM$C_GRY" "$RULE" "$C_RST"; }
-log()  { printf ' %s➜%s %s\n'  "$C_BLU$C_B" "$C_RST" "$*"; }
-ok()   { printf ' %s✔%s %s\n'  "$C_GRN$C_B" "$C_RST" "$*"; }
-warn() { printf ' %s▲%s %s\n'  "$C_YLW$C_B" "$C_RST" "$*"; }
-note() { printf '   %s%s%s\n'  "$C_DIM$C_GRY" "$*" "$C_RST"; }
-die()  { printf ' %s✖%s %s\n'  "$C_RED$C_B" "$C_RST" "$*" >&2; exit 1; }
+hr()   { printf '%s%s%s\n' "${C_DIM:-}${C_GRY:-}" "$RULE" "${C_RST:-}"; }
+log()  { printf ' %s➜%s %s\n'  "$C_BLU$C_B" "${C_RST:-}" "$*"; }
+ok()   { printf ' %s✔%s %s\n'  "$C_GRN$C_B" "${C_RST:-}" "$*"; }
+warn() { printf ' %s▲%s %s\n'  "$C_YLW$C_B" "${C_RST:-}" "$*"; }
+note() { printf '   %s%s%s\n'  "${C_DIM:-}${C_GRY:-}" "$*" "${C_RST:-}"; }
+die()  { printf ' %s✖%s %s\n'  "$C_RED$C_B" "${C_RST:-}" "$*" >&2; exit 1; }
 
 step() {
   local cur="$1" title="$2"
   printf '\n%s%s┏━ %s[ %02d / %02d ]%s %s%s%s%s\n' \
-    "$C_B" "$C_CYN" "$C_RST$C_B$C_YLW" "$cur" "$STEP_TOTAL" \
-    "$C_RST" "$C_B$C_CYN" "$title" "$C_RST" ""
-  printf '%s%s┗%s%s%s\n' "$C_B" "$C_CYN" "$C_RST" "$C_DIM$C_GRY" "$RULE${C_RST}"
+    "${C_B:-}" "${C_CYN:-}" "$C_RST$C_B$C_YLW" "$cur" "$STEP_TOTAL" \
+    "${C_RST:-}" "${C_B:-}${C_CYN:-}" "$title" "${C_RST:-}" ""
+  printf '%s%s┗%s%s%s\n' "${C_B:-}" "${C_CYN:-}" "${C_RST:-}" "${C_DIM:-}${C_GRY:-}" "$RULE${C_RST}"
 }
 
 banner() {
-  local L="$C_B$C_WHT" T="$C_B$C_MAG" D="$C_DIM$C_GRY" A="$C_B$C_CYN" S="$C_DIM$C_GRY" R="$C_RST"
+  local L="$C_B$C_WHT" T="${C_B:-}${C_MAG:-}" D="${C_DIM:-}${C_GRY:-}" A="${C_B:-}${C_CYN:-}" S="${C_DIM:-}${C_GRY:-}" R="${C_RST:-}"
   printf '%s\n' \
     "${D}╭──────────────────────────────────────────────────────────────╮${R}" \
     "${D}│${R}                                                              ${D}│${R}" \
@@ -187,7 +216,7 @@ banner() {
     "${D}╰──────────────────────────────────────────────────────────────╯${R}"
 }
 
-kv() { printf '   %s%-14s%s %s%s%s\n' "$C_GRY" "$1" "$C_RST" "$C_B" "$2" "$C_RST"; }
+kv() { printf '   %s%-14s%s %s%s%s\n' "${C_GRY:-}" "$1" "${C_RST:-}" "${C_B:-}" "$2" "${C_RST:-}"; }
 
 retry() {
   local -i tries="$1" delay="$2"; shift 2
@@ -707,6 +736,123 @@ write_config_profile() {
   return 0
 }
 
+write_xray_template() {
+  local src="" out="$NODE_DIR/Xray_template.json"
+  local choice="${XRAY_TEMPLATE_CHOICE:-standard}"
+  # Нормализуем: standard или split — остальное считаем standard для безопасности
+  if [[ "${choice,,}" == "split" ]]; then
+    choice="split"
+  else
+    choice="standard"
+  fi
+  if [[ "$choice" == "split" ]]; then
+    src="$SCRIPT_DIR/Xray_template_split.json"
+    if [[ ! -r "$src" ]]; then
+      src="$SCRIPT_DIR/../Xray_template_split.json"
+    fi
+    # Если запускаем не из репозитория, пробуем скачать
+    if [[ ! -r "$src" ]]; then
+      local tmp2="$(mktemp)"
+      if retry 3 3 curl -fsSL "${SELF_STEAL_RAW_BASE}/Xray_template_split.json" -o "$tmp2" 2>/dev/null; then
+        src="$tmp2"
+      else
+        rm -f "$tmp2"
+        warn "Не удалось подготовить шаблон split — используйте Xray_template_split.json из репозитория."
+        return 0
+      fi
+    fi
+  else
+    src="$SCRIPT_DIR/Xray_template.json"
+    if [[ ! -r "$src" ]]; then
+      src="$SCRIPT_DIR/../Xray_template.json"
+    fi
+    if [[ ! -r "$src" ]]; then
+      local tmp2="$(mktemp)"
+      if retry 3 3 curl -fsSL "${SELF_STEAL_RAW_BASE}/Xray_template.json" -o "$tmp2" 2>/dev/null; then
+        src="$tmp2"
+      else
+        rm -f "$tmp2"
+        warn "Не удалось подготовить шаблон standard — используйте Xray_template.json из репозитория."
+        return 0
+      fi
+    fi
+  fi
+  mkdir -p "$NODE_DIR"
+  if [[ -s "$src" ]]; then
+    install -m 644 "$src" "$out"
+    rm -f "${tmp2:-}" 2>/dev/null || true
+    if [[ "$choice" == "split" ]]; then
+      ok "Шаблон подписки сохранён: $out (split-routing — только часть трафика через VPN)"
+    else
+      ok "Шаблон подписки сохранён: $out (standard — весь трафик через VPN)"
+    fi
+  fi
+  return 0
+}
+
+# ——— Авто-настройка панели через API (если выбран REMNAWAVE_AUTO_SETUP) ———
+panel_auto_setup() {
+  # Вызывается после того как нода поднята и сертификаты готовы.
+  # Не роняет установку при ошибках — только предупреждает.
+  if (( ! REMNAWAVE_AUTO_SETUP )); then
+    return 0
+  fi
+  if [[ -z "${REMNAWAVE_PANEL_URL:-}" || -z "${REMNAWAVE_API_TOKEN:-}" ]]; then
+    warn "Авто-настройка панели включена, но не задан URL или токен — пропускаю."
+    return 0
+  fi
+  if ! have jq || ! have curl; then
+    warn "Для авто-настройки нужен jq и curl — пропускаю."
+    return 0
+  fi
+  # Токен уже в PANEL_CURL_CFG с шага 1, но если повторный запуск — создаём заново
+  if [[ -z "${PANEL_CURL_CFG:-}" || ! -f "$PANEL_CURL_CFG" ]]; then
+    panel_curl_cfg_init
+  fi
+  log "Авто-настройка панели Remnawave через API..."
+
+  # 1) Config Profile — загружаем Multiselect.json как есть
+  local profile_json="" profile_resp="" profile_id=""
+  if [[ -r "$NODE_DIR/Multiselect.json" ]]; then
+    profile_json="$(cat "$NODE_DIR/Multiselect.json" 2>/dev/null || true)"
+  fi
+  if [[ -n "$profile_json" ]]; then
+    # Экранируем JSON для вставки в тело запроса
+    local payload
+    payload="$(jq -n --arg name "Multi-protocol $(date +%Y-%m-%d)" --argjson config "$profile_json" '{name: $name, config: $config}' 2>/dev/null || true)"
+    if [[ -n "$payload" ]]; then
+      profile_resp="$(panel_api POST "/config-profiles" "$payload" 2>/dev/null || true)"
+      if panel_api_success "$profile_resp"; then
+        profile_id="$(jq -r '.response.uuid // .data.uuid // .uuid // empty' <<<"$profile_resp" 2>/dev/null || true)"
+        if [[ -n "$profile_id" ]]; then
+          ok "Config Profile создан в панели: $profile_id"
+        else
+          ok "Config Profile создан в панели (ответ получен)"
+        fi
+      else
+        warn "Не удалось создать Config Profile: $(panel_api_error "$profile_resp")"
+        note "Создайте профиль вручную: Config Profiles → Create → вставьте $NODE_DIR/Multiselect.json"
+      fi
+    fi
+  fi
+
+  # 2) Шаблон подписки — информация для пользователя (API шаблонов может отличаться по версиям)
+  note "Шаблон подписки ($XRAY_TEMPLATE_CHOICE) сохранён в $NODE_DIR/Xray_template.json"
+  note "Загрузите его в панели: Templates → XRAY_JSON (скопируйте содержимое файла)"
+
+  # 3) Нода — создаётся уже с SECRET_KEY, но требует выбора профиля в панели
+  note "Нода Remnawave: IP $SERVER_IP, порт $NODE_API_PORT — создайте её в панели (Nodes → Management → +)"
+  note "Используйте SECRET_KEY из шага 9 и выберите созданный Config Profile"
+
+  # 4) Общая инструкция
+  if [[ -n "$profile_id" ]]; then
+    ok "Авто-настройка панели завершена (профиль создан, остальное — по инструкции README шаги 5–8)"
+  else
+    warn "Авто-настройка частично завершена — проверьте панель вручную"
+  fi
+  return 0
+}
+
 apt_wait() {
   local -i waited=0
   # fuser приходит из пакета psmisc: он есть в списке базовых утилит шага 0, но
@@ -743,13 +889,13 @@ ask() {
   fi
   has_tty || die "Нет /dev/tty для вопроса «$__prompt». Запустите с --non-interactive и переменными окружения."
   if [[ -n "$__default" ]]; then
-    printf ' %s?%s %s %s[%s]%s: ' "$C_MAG$C_B" "$C_RST" "$__prompt" "$C_DIM$C_GRY" "$__default" "$C_RST" > /dev/tty
+    printf ' %s?%s %s %s[%s]%s: ' "${C_MAG:-}${C_B:-}" "${C_RST:-}" "$__prompt" "${C_DIM:-}${C_GRY:-}" "$__default" "${C_RST:-}" > /dev/tty
     IFS= read -r __input < /dev/tty || true
     __input="${__input:-$__default}"
   else
     __input=""
     while [[ -z "$__input" ]]; do
-      printf ' %s?%s %s: ' "$C_MAG$C_B" "$C_RST" "$__prompt" > /dev/tty
+      printf ' %s?%s %s: ' "${C_MAG:-}${C_B:-}" "${C_RST:-}" "$__prompt" > /dev/tty
       IFS= read -r __input < /dev/tty || true
     done
   fi
@@ -768,7 +914,7 @@ ask_secret() {
   fi
   has_tty || die "Нет /dev/tty для ввода «$__prompt». Запустите с --non-interactive и переменными окружения."
   while [[ -z "$__input" ]]; do
-    printf ' %s?%s %s (ввод скрыт): ' "$C_MAG$C_B" "$C_RST" "$__prompt" > /dev/tty
+    printf ' %s?%s %s (ввод скрыт): ' "${C_MAG:-}${C_B:-}" "${C_RST:-}" "$__prompt" > /dev/tty
     IFS= read -rs __input < /dev/tty || true
     printf '\n' > /dev/tty
   done
@@ -840,6 +986,87 @@ confirm() {
   [[ "$__ans" == 1 ]]
 }
 
+# ask_choice VAR PROMPT DEFAULT_NUM "вариант1: описание" "вариант2: описание" ...
+# Понятный выбор из списка для обычного пользователя — нумерованное меню.
+ask_choice() {
+  local __var="$1" __prompt="$2" __default="$3"
+  shift 3
+  local -a __opts=("$@")
+  local __i __input __choice __key
+  if [[ "$NONINTERACTIVE" == 1 ]]; then
+    [[ -n "$__default" ]] || die "--non-interactive: нет значения для «$__prompt» (задайте через env)."
+    # В авто-режиме __default — номер варианта, берём ключ по номеру
+    if [[ "$__default" =~ ^[0-9]+$ ]] && (( __default >= 1 && __default <= ${#__opts[@]} )); then
+      __key="${__opts[$((__default-1))]%%:*}"
+      printf -v "$__var" '%s' "$__key"
+    else
+      printf -v "$__var" '%s' "$__default"
+    fi
+    note "(auto) $__prompt = ${!__var}"
+    return
+  fi
+  has_tty || die "Нет /dev/tty для вопроса «$__prompt». Запустите с --non-interactive и переменными окружения."
+  {
+    printf '\n'
+    printf ' %s%s%s\n' "${C_B:-}${C_CYN:-}" "$__prompt" "${C_RST:-}"
+    printf ' %s%s%s\n' "${C_DIM:-}${C_GRY:-}" "$RULE" "${C_RST:-}"
+    for __i in "${!__opts[@]}"; do
+      __key="${__opts[$__i]%%:*}"
+      __choice="${__opts[$__i]#*:}"
+      if [[ "$__key" == "${__opts[$__i]}" ]]; then __choice="$__key"; fi
+      if (( __i + 1 == __default )); then
+        printf '   %s%s %d)%s %s %s[по умолчанию]%s\n' "${C_B:-}${C_GRN:-}" "${C_RST:-}" "$((__i+1))" "${C_B:-}" "$__choice" "${C_DIM:-}${C_GRY:-}" "${C_RST:-}"
+      else
+        printf '   %s %d)%s %s\n' "${C_GRY:-}" "$((__i+1))" "${C_RST:-}" "$__choice"
+      fi
+    done
+    printf ' %s%s%s\n' "${C_DIM:-}${C_GRY:-}" "$RULE" "${C_RST:-}"
+  } > /dev/tty
+  while :; do
+    printf ' %s?%s Выберите номер [%s]: ' "${C_MAG:-}${C_B:-}" "${C_RST:-}" "$__default" > /dev/tty
+    IFS= read -r __input < /dev/tty || true
+    __input="${__input:-$__default}"
+    if [[ "$__input" =~ ^[0-9]+$ ]] && (( __input >= 1 && __input <= ${#__opts[@]} )); then
+      __key="${__opts[$((__input-1))]%%:*}"
+      printf -v "$__var" '%s' "$__key"
+      return
+    fi
+    warn "Введите число от 1 до ${#__opts[@]}." > /dev/tty
+  done
+}
+
+# ——— Remnawave Panel API: автоматическая настройка ———
+panel_curl_cfg_init() {
+  PANEL_CURL_CFG="$(mktemp)"
+  ( umask 077; printf 'header = "Authorization: Bearer %s"\n' "$REMNAWAVE_API_TOKEN" > "$PANEL_CURL_CFG" )
+}
+
+panel_api() {
+  local method="$1" path="$2" body="${3:-}"
+  local url="${REMNAWAVE_PANEL_URL%/}/api$path"
+  local -a args=(-sS --max-time 20 -X "$method" -K "$PANEL_CURL_CFG" -H "Content-Type: application/json")
+  if [[ -n "$body" ]]; then args+=(-d "$body"); fi
+  curl "${args[@]}" "$url"
+}
+
+panel_api_success() {
+  jq -e '.response != null or .success == true or .data != null' >/dev/null 2>&1 <<<"$1" ||   jq -e 'has("response") or has("data") or .success == true' >/dev/null 2>&1 <<<"$1"
+}
+
+panel_api_error() {
+  local msg
+  msg="$(jq -r '.message // .error // .errors[0].message // empty' <<<"$1" 2>/dev/null)"
+  printf '%s' "${msg:-неизвестная ошибка Panel API}"
+}
+
+panel_check_connection() {
+  local resp
+  resp="$(panel_api GET "/config-profiles")" || return 1
+  if panel_api_success "$resp"; then return 0; fi
+  resp="$(panel_api GET "/nodes")" || return 1
+  panel_api_success "$resp"
+}
+
 detect_ssh_port() {
   local port=""
   if have sshd; then
@@ -873,7 +1100,7 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 on_err() {
   local ec=$? line=$1 cmd=$2
   printf '\n %s✖ НЕПРЕДВИДЕННЫЙ СБОЙ%s код=%s строка=%s\n   %s%s%s\n' \
-    "$C_RED$C_B" "$C_RST" "$ec" "$line" "$C_DIM$C_GRY" "$cmd" "$C_RST" >&2
+    "$C_RED$C_B" "${C_RST:-}" "$ec" "$line" "${C_DIM:-}${C_GRY:-}" "$cmd" "${C_RST:-}" >&2
   printf '   Полный лог: %s\n' "$LOG_FILE" >&2
   exit "$ec"
 }
@@ -889,6 +1116,9 @@ on_exit() {
   fi
   if [[ -n "${CF_CURL_CFG:-}" && -f "$CF_CURL_CFG" ]]; then
     rm -f -- "$CF_CURL_CFG"
+  fi
+  if [[ -n "${PANEL_CURL_CFG:-}" && -f "$PANEL_CURL_CFG" ]]; then
+    rm -f -- "$PANEL_CURL_CFG"
   fi
   if [[ "${CADDY_RESTORE_NEEDED:-0}" -eq 1 ]]; then
     if systemctl start caddy >/dev/null 2>&1; then
@@ -966,7 +1196,7 @@ retry 3 5 apt_get update -y || warn "apt-get update завершился с ош
 retry 3 5 apt_get install -y curl ca-certificates dnsutils jq psmisc \
   || warn "Не удалось установить базовые утилиты — некоторые проверки будут ограничены."
 
-step 1 "Переменные окружения"
+step 1 "Мастер установки — отвечаем на вопросы"
 
 if [[ -f "$ENV_STORE" ]]; then
   if confirm "Найден $ENV_STORE. Загрузить сохранённые переменные?" "y"; then
@@ -977,6 +1207,19 @@ if [[ -f "$ENV_STORE" ]]; then
   fi
 fi
 
+# Короткое объяснение для новичка: что сейчас будет.
+if has_tty; then
+{
+  printf '\n'
+  printf ' %s%s Добро пожаловать в мастер установки! %s\n' "${C_B:-}${C_CYN:-}" "${C_RST:-}" ""
+  printf ' %sМы зададим 4 блока вопросов простым языком. На каждом шаге есть подсказки.%s\n' "${C_DIM:-}${C_GRY:-}" "${C_RST:-}"
+  printf ' %sЕсли не знаете что ответить — жмите Enter для значения по умолчанию.%s\n' "${C_DIM:-}${C_GRY:-}" "${C_RST:-}"
+  printf '\n'
+} > /dev/tty 2>/dev/null || true
+fi
+
+# Цвета могут быть не определены в тестах — задаём пустые значения чтобы set -u не падал
+: "${C_B:=}" "${C_CYN:=}" "${C_GRN:=}" "${C_RST:=}" "${C_DIM:=}" "${C_GRY:=}" "${C_MAG:=}" "${C_BLU:=}" "${C_YLW:=}" "${C_RED:=}" "${C_WHT:=}"
 # SERVER_IP нужен для A-записей Cloudflare и для сверки DNS. Значение из env (в
 # том числе из сохранённого env-файла) приоритетнее автодетекта: за NAT внешние
 # сервисы могут быть недоступны, а README и текст ошибки обещают возможность
@@ -1007,50 +1250,119 @@ if [[ -z "${SERVER_IP:-}" ]]; then
   fi
 fi
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# БЛОК 1/4: Домен и автоматическое создание поддоменов
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+if has_tty; then printf '\n %s%s━━━ Блок 1/4: Домены и DNS ━━━%s\n' "${C_B:-}" "${C_CYN:-}" "${C_RST:-}" > /dev/tty 2>/dev/null || true; fi
+note "Базовый домен — это ваш основной домен, например example.com. На его основе создаются поддомены для протоколов."
 ask BASE_DOMAIN "Базовый домен (напр. example.com)" "${BASE_DOMAIN:-}"
-ask PREFIX      "Префикс поддомена (напр. usa)"      "${PREFIX:-usa}"
+
+# Явный вопрос про авто-создание доменов — понятно обычному пользователю.
+# Если флаг --cloudflare/--no-cloudflare уже задан — не спрашиваем, используем его.
+if [[ -z "$CF_MODE_SETTING" ]]; then
+  note "Поддомены можно создать автоматически через Cloudflare API (рекомендуется для новичков)"
+  note "или вручную — тогда нужно заранее создать A-записи на IP ноды ($SERVER_IP)."
+  ask_bool CF_MODE "Создавать поддомены автоматически через Cloudflare?" "${CF_MODE:-n}"
+else
+  # Флаг уже определил CF_MODE выше — сохраняем его как выбор пользователя.
+  CF_MODE="$CF_MODE_SETTING"
+fi
+
 if (( CF_MODE )); then
   if [[ -z "${CLOUDFLARE_API_TOKEN:-}" ]]; then
-    # Интерактив — ввод скрыт; при --non-interactive без env ask_secret
-    # остановится с подсказкой задать переменную.
+    note "Токен Cloudflare с правами Zone:Read и Zone:DNS:Edit создаётся в панели Cloudflare → API Tokens."
     ask_secret CLOUDFLARE_API_TOKEN \
-      "Cloudflare API Token (CLOUDFLARE_API_TOKEN, для создания A-записей)" ""
+      "Cloudflare API Token (для авто-создания A-записей)" ""
   fi
-  log "Режим Cloudflare: A-записи создаст сам API (случайные непохожие хосты)"
+  log "Режим Cloudflare: поддомены создаст API (случайные непохожие имена вида quiet-otter.example.com)"
   cf_setup_hosts
-elif cf_valid_saved_host "${VLESS_HOST:-}" "$BASE_DOMAIN" \
-    && cf_valid_saved_host "${HY_HOST:-}" "$BASE_DOMAIN"; then
-  # Без токена повторный запуск не должен затирать случайные имена,
-  # созданные когда-то в режиме Cloudflare, — сохранённые хосты главнее.
-  ok "Хосты из сохранённых переменных: $VLESS_HOST / $HY_HOST"
 else
-  VLESS_HOST="${PREFIX}1.${BASE_DOMAIN}"
-  HY_HOST="${PREFIX}3.${BASE_DOMAIN}"
+  if cf_valid_saved_host "${VLESS_HOST:-}" "$BASE_DOMAIN" \
+      && cf_valid_saved_host "${HY_HOST:-}" "$BASE_DOMAIN"; then
+    ok "Хосты из сохранённых переменных: $VLESS_HOST / $HY_HOST"
+  else
+    note "Ручной режим: поддомены создаются вами вручную. Формат по умолчанию — prefix + номер."
+    ask PREFIX "Префикс поддомена (напр. usa, eu, sg)" "${PREFIX:-usa}"
+    VLESS_HOST="${PREFIX}1.${BASE_DOMAIN}"
+    HY_HOST="${PREFIX}3.${BASE_DOMAIN}"
+    note "Будут использованы: VLESS=$VLESS_HOST, Hysteria2=$HY_HOST"
+    note "Убедитесь, что A-записи этих доменов указывают на $SERVER_IP и без прокси (серое облако)."
+  fi
 fi
-ok "Домены: $VLESS_HOST / $HY_HOST"
+ok "Домены ноды: $VLESS_HOST / $HY_HOST"
 
 ACME_EMAIL="admin@${BASE_DOMAIN}"
 ok "Email для Let's Encrypt: $ACME_EMAIL"
 
-ask SELF_STEAL_HOST "Домен self-steal для Vision/Reality" "${SELF_STEAL_HOST:-$VLESS_HOST}"
-# Обратная совместимость с шаблонами/старыми env: для Vision SNI всегда равен
-# домену локального TLS-сайта. Иначе это снова будет обычный внешний REALITY target.
+ask SELF_STEAL_HOST "Домен self-steal для Vision/Reality (обычно = VLESS домен)" "${SELF_STEAL_HOST:-$VLESS_HOST}"
 VISION_SNI="$SELF_STEAL_HOST"
-ask_bool ENABLE_XHTTP "Включить XHTTP в selfsteal?"     "${ENABLE_XHTTP:-y}"
-if (( ENABLE_XHTTP )); then
-  ask XHTTP_SNI  "Маскировочный SNI для XHTTP"        "${XHTTP_SNI:-www.gstatic.com}"
-  ask XHTTP_PATH "Путь XHTTP"                         "${XHTTP_PATH:-/api/v3/sync/r1}"
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# БЛОК 2/4: Шаблоны — маскировочный сайт и шаблон подписки
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+if has_tty; then printf '\n %s%s━━━ Блок 2/4: Шаблоны — маскировка и подписка ━━━%s\n' "${C_B:-}" "${C_CYN:-}" "${C_RST:-}" > /dev/tty 2>/dev/null || true; fi
+note "Маскировочный сайт показывается сканерам вместо заглушки — выберите тему, похожую на обычный веб-сайт."
+note "Шаблон подписки определяет, как клиенты получают настройки: весь трафик через VPN или только часть."
+
+# Выбор темы фасада — меню с описаниями (понятно обычному пользователю)
+if [[ -z "${SELF_STEAL_TEMPLATE_URL:-}" ]]; then
+  # Определяем дефолтный номер для меню: vaultdrop=1, mail=2, cloud=3, admin=4, docs=5
+  __default_theme_num=1
+  for __i in "${!SELF_STEAL_TEMPLATES[@]}"; do
+    if [[ "${SELF_STEAL_TEMPLATES[$__i]}" == "$SELF_STEAL_TEMPLATE" ]]; then
+      __default_theme_num=$((__i+1))
+      break
+    fi
+  done
+  ask_choice SELF_STEAL_TEMPLATE "Выберите тему маскировочного сайта" "$__default_theme_num" \
+    "vaultdrop: Файлообменник — приватный обмен файлами (рекомендуется)" \
+    "mail: Почта — корпоративный почтовый портал" \
+    "cloud: Облако — файловое облако с папками" \
+    "admin: Админ-панель — панель управления сервером" \
+    "docs: Документация — сайт с документацией"
+  note "Выбрана тема: $SELF_STEAL_TEMPLATE"
 else
-  warn "XHTTP в selfsteal отключён — будет использован режим только Vision (Reality)."
-  # Без XHTTP SNI и path нигде не нужны: не спрашиваем и не сохраняем их.
+  ok "Используется кастомный фасад: $SELF_STEAL_TEMPLATE_URL"
+fi
+
+# Выбор шаблона подписки — full vs split
+__default_tpl_num=1
+if [[ "${XRAY_TEMPLATE_CHOICE,,}" == "split" ]]; then __default_tpl_num=2; fi
+ask_choice XRAY_TEMPLATE_CHOICE "Выберите шаблон подписки для клиентов" "$__default_tpl_num" \
+  "standard: Весь трафик через VPN (рекомендуется для обхода блокировок)" \
+  "split: Только RU/частные сети через VPN, остальное напрямую (экономия трафика)"
+# Нормализуем к стандартным значениям
+case "${XRAY_TEMPLATE_CHOICE,,}" in
+  split|2) XRAY_TEMPLATE_CHOICE="split" ;;
+  *)       XRAY_TEMPLATE_CHOICE="standard" ;;
+esac
+if [[ "$XRAY_TEMPLATE_CHOICE" == "split" ]]; then
+  note "Шаблон подписки: split-routing — только часть доменов через VPN"
+else
+  note "Шаблон подписки: standard — весь трафик через VPN (full-tunnel)"
+fi
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# БЛОК 3/4: Протоколы
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+if has_tty; then printf '\n %s%s━━━ Блок 3/4: Протоколы ━━━%s\n' "${C_B:-}" "${C_CYN:-}" "${C_RST:-}" > /dev/tty 2>/dev/null || true; fi
+note "VLESS Reality/Vision и Hysteria2 включены всегда. Дополнительно можно включить:"
+note "  • XHTTP — современный транспорт, лучше работает в некоторых сетях"
+note "  • VLESS за CDN — прячет IP ноды за Cloudflare/аналогами (требует отдельный домен)"
+: "${C_B:=}" "${C_CYN:=}" "${C_RST:=}" "${C_DIM:=}" "${C_GRY:=}" "${C_MAG:=}"
+ask_bool ENABLE_XHTTP "Включить XHTTP (рекомендуется: да)?" "${ENABLE_XHTTP:-y}"
+if (( ENABLE_XHTTP )); then
+  ask XHTTP_SNI  "Маскировочный SNI для XHTTP (сайт для REALITY-handshake)" "${XHTTP_SNI:-www.gstatic.com}"
+  ask XHTTP_PATH "Путь XHTTP (случайный URL-путь)" "${XHTTP_PATH:-/api/v3/sync/r1}"
+else
+  warn "XHTTP отключён — будет использован только Vision (Reality)."
   XHTTP_SNI=""
   XHTTP_PATH=""
 fi
-ask_bool ENABLE_CDN "Добавить VLESS за CDN (Cloudflare и др.)?" "${ENABLE_CDN:-n}"
+ask_bool ENABLE_CDN "Добавить VLESS за CDN (прячет IP ноды)?" "${ENABLE_CDN:-n}"
 if (( ENABLE_CDN )); then
-  note "CDN прячет origin: клиент идёт на CDN-хост по 443, сам CDN — на :443 ноды,"
-  note "где Caddy отвечает сертификатом для этого хоста (ACME DNS-01 через Cloudflare)."
-  note "Пути транспортов уходят в Xray на loopback; gRPC — по h2c, без своего TLS."
+  note "CDN прячет origin: клиент идёт на CDN-домен по 443, CDN — на :443 ноды."
+  note "Публичный TLS терминирует CDN, между CDN и нодой — сертификат origin (DNS-01 через Cloudflare)."
   ask CDN_HOST "Домен, проксируемый CDN (A-запись под оранжевым облаком)" "${CDN_HOST:-}"
   ask CDN_TRANSPORT "Транспорт CDN: ws, xhttp, grpc, both (ws+xhttp) или all" "${CDN_TRANSPORT:-ws}"
   CDN_TRANSPORT="${CDN_TRANSPORT,,}"
@@ -1070,15 +1382,53 @@ if (( ENABLE_CDN )); then
     CDN_GRPC_ENABLED=1
     ask CDN_GRPC_PATH "serviceName gRPC для CDN" "${CDN_GRPC_PATH:-/api/v4/stream}"
   fi
-  # Сертификат origin выпускается по DNS-01 (HTTP-01 за прокси невозможен),
-  # поэтому нужен токен с правами Zone:Read и Zone:DNS:Edit.
   if [[ -z "${CLOUDFLARE_API_TOKEN:-}" ]]; then
+    note "Для CDN нужен Cloudflare Token с Zone:Read + DNS:Edit (сертификат origin по DNS-01)."
     ask_secret CLOUDFLARE_API_TOKEN \
-      "Cloudflare API Token (Zone:Read + DNS:Edit — для ACME DNS-01 сертификата CDN)" ""
+      "Cloudflare API Token (для DNS-01 сертификата CDN)" ""
   fi
 fi
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# БЛОК 4/4: Панель Remnawave
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+if has_tty; then printf '\n %s%s━━━ Блок 4/4: Панель Remnawave ━━━%s\n' "${C_B:-}" "${C_CYN:-}" "${C_RST:-}" > /dev/tty 2>/dev/null || true; fi
+note "Панель управляет нодами, пользователями и подписками. Укажите её IP для firewall и API-порт ноды."
 ask PANEL_IP   "IP панели Remnawave (IPv4 или IPv6)"  "${PANEL_IP:-}"
-ask NODE_API_PORT "Порт ноды для связи с панелью"     "${NODE_API_PORT:-2222}"
+ask NODE_API_PORT "Порт ноды для связи с панелью (обычно 2222)" "${NODE_API_PORT:-2222}"
+
+# Явный запрос на авто-настройку панели через API — то, чего не хватало.
+note "Панель можно настроить автоматически (создать Config Profile, ноду, хосты) через API,"
+note "или вручную — через веб-интерфейс панели (инструкция в README, шаги 1–8)."
+ask_bool REMNAWAVE_AUTO_SETUP "Настроить панель автоматически через Remnawave API?" "${REMNAWAVE_AUTO_SETUP:-n}"
+if (( REMNAWAVE_AUTO_SETUP )); then
+  note "Нужны: URL панели (https://panel.example.com) и API токен (Панель → Settings → API Tokens)."
+  ask REMNAWAVE_PANEL_URL "URL панели Remnawave" "${REMNAWAVE_PANEL_URL:-}"
+  # Валидация URL — должен начинаться с http
+  if [[ ! "$REMNAWAVE_PANEL_URL" =~ ^https?:// ]]; then
+    warn "URL панели должен начинаться с https:// или http:// — проверьте."
+  fi
+  if [[ -z "${REMNAWAVE_API_TOKEN:-}" ]]; then
+    ask_secret REMNAWAVE_API_TOKEN "API токен панели Remnawave (скрытый ввод)" ""
+  fi
+  note "Проверка соединения с панелью..."
+  panel_curl_cfg_init
+  if panel_check_connection; then
+    ok "Панель доступна и токен валиден — авто-настройка будет выполнена после установки ноды"
+  else
+    warn "Не удалось подключиться к панели или токен невалиден — авто-настройка может не сработать."
+    warn "Проверьте URL и права токена (нужны: nodes:write, config-profiles:write, hosts:write)."
+    if ! confirm "Продолжить установку несмотря на ошибку соединения?" "n"; then
+      die "Отменено: исправьте URL/токен панели."
+    fi
+  fi
+  # Не удаляем PANEL_CURL_CFG сейчас — он понадобится на шаге 9/10 для авто-настройки.
+else
+  note "Ручной режим: после установки создайте Config Profile, ноду и хосты вручную (README шаги 1–8)."
+  if [[ -n "${PANEL_CURL_CFG:-}" && -f "$PANEL_CURL_CFG" ]]; then
+    rm -f "$PANEL_CURL_CFG"; PANEL_CURL_CFG=""
+  fi
+fi
 
 is_fqdn "$BASE_DOMAIN"       || die "Некорректный домен: $BASE_DOMAIN"
 [[ "$PREFIX" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ && ${#PREFIX} -le 50 ]] \
@@ -1165,6 +1515,9 @@ fi
 if (( ENABLE_CDN )); then
   export ENABLE_CDN CDN_HOST CDN_TRANSPORT CDN_WS_PATH CDN_XHTTP_PATH CDN_GRPC_PATH
 fi
+export XRAY_TEMPLATE_CHOICE SELF_STEAL_TEMPLATE SELF_STEAL_TEMPLATE_URL
+export REMNAWAVE_PANEL_URL REMNAWAVE_API_TOKEN REMNAWAVE_AUTO_SETUP
+export CF_MODE CLOUDFLARE_API_TOKEN CLOUDFLARE_ZONE
 
 # Запись CDN-хоста создаётся проксируемой: именно оранжевое облако направляет
 # трафик через CDN на origin. Токен нужен и для DNS-01 сертификата, поэтому всё,
@@ -1206,8 +1559,28 @@ fi
       printf 'export CDN_XHTTP_PATH=%q\n' "$CDN_XHTTP_PATH"
       printf 'export CDN_GRPC_PATH=%q\n' "$CDN_GRPC_PATH"
     fi
-    printf 'export PANEL_IP=%q\n' "$PANEL_IP"
-    printf 'export NODE_API_PORT=%q\n' "$NODE_API_PORT"
+    printf 'export PANEL_IP=%q\n' "${PANEL_IP:-}"
+    printf 'export NODE_API_PORT=%q\n' "${NODE_API_PORT:-2222}"
+    # Новые интерактивные ответы — сохраняем для идемпотентного повторного запуска
+    printf 'export SELF_STEAL_TEMPLATE=%q\n' "${SELF_STEAL_TEMPLATE:-vaultdrop}"
+    if [[ -n "${SELF_STEAL_TEMPLATE_URL:-}" ]]; then
+      printf 'export SELF_STEAL_TEMPLATE_URL=%q\n' "$SELF_STEAL_TEMPLATE_URL"
+    fi
+    printf 'export XRAY_TEMPLATE_CHOICE=%q\n' "${XRAY_TEMPLATE_CHOICE:-standard}"
+    printf 'export CF_MODE=%s\n' "$(bool_yn "${CF_MODE:-0}")"
+    if [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]]; then
+      printf 'export CLOUDFLARE_API_TOKEN=%q\n' "$CLOUDFLARE_API_TOKEN"
+    fi
+    if [[ -n "${CLOUDFLARE_ZONE:-}" ]]; then
+      printf 'export CLOUDFLARE_ZONE=%q\n' "$CLOUDFLARE_ZONE"
+    fi
+    printf 'export REMNAWAVE_AUTO_SETUP=%s\n' "$(bool_yn "${REMNAWAVE_AUTO_SETUP:-0}")"
+    if [[ -n "${REMNAWAVE_PANEL_URL:-}" ]]; then
+      printf 'export REMNAWAVE_PANEL_URL=%q\n' "$REMNAWAVE_PANEL_URL"
+    fi
+    if [[ -n "${REMNAWAVE_API_TOKEN:-}" ]]; then
+      printf 'export REMNAWAVE_API_TOKEN=%q\n' "$REMNAWAVE_API_TOKEN"
+    fi
   } > "$ENV_STORE"
 )
 # -F: путь ищется фиксированной строкой, а не как regex (точки в пути не
@@ -1216,6 +1589,7 @@ grep -qF "source $ENV_STORE" /root/.bashrc 2>/dev/null \
   || printf '[ -f %q ] && source %q\n' "$ENV_STORE" "$ENV_STORE" >> /root/.bashrc
 ok "Переменные сохранены в $ENV_STORE (0600, подхват в .bashrc)"
 write_config_profile
+write_xray_template
 
 echo
 hr
@@ -1238,10 +1612,16 @@ if (( ENABLE_CDN )); then
   kv "CDN"           "$CDN_HOST (транспорт: $CDN_TRANSPORT)"
 fi
 kv "Config Profile" "$NODE_DIR/Multiselect.json"
+kv "Шаблон подписки" "$XRAY_TEMPLATE_CHOICE ($NODE_DIR/Xray_template.json)"
 kv "PANEL_IP"      "$PANEL_IP"
 kv "NODE_API_PORT" "$NODE_API_PORT"
 if (( CF_MODE )); then
   kv "DNS"            "Cloudflare: A-записи созданы API (DNS only, proxied=off)"
+fi
+if (( REMNAWAVE_AUTO_SETUP )); then
+  kv "Авто-панель"     "$REMNAWAVE_PANEL_URL (API)"
+else
+  kv "Авто-панель"     "выключена — ручная настройка по README"
 fi
 hr
 echo
@@ -1891,6 +2271,11 @@ ls -l $files | sort
 SH
 ok "Контейнер remnanode запущен"
 
+# Авто-настройка панели, если включена (не роняет установку при ошибках)
+if (( REMNAWAVE_AUTO_SETUP )); then
+  panel_auto_setup || warn "Авто-настройка панели завершилась с ошибкой — проверьте панель вручную (README шаги 1–8)"
+fi
+
 step 10 "Проверка слушателей и маршрутизации"
 
 has_tcp_listener() {
@@ -1944,9 +2329,9 @@ for _ in $(seq 1 30); do
   sleep 2
 done
 
-printf '   %s%sTCP listeners%s\n' "$C_B" "$C_MAG" "$C_RST"
+printf '   %s%sTCP listeners%s\n' "${C_B:-}" "${C_MAG:-}" "${C_RST:-}"
 ss -lntup 2>/dev/null | grep -E ':443|:9443|:9444|:10443|:10444|:10446|:10447|:'"$NODE_API_PORT" | sed 's/^/     /' || true
-printf '   %s%sUDP listeners (Hysteria2)%s\n' "$C_B" "$C_MAG" "$C_RST"
+printf '   %s%sUDP listeners (Hysteria2)%s\n' "${C_B:-}" "${C_MAG:-}" "${C_RST:-}"
 ss -lnuap 2>/dev/null | grep ':443' | sed 's/^/     /' || true
 
 if [[ "$listeners_ready" -ne 1 ]]; then
@@ -1984,7 +2369,7 @@ ok "Все TCP/UDP-слушатели активны"
 
 check_tls_route() {
   local name="$1" sni="$2" output
-  printf '   %s%s%s (%s)%s\n' "$C_B" "$C_MAG" "$name" "$sni" "$C_RST"
+  printf '   %s%s%s (%s)%s\n' "${C_B:-}" "${C_MAG:-}" "$name" "$sni" "${C_RST:-}"
   if output="$(timeout 12 openssl s_client -connect 127.0.0.1:443 -servername "$sni" \
       -verify_hostname "$sni" -verify_return_error -brief </dev/null 2>&1)" \
       && grep -Eq 'CONNECTION ESTABLISHED|Protocol version:' <<<"$output"; then
@@ -2010,7 +2395,7 @@ for pair in "${ROUTE_PAIRS[@]}"; do
   name="${pair%%:*}"; sni="${pair#*:}"
   check_tls_route "$name" "$sni" || tls_failures=$((tls_failures + 1))
 done
-printf '   %s%sSelf-steal target (%s)%s\n' "$C_B" "$C_MAG" "$SELF_STEAL_HOST" "$C_RST"
+printf '   %s%sSelf-steal target (%s)%s\n' "${C_B:-}" "${C_MAG:-}" "$SELF_STEAL_HOST" "${C_RST:-}"
 if self_steal_output="$(timeout 12 openssl s_client -connect 127.0.0.1:9443 \
     -servername "$SELF_STEAL_HOST" -verify_hostname "$SELF_STEAL_HOST" \
     -verify_return_error -brief </dev/null 2>&1)" \
@@ -2055,7 +2440,7 @@ verify_http_layer() {
   ok "Локальный TLS-сайт принимает TLS 1.2 и TLS 1.3"
 }
 
-printf '   %s%sHTTP-слой: :80 и локальный TLS-сайт%s\n' "$C_B" "$C_MAG" "$C_RST"
+printf '   %s%sHTTP-слой: :80 и локальный TLS-сайт%s\n' "${C_B:-}" "${C_MAG:-}" "${C_RST:-}"
 verify_http_layer
 
 (( tls_failures == 0 )) || die "Не прошли TLS-проверку маршруты: $tls_failures. Установка не считается завершённой."
@@ -2064,12 +2449,12 @@ ok "Все SNI/TLS-маршруты прошли проверку"
 prune_matching_files "$LOG_DIR" 'remnanode-setup-*.log' 10
 
 echo
-printf '%s%s╭──────────────────────────────────────────────────────────────╮%s\n' "$C_B" "$C_GRN" "$C_RST"
+printf '%s%s╭──────────────────────────────────────────────────────────────╮%s\n' "${C_B:-}" "${C_GRN:-}" "${C_RST:-}"
 printf '%s%s│%s  %s✔ ГОТОВО%s  Проверьте статус ноды в панели — должна быть online   %s%s│%s\n' \
-  "$C_B" "$C_GRN" "$C_RST" "$C_B$C_GRN" "$C_RST" "$C_B$C_GRN" "" "$C_RST"
-printf '%s%s╰──────────────────────────────────────────────────────────────╯%s\n' "$C_B" "$C_GRN" "$C_RST"
+  "${C_B:-}" "${C_GRN:-}" "${C_RST:-}" "${C_B:-}${C_GRN:-}" "${C_RST:-}" "${C_B:-}${C_GRN:-}" "" "${C_RST:-}"
+printf '%s%s╰──────────────────────────────────────────────────────────────╯%s\n' "${C_B:-}" "${C_GRN:-}" "${C_RST:-}"
 echo
-printf '   %s%sКонфигурация нод-инбаундов (сверьте в панели)%s\n' "$C_B" "$C_MAG" "$C_RST"
+printf '   %s%sКонфигурация нод-инбаундов (сверьте в панели)%s\n' "${C_B:-}" "${C_MAG:-}" "${C_RST:-}"
 kv "Vision/Reality" "SNI $SELF_STEAL_HOST  →  127.0.0.1:10443  (target: 127.0.0.1:9443)"
 if (( ENABLE_XHTTP )); then
   kv "XHTTP"          "SNI $XHTTP_SNI  path $XHTTP_PATH  →  127.0.0.1:10444"
