@@ -463,4 +463,26 @@ jobs:
           grep -qF -- '--keep-build-tools' remnanode-setup.sh \
             || fail "нет флага --keep-build-tools для сохранения инструментов сборки"
 
+          # 47. HTTP-код ответа панели не теряется: panel_api вызывается через
+          #     $(...), поэтому код пишется в файл, а не в переменную подоболочки.
+          grep -q '^panel_http_code_file() {' remnanode-setup.sh \
+            || fail "HTTP-код панели хранится не в файле (потеряется в подоболочке)"
+          grep -qF '> "$(panel_http_code_file)"' remnanode-setup.sh \
+            || fail "panel_api не записывает HTTP-код в файл"
+
+          # 48. Результат upsert-функций не смешивается с диагностикой:
+          #     иначе текст предупреждения становится uuid профиля и уходит в URL.
+          grep -q '^panel_result_uuid() {' remnanode-setup.sh \
+            || fail "нет panel_result_uuid (uuid берётся из stdout вместе с warn)"
+          grep -qF 'profile_uuid="$(panel_result_uuid "$profile_out" "$profile_rc")"' remnanode-setup.sh \
+            || fail "uuid Config Profile снова берётся из смешанного вывода"
+
+          # 49. Ошибки создания хостов не глушатся: иначе установщик рапортует
+          #     «Хосты созданы/обновлены», даже когда панель отвергла все запросы.
+          grep -q '^panel_try_host() {' remnanode-setup.sh \
+            || fail "нет panel_try_host (ошибки хостов считаются успехом)"
+          if grep -q 'panel_upsert_host .*2>&1 || true' remnanode-setup.sh; then
+            fail "ошибки создания хостов снова глушатся в /dev/null"
+          fi
+
           echo "✔ инварианты переменных окружения на месте"
