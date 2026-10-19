@@ -561,6 +561,8 @@ normalize_panel_url() {
   esac
   u="${u%/}"
   rest="${u#*://}"
+  # Разрешён только origin без пути: иначе запросы API пойдут по неверному URL.
+  [[ "$rest" != */* ]] || return 1
   if [[ "$rest" == \[* ]]; then
     host="${rest%%]*}"
     host="${host#\[}"
@@ -654,6 +656,20 @@ cf_json_error() {
 cf_curl_cfg_init() {
   CF_CURL_CFG="$(mktemp)"
   ( umask 077; printf 'header = "Authorization: Bearer %s"\n' "$CLOUDFLARE_API_TOKEN" > "$CF_CURL_CFG" )
+}
+
+# Проверяет, что Cloudflare API принимает токен и видит зону BASE_DOMAIN.
+# Возвращает 0 при успехе, 1 при ошибке API/токена и 2 если зона не найдена.
+cf_check_token_zone() {
+  local resp zone_id
+  cf_curl_cfg_init
+  resp="$(cf_api GET "/zones?name=${CLOUDFLARE_ZONE:-$BASE_DOMAIN}&status=active" 2>/dev/null || true)"
+  [[ -n "$CF_CURL_CFG" ]] && rm -f "$CF_CURL_CFG"
+  CF_CURL_CFG=""
+  [[ -n "$resp" ]] || return 1
+  cf_json_success "$resp" || return 1
+  zone_id="$(jq -r '.result[0].id // empty' <<<"$resp" 2>/dev/null)"
+  [[ -n "$zone_id" ]] || return 2
 }
 
 # cf_upsert_a ZONE_ID HOST [proxied] — создать A-запись или обновить
@@ -1956,11 +1972,18 @@ fi
 note "Базовый домен — ваш домен в Cloudflare. Пишите просто домен: без https://, без www и без слэшей."
 note "На его основе создаются поддомены для протоколов."
 ask BASE_DOMAIN "Базовый домен (напр. example.com)" "${BASE_DOMAIN:-}"
-# Люди вставляют домен и как https://Example.COM/ — приводим к чистому виду
-# сразу, иначе Cloudflare-зона не найдётся и ошибка будет непонятной.
-BASE_DOMAIN="$(normalize_domain_input "$BASE_DOMAIN")"
-is_fqdn "$BASE_DOMAIN" \
-  || die "Некорректный домен: «$BASE_DOMAIN» — нужен вид example.com (без https://, www и путей)."
+# Люди вставляют домен и как https://Example.COM/ — приводим к чистому виду.
+# В автоустановке опечатка не должна обрывать мастер: просим ввести домен снова.
+while :; do
+  BASE_DOMAIN="$(normalize_domain_input "$BASE_DOMAIN")"
+  if is_fqdn "$BASE_DOMAIN"; then break; fi
+  if [[ "${QUICK_SETUP:-0}" == 1 && "$NONINTERACTIVE" != 1 ]] && has_tty; then
+    warn "Некорректный домен: «$BASE_DOMAIN» — нужен вид example.com (без https://, www и путей)."
+    ask BASE_DOMAIN "Введите базовый домен ещё раз" ""
+  else
+    die "Некорректный домен: «$BASE_DOMAIN» — нужен вид example.com (без https://, www и путей)."
+  fi
+done
 
 # Явный вопрос про авто-создание доменов — понятно обычному пользователю.
 # Если флаг --cloudflare/--no-cloudflare уже задан — не спрашиваем, используем его.
@@ -1982,6 +2005,25 @@ if (( CF_MODE )); then
     note "Токен Cloudflare с правами Zone:Read и Zone:DNS:Edit создаётся в панели Cloudflare → API Tokens."
     ask_secret CLOUDFLARE_API_TOKEN \
       "Cloudflare API Token (для авто-создания A-записей)" ""
+  fi
+  if [[ "${QUICK_SETUP:-0}" == 1 && "$NONINTERACTIVE" != 1 ]] && has_tty; then
+    while :; do
+      if cf_check_token_zone; then break; else __cf_check_rc=$?; fi
+      if (( __cf_check_rc == 2 )); then
+        warn "Токен принят, но зона ${CLOUDFLARE_ZONE:-$BASE_DOMAIN} не найдена. Проверьте домен/зону и права токена."
+        ask BASE_DOMAIN "Введите базовый домен ещё раз" "$BASE_DOMAIN"
+        BASE_DOMAIN="$(normalize_domain_input "$BASE_DOMAIN")"
+        while ! is_fqdn "$BASE_DOMAIN"; do
+          warn "Некорректный домен — нужен вид example.com."
+          ask BASE_DOMAIN "Введите базовый домен ещё раз" ""
+          BASE_DOMAIN="$(normalize_domain_input "$BASE_DOMAIN")"
+        done
+        continue
+      else
+        warn "Cloudflare не принял токен или проверка API не удалась. Проверьте токен и права Zone:Read + Zone:DNS:Edit."
+        ask_secret CLOUDFLARE_API_TOKEN "Введите токен Cloudflare ещё раз (скрытый ввод)" ""
+      fi
+    done
   fi
   log "Режим Cloudflare: поддомены создаст API (случайные непохожие имена вида quiet-otter.example.com)"
   cf_setup_hosts
@@ -2197,9 +2239,19 @@ if (( REMNAWAVE_AUTO_SETUP )); then
   note "API-токен создаётся в панели: Settings → API Tokens (права config-profiles:write,"
   note "nodes:write, hosts:write, internal-squads:write)."
   ask REMNAWAVE_PANEL_URL "Домен панели (URL, напр. https://panel.example.com)" "${REMNAWAVE_PANEL_URL:-}"
-  __normalized_panel_url="$(normalize_panel_url "$REMNAWAVE_PANEL_URL")" \
-    || die "Некорректный домен панели «$REMNAWAVE_PANEL_URL»: нужен URL вида https://panel.example.com (https:// можно не писать — добавится сам, а вот путь и слэш в конце не нужны)."
-  REMNAWAVE_PANEL_URL="$__normalized_panel_url"
+  while :; do
+    __normalized_panel_url="$(normalize_panel_url "$REMNAWAVE_PANEL_URL")" || __normalized_panel_url=""
+    if [[ -n "$__normalized_panel_url" ]]; then
+      REMNAWAVE_PANEL_URL="$__normalized_panel_url"
+      break
+    fi
+    if [[ "${QUICK_SETUP:-0}" == 1 && "$NONINTERACTIVE" != 1 ]] && has_tty; then
+      warn "Некорректный URL панели — нужен адрес вида https://panel.example.com без пути."
+      ask REMNAWAVE_PANEL_URL "Введите домен панели ещё раз" ""
+    else
+      die "Некорректный домен панели «$REMNAWAVE_PANEL_URL»: нужен URL вида https://panel.example.com (https:// можно не писать — добавится сам, а вот путь и слэш в конце не нужны)."
+    fi
+  done
   ok "URL панели: $REMNAWAVE_PANEL_URL"
   if [[ -z "${REMNAWAVE_API_TOKEN:-}" ]]; then
     ask_secret REMNAWAVE_API_TOKEN "API токен панели Remnawave (скрытый ввод)" ""
@@ -2208,6 +2260,26 @@ if (( REMNAWAVE_AUTO_SETUP )); then
   panel_curl_cfg_init
   if panel_check_connection; then
     ok "Панель доступна и токен валиден — авто-настройка будет выполнена после установки ноды"
+  elif [[ "${QUICK_SETUP:-0}" == 1 && "$NONINTERACTIVE" != 1 ]] && has_tty; then
+    while :; do
+      warn "Не удалось подключиться к панели или токен невалиден. Проверьте домен и права токена."
+      warn "Нужны права: nodes:write, config-profiles:write, hosts:write."
+      [[ -n "${PANEL_CURL_CFG:-}" ]] && rm -f "$PANEL_CURL_CFG"
+      PANEL_CURL_CFG=""
+      ask REMNAWAVE_PANEL_URL "Введите домен панели ещё раз" "$REMNAWAVE_PANEL_URL"
+      while :; do
+        __normalized_panel_url="$(normalize_panel_url "$REMNAWAVE_PANEL_URL")" || __normalized_panel_url=""
+        [[ -n "$__normalized_panel_url" ]] && { REMNAWAVE_PANEL_URL="$__normalized_panel_url"; break; }
+        warn "Некорректный URL панели — нужен адрес вида https://panel.example.com без пути."
+        ask REMNAWAVE_PANEL_URL "Введите домен панели ещё раз" ""
+      done
+      ask_secret REMNAWAVE_API_TOKEN "Введите API токен панели ещё раз (скрытый ввод)" ""
+      panel_curl_cfg_init
+      if panel_check_connection; then
+        ok "Панель доступна и токен валиден — авто-настройка будет выполнена после установки ноды"
+        break
+      fi
+    done
   else
     warn "Не удалось подключиться к панели или токен невалиден — авто-настройка может не сработать."
     warn "Проверьте URL и права токена (нужны: nodes:write, config-profiles:write, hosts:write)."

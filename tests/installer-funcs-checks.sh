@@ -162,7 +162,7 @@ ok "cf_valid_saved_host"
 # при ошибке API, отсутствии зоны и исчерпании перебора имён. curl подменяется
 # моком ПОСЛЕ извлечения функций.
 for fn in cf_api cf_json_success cf_json_error cf_curl_cfg_init \
-         cf_upsert_a cf_a_exists cf_setup_hosts cf_zone_id_for_host \
+         cf_check_token_zone cf_upsert_a cf_a_exists cf_setup_hosts cf_zone_id_for_host \
          cf_setup_cdn_host; do
   sed -n "/^${fn}() {\$/,/^}\$/p" "$SETUP" > "$WORK/$fn.sh"
   grep -q "^${fn}() {" "$WORK/$fn.sh" || fail "не удалось извлечь $fn из установщика"
@@ -229,6 +229,23 @@ cf_api() { # мок Cloudflare API: пишет журнал вызовов, от
   fi
   printf '{"success":false,"errors":[{"message":"мок: неожиданный вызов %s %s"}]}' "$method" "$path"
 }
+
+# Быстрая автоустановка должна отличать неверный токен от отсутствующей зоны,
+# чтобы повторно запросить соответственно токен или домен. Проверяем cleanup.
+CF_MOCK_ZONE_FOUND=1
+CF_MOCK_ZONE_ERROR=0
+BASE_DOMAIN=example.com
+CLOUDFLARE_API_TOKEN=mock-token-123
+CF_CURL_CFG=""
+cf_check_token_zone || fail "cf_check_token_zone: валидный токен/зона не прошли проверку"
+[[ -z "$CF_CURL_CFG" ]] || fail "cf_check_token_zone: временный файл токена не удалён"
+CF_MOCK_ZONE_ERROR=1
+if cf_check_token_zone; then fail "cf_check_token_zone: принял ответ API с ошибкой"; else [[ "$?" == 1 ]] || fail "ошибка API должна давать статус 1"; fi
+CF_MOCK_ZONE_ERROR=0
+CF_MOCK_ZONE_FOUND=0
+if cf_check_token_zone; then fail "cf_check_token_zone: принял отсутствующую зону"; else [[ "$?" == 2 ]] || fail "отсутствующая зона должна давать статус 2"; fi
+CF_MOCK_ZONE_FOUND=1
+ok "cf_check_token_zone: успех, ошибка токена/API и отсутствующая зона различаются"
 
 # Переменные «окружения установщика»: их читает извлечённая cf_setup_hosts.
 export BASE_DOMAIN=example.com
@@ -398,6 +415,9 @@ ok "CDN_HOST: по умолчанию предлагается cdn.<BASE_DOMAIN>
   || fail "normalize_panel_url: http с IP и портом должен сохраняться"
 if normalize_panel_url 'ftp://panel.example.com' >/dev/null; then
   fail "normalize_panel_url: чужая схема принята"
+fi
+if normalize_panel_url 'https://panel.example.com/login' >/dev/null; then
+  fail "normalize_panel_url: URL с путём принят"
 fi
 if normalize_panel_url 'https://' >/dev/null; then
   fail "normalize_panel_url: пустой хост принят"
