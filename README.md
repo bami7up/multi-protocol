@@ -102,6 +102,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/
 
 - A-записи в Cloudflare (DNS only, кроме CDN — proxied).
 - Сертификаты в `/etc/remna-certs/<домен>/` (автопродление через `acme.sh` cron).
+- **Чистка за собой:** после сборки Caddy удаляются Go-тулчейн, кэши сборки и модулей Go, `xcaddy`, `build-essential` (если его поставил установщик), а в конце — архивы `.deb` и индексы apt и неиспользуемые (dangling) образы Docker. Работающие сервисы не затрагиваются, а `build-essential` удаляется только если установщик поставил его сам. Если Caddy понадобится пересобрать, инструменты установщик скачает заново; чтобы оставить их, запустите с `--keep-build-tools` или `KEEP_BUILD_TOOLS=y`.
 - `Caddyfile` с L4-маршрутами и локальными сайтами `127.0.0.1:9443` (self-steal) и `127.0.0.1:9444` (CDN).
 - `docker-compose.yml` в `/opt/remnanode` и ноду `remnanode` (host network).
 - `Multiselect.json` и `Xray_template.json` в `/opt/remnanode`.
@@ -511,6 +512,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/
 --reset-firewall      удалить правила ufw
 --no-reset-firewall   не сбрасывать ufw (по умолчанию)
 --force-dns           продолжить при несовпадении DNS
+--keep-build-tools    не удалять Go, xcaddy, build-essential и кэши сборки (по умолчанию удаляются)
 --ssh-port N          SSH-порт для UFW
 --node-image REF      образ ноды; по умолчанию latest
 --self-steal-template T  тема фасада (vaultdrop, mail, cloud, admin, docs)
@@ -526,7 +528,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/
 -h, --help            справка
 ```
 
-Переменные: `BASE_DOMAIN`, `PREFIX`, `SELF_STEAL_HOST`, `ENABLE_XHTTP`, `XHTTP_SNI`, `XHTTP_PATH`, `ENABLE_CDN`, `CDN_HOST`, `CDN_TRANSPORT`, `CDN_WS_PATH`, `CDN_XHTTP_PATH`, `CDN_GRPC_PATH`, `PANEL_IP`, `NODE_API_PORT`, `SECRET_KEY`, `NODE_IMAGE`, `SELF_STEAL_TEMPLATE`, `SELF_STEAL_TEMPLATE_URL`, `MULTISELECT_TEMPLATE_URL`, `XCADDY_VERSION`, `CADDY_VERSION`, `CADDY_L4_VERSION`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ZONE`, `REMNAWAVE_PANEL_URL`, `REMNAWAVE_API_TOKEN`, `REMNAWAVE_AUTO_SETUP`, `QUICK_SETUP`, `XRAY_TEMPLATE_CHOICE`, `NODE_DIR`, `CERT_DIR`, `ENV_STORE`. Логические понимают `y/yes/1/true/on`/`n/no/0/false/off`. `SERVER_IP` из env важнее автодетекта (для NAT).
+Переменные: `BASE_DOMAIN`, `PREFIX`, `SELF_STEAL_HOST`, `ENABLE_XHTTP`, `XHTTP_SNI`, `XHTTP_PATH`, `ENABLE_CDN`, `CDN_HOST`, `CDN_TRANSPORT`, `CDN_WS_PATH`, `CDN_XHTTP_PATH`, `CDN_GRPC_PATH`, `PANEL_IP`, `NODE_API_PORT`, `SECRET_KEY`, `NODE_IMAGE`, `SELF_STEAL_TEMPLATE`, `SELF_STEAL_TEMPLATE_URL`, `MULTISELECT_TEMPLATE_URL`, `XCADDY_VERSION`, `CADDY_VERSION`, `CADDY_L4_VERSION`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ZONE`, `REMNAWAVE_PANEL_URL`, `REMNAWAVE_API_TOKEN`, `REMNAWAVE_AUTO_SETUP`, `QUICK_SETUP`, `XRAY_TEMPLATE_CHOICE`, `NODE_DIR`, `CERT_DIR`, `ENV_STORE`, `KEEP_BUILD_TOOLS`. Логические понимают `y/yes/1/true/on`/`n/no/0/false/off`. `SERVER_IP` из env важнее автодетекта (для NAT).
 
 ## Внешние источники и воспроизводимость
 

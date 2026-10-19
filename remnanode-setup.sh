@@ -5,6 +5,11 @@ BUILD_COMPOSE=1
 MANAGE_FIREWALL=1
 RESET_FIREWALL=0
 FORCE_DNS=0
+# 1 — оставить инструменты сборки (Go, xcaddy, build-essential, кэши) после
+# установки Caddy: нужно, только если Caddy предстоит пересобирать на этом сервере.
+KEEP_BUILD_TOOLS="${KEEP_BUILD_TOOLS:-0}"
+# Ставим build-essential сами (1) или он уже был в системе (0): чистим только своё.
+BUILD_ESSENTIAL_ADDED=0
 ASSUME_YES="${ASSUME_YES:-0}"
 NONINTERACTIVE="${NONINTERACTIVE:-0}"
 SSH_PORT_OVERRIDE=""
@@ -110,6 +115,8 @@ remnanode-setup.sh — установка ноды Remnawave (VLESS + Hysteria2 
   --reset-firewall      сбросить существующие правила ufw перед настройкой
   --no-reset-firewall   не сбрасывать ufw (по умолчанию; для совместимости)
   --force-dns           не прерываться при несовпадении DNS
+  --keep-build-tools    не удалять Go, xcaddy, build-essential и кэши сборки после Caddy
+                        (по умолчанию удаляются; нужно, только если Caddy будет пересобираться)
   --ssh-port N          явно указать SSH-порт для правила ufw
   --node-image REF      образ ноды (по умолчанию latest)
   --self-steal-template T
@@ -134,9 +141,9 @@ remnanode-setup.sh — установка ноды Remnawave (VLESS + Hysteria2 
   XCADDY_VERSION, CADDY_VERSION, CADDY_L4_VERSION,
   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ZONE,
   REMNAWAVE_PANEL_URL, REMNAWAVE_API_TOKEN, REMNAWAVE_AUTO_SETUP,
-  QUICK_SETUP, SERVER_IP, NODE_DIR, CERT_DIR, ENV_STORE
+  QUICK_SETUP, SERVER_IP, NODE_DIR, CERT_DIR, ENV_STORE, KEEP_BUILD_TOOLS
 
-Логические переменные (ENABLE_XHTTP, ENABLE_CDN, REMNAWAVE_AUTO_SETUP, QUICK_SETUP) понимают
+Логические переменные (ENABLE_XHTTP, ENABLE_CDN, REMNAWAVE_AUTO_SETUP, QUICK_SETUP, KEEP_BUILD_TOOLS) понимают
 y/yes/1/true/on и n/no/0/false/off в любом регистре; пустое значение означает ответ по умолчанию.
 Значение SERVER_IP (в том числе из сохранённого env-файла) важнее автодетекта:
 задайте его, если нода за NAT или внешние сервисы определения IP недоступны.
@@ -156,6 +163,7 @@ while [[ $# -gt 0 ]]; do
     --reset-firewall) RESET_FIREWALL=1 ;;
     --no-reset-firewall) RESET_FIREWALL=0 ;; # совместимость со старыми командами
     --force-dns)   FORCE_DNS=1 ;;
+    --keep-build-tools) KEEP_BUILD_TOOLS=1 ;;
     -y|--yes)      ASSUME_YES=1 ;;
     --non-interactive) NONINTERACTIVE=1; ASSUME_YES=1 ;;
     --ssh-port)
@@ -335,6 +343,61 @@ install_go_toolchain() {
   GO_INSTALL_TMP=""
   export PATH="$go_root/bin:$PATH"
   ok "Установлен проверенный Go $GO_VERSION ($go_arch)"
+}
+
+pkg_installed() {
+  dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -Fq 'install ok installed'
+}
+
+# Чистка за собой. На малых VPS диск ценен, а после сборки Caddy остаются
+# инструменты, которые ноде не нужны: Go-тулчейн (сотни МБ), кэш сборки и
+# модулей Go, xcaddy, копия собранного бинарника и build-essential с зависимостями.
+# Если Caddy понадобится пересобрать, установщик скачает всё заново.
+# Функция идемпотентна и безопасна при сбое: отсутствующие пути пропускаются.
+remove_build_leftovers() {
+  local go_bin="/opt/remnanode-toolchains/go${GO_VERSION}/bin/go" p
+  local removed=0
+  [[ "$KEEP_BUILD_TOOLS" == 1 ]] && return 0
+  # Очищаем кэши именно нашим тулчейном: системный go (если есть) не трогаем.
+  if [[ -x "$go_bin" ]]; then
+    "$go_bin" clean -modcache >/dev/null 2>&1 || true
+    "$go_bin" clean -cache >/dev/null 2>&1 || true
+    removed=1
+  fi
+  for p in /root/build-caddy-l4 /usr/local/bin/xcaddy /opt/remnanode-toolchains; do
+    if [[ -e "$p" ]]; then
+      rm -rf -- "$p"
+      removed=1
+    fi
+  done
+  # Молчим, если удалять было нечего: функция вызывается и при выходе (on_exit).
+  if (( removed == 1 )); then
+    note "Инструменты сборки Caddy удалены: Go, кэши сборки и модулей, xcaddy"
+  fi
+}
+
+# build-essential ставится только для сборки. Удаляем его, лишь если он появился
+# при установке: пакет, который был в системе до нас, не трогаем.
+remove_build_packages() {
+  [[ "$KEEP_BUILD_TOOLS" == 1 ]] && return 0
+  if [[ "$BUILD_ESSENTIAL_ADDED" == 1 ]] && pkg_installed build-essential; then
+    apt_get purge -y build-essential >/dev/null 2>&1 \
+      || warn "Не удалось удалить build-essential — при необходимости уберите вручную (apt-get purge build-essential)."
+    apt_get autoremove --purge -y >/dev/null 2>&1 || true
+    ok "build-essential и его зависимости удалены (нужны были только для сборки)"
+  fi
+}
+
+# Финальная уборка: архивы .deb и индексы apt, неиспользуемые (dangling) образы
+# Docker от прежних версий образа ноды. Работающие образы и установленные пакеты
+# не затрагиваются. Индексы apt восстанавливаются через apt-get update.
+cleanup_system_leftovers() {
+  apt_get clean >/dev/null 2>&1 || true
+  rm -rf -- /var/lib/apt/lists/* 2>/dev/null || true
+  if have docker && docker info >/dev/null 2>&1; then
+    docker image prune -f >/dev/null 2>&1 || true
+  fi
+  ok "Очистка завершена. Свободно на /: $(df -Pm / | awk 'NR==2{print $4}' 2>/dev/null || echo '?') МБ"
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -1507,6 +1570,7 @@ ask_bool() {
 # строки главнее: -y/--yes уже выставил 1 выше, и нормализация это не отменит.
 ASSUME_YES="$(parse_bool "${ASSUME_YES:-0}" 0)"
 NONINTERACTIVE="$(parse_bool "${NONINTERACTIVE:-0}" 0)"
+KEEP_BUILD_TOOLS="$(parse_bool "${KEEP_BUILD_TOOLS:-0}" 0)"
 
 # confirm "вопрос" "дефолт(y/n)" -> 0 если да, 1 если нет; уважает --yes/--non-interactive
 confirm() {
@@ -1714,6 +1778,9 @@ on_exit() {
   if [[ -n "${PANEL_CURL_CFG:-}" && -f "$PANEL_CURL_CFG" ]]; then
     rm -f -- "$PANEL_CURL_CFG"
   fi
+  # При сбое сборка не доходит до штатной очистки: убираем тулчейн и кэши здесь,
+  # чтобы неудачная попытка не оставляла сотни МБ на диске. Пакеты apt не трогаем.
+  remove_build_leftovers >/dev/null 2>&1 || true
   if [[ "${CADDY_RESTORE_NEEDED:-0}" -eq 1 ]]; then
     if systemctl start caddy >/dev/null 2>&1; then
       CADDY_RESTORE_NEEDED=0
@@ -2558,6 +2625,9 @@ if ! caddy_build_matches; then
       || die "Не удалось получить apt-репозиторий Caddy."
   fi
   retry 3 5 apt_get update -y || warn "apt-get update (caddy repo) с ошибкой — продолжаю."
+  if ! pkg_installed build-essential; then
+    BUILD_ESSENTIAL_ADDED=1
+  fi
   if have caddy; then
     retry 3 5 apt_get install -y build-essential libcap2-bin \
       || die "Не удалось установить build-essential/libcap2-bin."
@@ -2586,10 +2656,15 @@ if ! caddy_build_matches; then
   install -m 755 /root/build-caddy-l4/caddy /usr/bin/caddy
   setcap cap_net_bind_service=+ep /usr/bin/caddy || warn "setcap не удался — Caddy может не занять :80/:443 без root."
   apt-mark hold caddy >/dev/null 2>&1 || true
-  # Сборка кэширует гигабайты объектов в ~/.cache/go-build; пересборка нужна
-  # редко, а диск на малых VPS ценен — чистим кэш после успешной установки.
-  go clean -cache >/dev/null 2>&1 || true
-  note "Кэш сборки Go очищен"
+  # Caddy уже в /usr/bin/caddy, поэтому инструменты сборки больше не нужны.
+  # Сборка кэширует гигабайты объектов в ~/.cache/go-build, а модули — в GOMODCACHE;
+  # на малых VPS это лишнее место, поэтому удаляем всё после успешной установки.
+  if [[ "$KEEP_BUILD_TOOLS" == 1 ]]; then
+    note "Инструменты сборки оставлены (--keep-build-tools / KEEP_BUILD_TOOLS=1)"
+  else
+    remove_build_leftovers
+    remove_build_packages
+  fi
   systemctl enable caddy >/dev/null 2>&1 || true
   L4_COUNT="$(caddy list-modules 2>/dev/null | grep -c layer4 || true)"
   ok "Кастомный Caddy $CADDY_VERSION собран (${L4_COUNT:-0} L4-модулей)"
@@ -3220,6 +3295,9 @@ verify_http_layer
 ok "Все SNI/TLS-маршруты прошли проверку"
 
 prune_matching_files "$LOG_DIR" 'remnanode-setup-*.log' 10
+
+log "Очистка установочных остатков (apt, Docker)"
+cleanup_system_leftovers
 
 echo
 printf '%s%s╭──────────────────────────────────────────────────────────────╮%s\n' "${C_B:-}" "${C_GRN:-}" "${C_RST:-}"
