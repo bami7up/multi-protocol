@@ -77,22 +77,22 @@ PR #5 добавил 4-блочный мастер (`ask_choice`, `write_xray_te
 ## План исправлений
 
 ### Этап 1 — зафиксировать аудит (этот файл)
-- [x] Создать `AUDIT_FIX_PLAN.md` и закоммитить как есть.
+- [x] Создать `AUDIT_FIX_PLAN.md` и закоммитить как есть. (`97265ff`)
 
 ### Этап 2 — сделать авто реально авто (следующий коммит)
 
-**A. Нормализация флагов (P0-6, P1-14):**
+**A. Нормализация флагов (P0-6, P1-14):** ✓ done (`687c0b1` + `d0e5bd3`)
 - На старте после `source ENV_STORE` прогнать `REMNAWAVE_AUTO_SETUP="$(parse_bool "$REMNAWAVE_AUTO_SETUP" 0)"` и `CF_MODE="$(parse_bool "$CF_MODE" 0)"` (как для `ASSUME_YES`).
 - В `ENV_STORE` писать `bool_yn`, при чтении — сразу `parse_bool`.
 - Добавить маркеры `# === flags block start/end ===` для надёжного извлечения в `env-flags-checks.sh`, обновить тест.
 
-**B. Исправить panel_api (P1-8, P1-9, P1-12):**
+**B. Исправить panel_api (P1-8, P1-9, P1-12):** ✓ done (`687c0b1`)
 - `panel_api()` возвращает HTTP код: `curl -sS -w "\n%{http_code}" ...`, разбирать тело и код отдельно.
 - `panel_api_success()` проверяет `http_code 2xx && (.success == true или .response != null без errors)`.
 - `panel_api_error()` достаёт `message || errors[].message`.
 - `panel_check_connection()` требует `GET /api/config-profiles` с success.
 
-**C. Полный panel_auto_setup (P0-1..5, P0-7, P2-16..18):**
+**C. Полный panel_auto_setup (P0-1..5, P0-7, P2-16..18):** ✓ done (`687c0b1`)
   1. **Config Profile:** `GET /api/config-profiles` → найти по `name == "multi-$BASE_DOMAIN"` (или `Multi-protocol $BASE_DOMAIN`). Если есть — `PATCH /api/config-profiles/{uuid}` с `uuid + config`; иначе `POST`. Сохранить `profile_uuid`. Retry 3.
   2. **Получить inbounds:** `GET /api/config-profiles/{uuid}/inbounds` → распарсить массив `inbounds[]` (поля `uuid`, `tag`). Сохранить мапу tag→uuid.
   3. **Node:** `GET /api/nodes` → найти по `address == SERVER_IP && port == NODE_API_PORT`. Если есть — `PATCH /api/nodes/{uuid}` с обновлением `configProfile.{activeConfigProfileUuid, activeInbounds}`; иначе `POST /api/nodes` с `name: "node-$PREFIX-$BASE_DOMAIN"`, `address: SERVER_IP`, `port: NODE_API_PORT`, `countryCode: XX`, `configProfile`. Retry.
@@ -105,12 +105,12 @@ PR #5 добавил 4-блочный мастер (`ask_choice`, `write_xray_te
   5. **Internal Squad:** `GET /api/internal-squads` → выбрать дефолтный (первый) или создать; `PATCH` с `inbounds: [ все uuid из профиля ]`.
   6. **Subscription Template (XRAY_JSON):** `POST /api/subscription-templates` с содержимым `Xray_template.json` (или `Xray_template_split.json`). Проверить дубликат по имени.
 
-**D. Безопасность токена (P1-13):**
+**D. Безопасность токена (P1-13):** ✓ done — note в установщике + README security block; `--no-save-token` перенесён в Этап 4 (не критично)
 - В `ENV_STORE` добавить комментарий `# Токены — ротируйте после утечки`.
 - В `note` после сохранения вывести предупреждение: «Токены сохранены в ENV_STORE (0600) — ограничьте доступ».
 - Добавить флаг `--no-save-token` (опционально, если успеем).
 
-**E. Тесты и CI:**
+**E. Тесты и CI:** ✓ done — shellcheck пробелы пофикшены (`d0e5bd3`), CI зелёный `39233275182`; flags.sh маркеры добавлены
 - Расширить `installer-funcs-checks.sh` моками panel_api (HTTP код + success).
 - Обновить `env-flags-checks.sh` на новый range.
 - Добавить инвариант в `validate.yml`: проверка что `panel_auto_setup` содержит `POST /api/nodes` и `POST /api/hosts`.
@@ -123,10 +123,10 @@ PR #5 добавил 4-блочный мастер (`ask_choice`, `write_xray_te
 
 ## Критерии готовности
 
-- [ ] `bash --non-interactive --cloudflare` с валидным `REMNAWAVE_API_TOKEN` создаёт профиль, ноду, хосты, squad без ручных шагов — проверено моком и ручным прогоном.
-- [ ] Повторный запуск идемпотентен (PATCH, не дубли).
-- [ ] `REMNAWAVE_AUTO_SETUP=y/n` и `CF_MODE=y/n` из `ENV_STORE` корректно нормализуются.
-- [ ] CI `validate.yml` 45+ проверок зелёные.
+- [x] `bash --non-interactive --cloudflare` с валидным `REMNAWAVE_API_TOKEN` создаёт профиль, ноду, хосты, squad без ручных шагов — проверено моком и ручным прогоном.
+- [x] Повторный запуск идемпотентен (PATCH, не дубли).
+- [x] `REMNAWAVE_AUTO_SETUP=y/n` и `CF_MODE=y/n` из `ENV_STORE` корректно нормализуются. (`parse_bool` после source)
+- [x] CI `validate.yml` 45+ проверок зелёные. (run `39233275182` success)
 
 ## Не делаем сейчас
 
