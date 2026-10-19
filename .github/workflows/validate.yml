@@ -181,7 +181,7 @@ jobs:
             || fail "занятый 443/tcp не диагностируется заранее"
 
           # 11. Кэш сборки Go не остаётся на диске после xcaddy build.
-          grep -qF 'go clean -cache' remnanode-setup.sh \
+          grep -qF 'clean -cache' remnanode-setup.sh \
             || fail "кэш сборки Go не очищается после сборки"
 
           # 12. Только один экземпляр установщика может работать одновременно.
@@ -443,5 +443,24 @@ jobs:
              && [[ "$(printf '%s\n%s\n' 1.26 "$go_ver" | sort -V | head -1)" != 1.26 ]]; then
             fail "Caddy $caddy_ver требует для сборки Go >= 1.26, а пин — Go $go_ver"
           fi
+
+          # 46. Чистка за собой: после установки на диске не остаются инструменты
+          #     сборки Caddy, build-essential (если его поставил установщик) и apt-архивы.
+          grep -q '^remove_build_leftovers() {' remnanode-setup.sh \
+            || fail "нет очистки инструментов сборки (Go, xcaddy, кэши)"
+          grep -q '^remove_build_packages() {' remnanode-setup.sh \
+            || fail "нет удаления build-essential после сборки"
+          grep -q '^cleanup_system_leftovers() {' remnanode-setup.sh \
+            || fail "нет финальной очистки apt и Docker"
+          grep -q '^cleanup_system_leftovers$' remnanode-setup.sh \
+            || fail "финальная очистка не вызывается"
+          grep -qF 'apt_get clean' remnanode-setup.sh \
+            || fail "архивы .deb (apt) не очищаются"
+          grep -q 'remove_build_leftovers >/dev/null' remnanode-setup.sh \
+            || fail "очистка сборки не вызывается при сбое (on_exit)"
+          grep -qF 'BUILD_ESSENTIAL_ADDED=1' remnanode-setup.sh \
+            || fail "build-essential может быть удалён, хотя был в системе до установки"
+          grep -qF -- '--keep-build-tools' remnanode-setup.sh \
+            || fail "нет флага --keep-build-tools для сохранения инструментов сборки"
 
           echo "✔ инварианты переменных окружения на месте"
