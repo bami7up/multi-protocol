@@ -737,4 +737,190 @@ if acme_cert_days_left 'corrupt.test'; then
 fi
 ok "acme_cert_days_left: свежий учитывается, битый/отсутствующий требует перевыпуска"
 
+
+# --- Panel API: HTTP-код обязан доживать до panel_api_success ---
+# Регрессия: panel_api вызывается через $(...), и выставленный внутри подоболочки
+# PANEL_HTTP_CODE не возвращался вызывающему. Из-за этого panel_api_success
+# всегда видел «000» и считал ошибкой даже 200 с валидным токеном («не удалось
+# подключиться к панели» при заведомо рабочем токене).
+for fn in panel_curl_cfg_init panel_http_code_file panel_http_error_file panel_state_init panel_api_code panel_api \
+         panel_api_success panel_api_error panel_check_connection \
+         panel_connection_hint panel_api_retry \
+         panel_profile_name panel_result_uuid panel_try_host \
+         panel_find_profile_by_name json5_to_json; do
+  sed -n "/^${fn}() {\$/,/^}\$/p" "$SETUP" > "$WORK/panel-$fn.sh"
+  grep -q "^${fn}() {" "$WORK/panel-$fn.sh" || fail "не удалось извлечь $fn из установщика"
+  # shellcheck source=/dev/null
+  . "$WORK/panel-$fn.sh"
+done
+
+PANEL_STATE_DIR="$WORK/panel-state"
+mkdir -p "$PANEL_STATE_DIR"
+PANEL_MOCK_CALLS="$WORK/panel-calls.log"
+PANEL_MOCK_PROFILES_BODY='{"response":{"total":0,"configProfiles":[]}}'
+PANEL_MOCK_NODES_BODY='{"response":[]}'
+
+curl() { # мок панели: тело и код задаются переменными сценария
+  local url="" a body code
+  for a in "$@"; do url="$a"; done
+  printf '%s\n' "$url" >> "$PANEL_MOCK_CALLS"
+  body="$PANEL_MOCK_PROFILES_BODY"; code="$PANEL_MOCK_PROFILES_CODE"
+  if [[ "$url" == */nodes ]]; then
+    body="$PANEL_MOCK_NODES_BODY"; code="$PANEL_MOCK_NODES_CODE"
+  fi
+  [[ -z "$PANEL_MOCK_ERR" ]] || printf '%s\n' "$PANEL_MOCK_ERR" >&2
+  printf '%s\n%s' "$body" "$code"
+  return "${PANEL_MOCK_RC:-0}"
+}
+
+PANEL_MOCK_PROFILES_CODE=200
+PANEL_MOCK_NODES_CODE=200
+PANEL_MOCK_RC=0
+PANEL_MOCK_ERR=""
+sleep() { :; }
+
+panel_mock_reset() {
+  export PANEL_HTTP_BODY=""
+  export PANEL_HTTP_CODE_FILE=""
+  export PANEL_HTTP_ERROR_FILE=""
+  export PANEL_CONN_REASON=""
+  export PANEL_CONN_DETAIL=""
+  export PANEL_CONN_CODE=""
+  PANEL_MOCK_PROFILES_CODE=200
+  PANEL_MOCK_NODES_CODE=200
+  PANEL_MOCK_PROFILES_BODY='{"response":{"total":0,"configProfiles":[]}}'
+  PANEL_MOCK_NODES_BODY='{"response":[]}'
+  PANEL_MOCK_RC=0
+  PANEL_MOCK_ERR=""
+  rm -f "${PANEL_CURL_CFG:-}" 2>/dev/null || true
+  PANEL_CURL_CFG=""
+  : > "$PANEL_MOCK_CALLS"
+  panel_curl_cfg_init
+}
+
+export REMNAWAVE_PANEL_URL="https://panel.example.com/"
+REMNAWAVE_API_TOKEN="$(printf 'eyJ%s' "$(printf 'A%.0s' {1..220})")"
+export REMNAWAVE_API_TOKEN
+
+panel_mock_reset
+panel_check_connection \
+  || fail "panel_check_connection: валидный ответ 200 считается ошибкой (код HTTP терялся в подоболочке)"
+[[ "$(panel_api_code)" == "200" ]] || fail "panel_api_code: код 200 не сохранился"
+grep -q '^header = "Authorization: Bearer eyJ' "$PANEL_CURL_CFG" \
+  || fail "panel_curl_cfg_init: токен не попал в curl config"
+ok "panel_api: HTTP-код и токен доходят до проверки (регрессия ложного «не удалось подключиться»)"
+
+panel_mock_reset
+PANEL_MOCK_PROFILES_CODE=401
+PANEL_MOCK_NODES_CODE=401
+PANEL_MOCK_PROFILES_BODY='{"message":"Unauthorized","code":"A001"}'
+PANEL_MOCK_NODES_BODY='{"message":"Unauthorized","code":"A001"}'
+if panel_check_connection; then fail "panel_check_connection: 401 принят как успех"; fi
+[[ "$PANEL_CONN_REASON" == "unauthorized" ]] || fail "401 не распознан как проблема токена: $PANEL_CONN_REASON"
+[[ "$(panel_connection_hint)" == *"HTTP 401"* ]] || fail "подсказка для 401 не упоминает HTTP 401"
+ok "panel_api: 401 → «токен отклонён», а не общая ошибка"
+
+panel_mock_reset
+PANEL_MOCK_PROFILES_CODE=403
+PANEL_MOCK_NODES_CODE=403
+PANEL_MOCK_PROFILES_BODY='{"message":"Forbidden resource","code":"A040"}'
+PANEL_MOCK_NODES_BODY='{"message":"Forbidden resource","code":"A040"}'
+if panel_check_connection; then fail "panel_check_connection: 403 принят как успех"; fi
+[[ "$PANEL_CONN_REASON" == "scope" ]] || fail "403 не распознан как нехватка прав: $PANEL_CONN_REASON"
+[[ "$(panel_connection_hint)" == *"прав"* ]] || fail "подсказка для 403 не говорит о правах токена"
+ok "panel_api: 403 → «токен рабочий, не хватает прав»"
+
+panel_mock_reset
+PANEL_MOCK_PROFILES_CODE=403
+PANEL_MOCK_PROFILES_BODY='{"message":"Forbidden resource","code":"A040"}'
+if panel_check_connection; then fail "panel_check_connection: 403 config-profiles принят как успех"; fi
+[[ "$PANEL_CONN_REASON" == "scope" ]] || fail "403 на одном разделе не распознан: $PANEL_CONN_REASON"
+[[ "$PANEL_CONN_DETAIL" == *"config-profiles"* ]] || fail "в отказе не назван раздел: $PANEL_CONN_DETAIL"
+[[ "$PANEL_CONN_DETAIL" != *"nodes"* ]] || fail "в отказ попал доступный раздел: $PANEL_CONN_DETAIL"
+ok "panel_api: 403 называет только разделы без прав"
+
+panel_mock_reset
+PANEL_MOCK_PROFILES_CODE=000
+PANEL_MOCK_NODES_CODE=000
+PANEL_MOCK_RC=7
+PANEL_MOCK_ERR="curl: (7) Failed to connect to panel.example.com port 443"
+if panel_check_connection; then fail "panel_check_connection: сетевая ошибка принята как успех"; fi
+[[ "$PANEL_CONN_REASON" == "network" ]] || fail "сетевая ошибка не распознана: $PANEL_CONN_REASON"
+[[ "$PANEL_CONN_DETAIL" == *"curl: (7)"* ]] || fail "текст ошибки curl потерялся: $PANEL_CONN_DETAIL"
+ok "panel_api: сетевой сбой → код 000 и текст curl в диагностике"
+
+panel_mock_reset
+PANEL_MOCK_PROFILES_CODE=200
+PANEL_MOCK_PROFILES_BODY='<!DOCTYPE html><html><body>Cloudflare Access</body></html>'
+if panel_check_connection; then fail "panel_check_connection: HTML вместо JSON принят как успех"; fi
+[[ "$PANEL_CONN_REASON" == "not-json" ]] || fail "HTML вместо JSON не распознан: $PANEL_CONN_REASON"
+ok "panel_api: HTML (Cloudflare Access) не считается успешным ответом"
+
+panel_mock_reset
+PANEL_MOCK_PROFILES_CODE=403
+PANEL_MOCK_PROFILES_BODY='{"message":"Forbidden resource"}'
+if panel_api_retry GET /config-profiles >/dev/null; then fail "panel_api_retry: 403 принят как успех"; fi
+[[ "$(wc -l < "$PANEL_MOCK_CALLS")" == 1 ]] || fail "panel_api_retry ретраит 4xx (403)"
+panel_mock_reset
+PANEL_MOCK_PROFILES_CODE=500
+PANEL_MOCK_PROFILES_BODY='{"message":"Internal error"}'
+if panel_api_retry GET /config-profiles >/dev/null; then fail "panel_api_retry: 500 принят как успех"; fi
+[[ "$(wc -l < "$PANEL_MOCK_CALLS")" == 3 ]] || fail "panel_api_retry: 500 не повторился 3 раза"
+panel_mock_reset
+ok "panel_api_retry: 403 не ретраится, 5xx — три попытки"
+
+# Имя Config Profile: точки из домена запрещены API (400 на POST).
+BASE_DOMAIN="example.com"
+name="$(panel_profile_name)"
+[[ "$name" != *.* ]] || fail "panel_profile_name: точка осталась в имени ($name)"
+[[ "$name" =~ ^[A-Za-z0-9_\ -]{2,30}$ ]] || fail "panel_profile_name: недопустимые символы ($name)"
+BASE_DOMAIN="$(printf 'very-long-subdomain-%.0s' {1..3}).example.com"
+name="$(panel_profile_name)"
+(( ${#name} <= 30 )) || fail "panel_profile_name: имя длиннее 30 символов (${#name})"
+[[ "$name" =~ ^[A-Za-z0-9_\ -]{2,30}$ ]] || fail "panel_profile_name: недопустимые символы ($name)"
+unset BASE_DOMAIN
+ok "panel_profile_name: домен с точками санируется, длина ≤ 30"
+
+# Ответы-обёртки Remnawave 3.x: {response:{configProfiles:[...]}}.
+found="$( (
+  # shellcheck disable=SC2329  # вызывается косвенно из panel_find_profile_by_name
+  panel_api() { printf '%s' '{"response":{"total":1,"configProfiles":[{"uuid":"p-1","name":"multi-example-com"}]}}'; }
+  panel_find_profile_by_name 'multi-example-com'
+) )"
+[[ "$found" == "p-1" ]] || fail "panel_find_profile_by_name не читает {response:{configProfiles}}: '$found'"
+ok "panel_find_profile_by_name: список профилей в обёртке response.configProfiles"
+
+# JSON5 → JSON: комментарии вне строк удаляются, URL внутри строк не ломается.
+converted="$(printf '%s\n' $'{\n  "url": "https://example.com/x", // комментарий\n  "list": [1, 2,],\n}\n' | json5_to_json | jq -c .)" \
+  || fail "json5_to_json: результат не разбирается jq"
+[[ "$converted" == '{"url":"https://example.com/x","list":[1,2]}' ]] \
+  || fail "json5_to_json: неверный результат: $converted"
+for tpl in Xray_template.json Xray_template_split.json; do
+  json5_to_json < "$SRC/$tpl" | jq -e . >/dev/null 2>&1 \
+    || fail "json5_to_json: $tpl не превращается в валидный JSON"
+done
+ok "json5_to_json: комментарии и висячие запятые убраны, шаблоны валидны"
+
+# Результат upsert-функции: она печатает ok/warn и лишь последней строкой uuid.
+# При ошибке код возврата ненулевой, и текст предупреждения НЕ должен стать uuid
+# (иначе он уходил бы в URL запросов и установка «завершалась успешно»).
+res="$(panel_result_uuid $'  ✔ Config Profile создан: x (5f0f1a76-1111-2222-3333-444455556666)\n5f0f1a76-1111-2222-3333-444455556666' 0)"
+[[ "$res" == "5f0f1a76-1111-2222-3333-444455556666" ]] \
+  || fail "panel_result_uuid: uuid не извлечён из вывода функции: '$res'"
+res="$(panel_result_uuid '  ▲ Не удалось создать Config Profile: Internal server error (код A500, HTTP 500)' 1)"
+[[ -z "$res" ]] || fail "panel_result_uuid: текст ошибки принят за uuid: '$res'"
+ok "panel_result_uuid: uuid берётся только из успешного вызова"
+
+# shellcheck disable=SC2329  # вызывается косвенно из panel_try_host
+panel_upsert_host() { return "${HOST_STUB_RC:-0}"; }
+out="$(panel_try_host a b c)"
+[[ -z "$out" ]] || fail "panel_try_host: в консоль попал вывод успешного вызова: '$out'"
+HOST_STUB_RC=1
+rc=0
+panel_try_host a b c >/dev/null || rc=$?
+[[ "$rc" -eq 1 ]] || fail "panel_try_host: код ошибки потерян (rc=$rc)"
+HOST_STUB_RC=0
+unset -f panel_upsert_host
+ok "panel_try_host: успех молчит, ошибка возвращает код"
+
 printf 'все проверки функций установщика прошли\n'

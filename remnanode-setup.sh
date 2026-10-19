@@ -283,7 +283,7 @@ prune_matching_files() {
 }
 
 remove_managed_ufw_rules() {
-  local rule_no
+  local rule_no removed=0
   local -a rule_numbers=()
   mapfile -t rule_numbers < <(
     ufw status numbered 2>/dev/null \
@@ -291,11 +291,14 @@ remove_managed_ufw_rules() {
       | sort -rn
   )
   for rule_no in "${rule_numbers[@]}"; do
-    ufw --force delete "$rule_no" >/dev/null \
-      || warn "Не удалось удалить старое управляемое правило ufw №$rule_no."
+    if ufw --force delete "$rule_no" >/dev/null; then
+      removed=$((removed + 1))
+    else
+      warn "Не удалось удалить старое управляемое правило ufw №$rule_no."
+    fi
   done
-  if (( ${#rule_numbers[@]} > 0 )); then
-    ok "Старые правила доступа панели к Node API удалены: ${#rule_numbers[@]}"
+  if (( removed > 0 )); then
+    ok "Старые правила доступа панели к Node API удалены: $removed"
   fi
 }
 
@@ -381,10 +384,14 @@ remove_build_leftovers() {
 remove_build_packages() {
   [[ "$KEEP_BUILD_TOOLS" == 1 ]] && return 0
   if [[ "$BUILD_ESSENTIAL_ADDED" == 1 ]] && pkg_installed build-essential; then
-    apt_get purge -y build-essential >/dev/null 2>&1 \
-      || warn "Не удалось удалить build-essential — при необходимости уберите вручную (apt-get purge build-essential)."
-    apt_get autoremove --purge -y >/dev/null 2>&1 || true
-    ok "build-essential и его зависимости удалены (нужны были только для сборки)"
+    # Сообщение об успехе — только после успешного purge: иначе установщик
+    # рапортовал об удалении пакета, который остался в системе.
+    if apt_get purge -y build-essential >/dev/null 2>&1; then
+      apt_get autoremove --purge -y >/dev/null 2>&1 || true
+      ok "build-essential и его зависимости удалены (нужны были только для сборки)"
+    else
+      warn "Не удалось удалить build-essential — при необходимости уберите вручную (apt-get purge build-essential)."
+    fi
   fi
 }
 
@@ -1087,11 +1094,47 @@ write_xray_template() {
 }
 
 # ——— Авто-настройка панели через API (если выбран REMNAWAVE_AUTO_SETUP) ———
+# Имя Config Profile: API разрешает только буквы, цифры, пробелы, «_» и «-»
+# (точки из домена запрещены), длина 2–30 символов.
+panel_profile_name() {
+  local base="${BASE_DOMAIN:-auto}" name
+  base="${base//[^A-Za-z0-9_-]/-}"
+  name="multi-${base}-$(date +%Y%m%d)"
+  printf '%s' "${name:0:30}"
+}
+
+# Результат функции, которая печатает диагностику (ok/warn) и лишь последней
+# строкой — значение. Подоболочка $(...) смешивает их, поэтому значение берём
+# ТОЛЬКО при успешном коде возврата: иначе текст предупреждения
+# («▲ Не удалось создать…») стал бы uuid профиля и ушёл в URL запросов.
+panel_result_uuid() {
+  local out="${1:-}" rc="${2:-1}"
+  (( rc == 0 )) || return 0
+  printf '%s' "$out" | tail -1 | tr -d '[:space:]'
+}
+
+# Обёртка для panel_upsert_host: в успешном случае молчим (функция печатает
+# uuid в stdout — в консоли он не нужен), при ошибке показываем диагностику
+# целиком и возвращаем ненулевой код, чтобы вызывающий её посчитал.
+panel_try_host() {
+  local out="" rc=0
+  out="$(panel_upsert_host "$@" 2>/dev/null)" || rc=$?
+  if (( rc != 0 )) && [[ -n "$out" ]]; then
+    printf '%s\n' "$out"
+  fi
+  return "$rc"
+}
+
 panel_find_profile_by_name() {
   local name="$1" resp uuid
   resp="$(panel_api GET "/config-profiles" 2>/dev/null || true)"
-  # Список может быть в .response[], .data[] или прямо массив
-  uuid="$(jq -r --arg n "$name" '(.response // .data // .) | if type=="array" then .[] else . end | select(.name==$n) | .uuid // empty' <<<"$resp" 2>/dev/null | head -1)"
+  # Remnawave 3.x: {response:{total, configProfiles:[...]}}; старые версии — массив
+  uuid="$(jq -r --arg n "$name" '
+    (.response // .data // .)
+    | if type=="object" and has("configProfiles") then .configProfiles
+      elif type=="array" then .
+      else [] end
+    | .[] | select(.name==$n) | .uuid // empty' <<<"$resp" 2>/dev/null | head -1 || true)"
   printf '%s' "$uuid"
 }
 
@@ -1130,16 +1173,17 @@ panel_upsert_config_profile() {
     return 1
   fi
   if [[ -n "$existing_uuid" ]]; then
-    # PATCH — полный replace, нужен uuid + config + name
+    # PATCH — полный replace, нужен uuid + config + name.
+    # В актуальном API маршрут коллекционный: PATCH /config-profiles, uuid в теле.
     local patch_payload
     patch_payload="$(jq -n --arg uuid "$existing_uuid" --arg name "$profile_name" --argjson config "$profile_json" '{uuid: $uuid, name: $name, config: $config}' 2>/dev/null || true)"
-    resp="$(panel_api_retry PATCH "/config-profiles/$existing_uuid" "$patch_payload" 2>/dev/null || true)"
+    resp="$(panel_api_retry PATCH "/config-profiles" "$patch_payload" 2>/dev/null || true)"
     if panel_api_success "$resp"; then
       result_uuid="$existing_uuid"
       ok "Config Profile обновлён: $profile_name ($result_uuid)"
     else
-      # Фолбэк PATCH без uuid в пути (разные версии API)
-      resp="$(panel_api_retry PATCH "/config-profiles" "$patch_payload" 2>/dev/null || true)"
+      # Фолбэк для версий, где uuid передаётся в пути
+      resp="$(panel_api_retry PATCH "/config-profiles/$existing_uuid" "$patch_payload" 2>/dev/null || true)"
       if panel_api_success "$resp"; then
         result_uuid="$existing_uuid"
         ok "Config Profile обновлён: $profile_name ($result_uuid)"
@@ -1190,13 +1234,13 @@ panel_upsert_node() {
     # PATCH существующей
     local patch_payload
     patch_payload="$(jq -n --arg uuid "$existing_uuid" --arg name "$node_name" --arg address "$SERVER_IP" --argjson port "$NODE_API_PORT" --arg prof "$profile_uuid" --argjson inbs "$inbounds_json" '{uuid: $uuid, name: $name, address: $address, port: $port, configProfile: {activeConfigProfileUuid: $prof, activeInbounds: $inbs}}' 2>/dev/null || true)"
-    resp="$(panel_api_retry PATCH "/nodes/$existing_uuid" "$patch_payload" 2>/dev/null || true)"
+    resp="$(panel_api_retry PATCH "/nodes" "$patch_payload" 2>/dev/null || true)"
     if panel_api_success "$resp"; then
       result_uuid="$existing_uuid"
       ok "Нода обновлена: $node_name ($result_uuid) → профиль $profile_uuid"
     else
-      # Фолбэк PATCH /nodes без uuid в пути
-      resp="$(panel_api_retry PATCH "/nodes" "$patch_payload" 2>/dev/null || true)"
+      # Фолбэк для версий, где uuid передаётся в пути
+      resp="$(panel_api_retry PATCH "/nodes/$existing_uuid" "$patch_payload" 2>/dev/null || true)"
       if panel_api_success "$resp"; then
         result_uuid="$existing_uuid"
         ok "Нода обновлена: $node_name ($result_uuid)"
@@ -1234,12 +1278,12 @@ panel_upsert_host() {
   if [[ -n "$existing_uuid" ]]; then
     local patch_payload
     patch_payload="$(jq --arg uuid "$existing_uuid" '. + {uuid: $uuid}' <<<"$payload" 2>/dev/null || true)"
-    resp="$(panel_api_retry PATCH "/hosts/$existing_uuid" "$patch_payload" 2>/dev/null || true)"
+    resp="$(panel_api_retry PATCH "/hosts" "$patch_payload" 2>/dev/null || true)"
     if panel_api_success "$resp"; then
       ok "Хост обновлён: $remark → $address:$port (inbound $inbound_uuid)"
       result_uuid="$existing_uuid"
     else
-      resp="$(panel_api_retry PATCH "/hosts" "$patch_payload" 2>/dev/null || true)"
+      resp="$(panel_api_retry PATCH "/hosts/$existing_uuid" "$patch_payload" 2>/dev/null || true)"
       if panel_api_success "$resp"; then
         ok "Хост обновлён: $remark"
         result_uuid="$existing_uuid"
@@ -1277,18 +1321,24 @@ panel_upsert_internal_squad() {
   local -a inbounds=("$@")
   local resp squad_uuid inbounds_json payload
   resp="$(panel_api GET "/internal-squads" 2>/dev/null || true)"
-  squad_uuid="$(jq -r '(.response // .data // .) | if type=="array" then .[0].uuid // empty else .uuid // empty end' <<<"$resp" 2>/dev/null || true)"
+  # Remnawave 3.x: {response:{total, internalSquads:[...]}}; старые версии — массив
+  squad_uuid="$(jq -r '
+    (.response // .data // .)
+    | if type=="object" and has("internalSquads") then .internalSquads
+      elif type=="array" then .
+      else [] end
+    | .[0].uuid // empty' <<<"$resp" 2>/dev/null || true)"
   if [[ -z "$squad_uuid" ]]; then
     note "Internal Squad не найден — создайте его вручную и включите inbound'ы"
     return 0
   fi
   inbounds_json="$(printf '%s\n' "${inbounds[@]}" | jq -R . | jq -s 'map(select(length>0))' 2>/dev/null || echo '[]')"
   payload="$(jq -n --arg uuid "$squad_uuid" --argjson inbounds "$inbounds_json" '{uuid: $uuid, inbounds: $inbounds}' 2>/dev/null || true)"
-  resp="$(panel_api_retry PATCH "/internal-squads/$squad_uuid" "$payload" 2>/dev/null || true)"
+  resp="$(panel_api_retry PATCH "/internal-squads" "$payload" 2>/dev/null || true)"
   if panel_api_success "$resp"; then
     ok "Internal Squad обновлён: добавлены inbound'ы ($squad_uuid)"
   else
-    resp="$(panel_api_retry PATCH "/internal-squads" "$payload" 2>/dev/null || true)"
+    resp="$(panel_api_retry PATCH "/internal-squads/$squad_uuid" "$payload" 2>/dev/null || true)"
     if panel_api_success "$resp"; then
       ok "Internal Squad обновлён (fallback): $squad_uuid"
     else
@@ -1297,16 +1347,49 @@ panel_upsert_internal_squad() {
   fi
 }
 
+# Шаблоны в репозитории комментированы (JSON5), а Panel API принимает только
+# строгий JSON. Убираем //-комментарии вне строк и висячие запятые перед }/].
+json5_to_json() {
+  awk '
+    {
+      line=$0; out=""; instr=0; esc=0;
+      for (i=1; i<=length(line); i++) {
+        c=substr(line,i,1);
+        if (instr) {
+          out=out c;
+          if (esc) esc=0;
+          else if (c=="\\") esc=1;
+          else if (c=="\"") instr=0;
+        } else if (c=="\"") {
+          instr=1; out=out c;
+        } else if (c=="/" && substr(line,i,2)=="//") {
+          break;
+        } else {
+          out=out c;
+        }
+      }
+      buf=buf out "\n";
+    }
+    END {
+      res="";
+      while (match(buf, /,[ \t\r\n]*[}\]]/)) {
+        m=substr(buf,RSTART,RLENGTH);
+        sub(/^,[ \t\r\n]*/,"",m);
+        res=res substr(buf,1,RSTART-1) m;
+        buf=substr(buf,RSTART+RLENGTH);
+      }
+      printf "%s%s", res, buf;
+    }
+  '
+}
+
 panel_upsert_subscription_template() {
   local choice="$1"
-  local src=""
+  local src="$NODE_DIR/Xray_template.json"
   local tname
-  tname="XRAY $choice $(date +%Y-%m-%d)"
-  if [[ "$choice" == "split" ]]; then
-    src="$NODE_DIR/Xray_template.json"
+  if [[ "${choice,,}" == "split" ]]; then
     tname="XRAY split $(date +%Y-%m-%d)"
   else
-    src="$NODE_DIR/Xray_template.json"
     tname="XRAY standard $(date +%Y-%m-%d)"
   fi
   if [[ ! -r "$src" ]]; then
@@ -1314,27 +1397,54 @@ panel_upsert_subscription_template() {
     return 0
   fi
   local content
-  content="$(cat "$src" 2>/dev/null || true)"
-  if [[ -z "$content" ]]; then return 0; fi
-  # Проверяем дубликат по имени
+  content="$(json5_to_json < "$src" 2>/dev/null | jq -c . 2>/dev/null || true)"
+  if [[ -z "$content" || "$content" == "null" ]]; then
+    warn "Шаблон подписки $src не является корректным JSON — пропускаю загрузку (вставьте его вручную: Templates → XRAY_JSON)"
+    return 0
+  fi
+  # Проверяем дубликат по имени. Remnawave 3.x: {response:{total, templates:[...]}}
   local resp existing_uuid
   resp="$(panel_api GET "/subscription-templates" 2>/dev/null || true)"
   if ! panel_api_success "$resp"; then
     # Пробуем альтернативный путь
     resp="$(panel_api GET "/templates" 2>/dev/null || true)"
   fi
-  existing_uuid="$(jq -r --arg n "$tname" '(.response // .data // .) | if type=="array" then .[] else . end | select(.name==$n or .templateName==$n) | .uuid // empty' <<<"$resp" 2>/dev/null | head -1 || true)"
+  existing_uuid="$(jq -r --arg n "$tname" '
+    (.response // .data // .)
+    | if type=="object" and has("templates") then .templates
+      elif type=="array" then .
+      else [] end
+    | .[] | select(.name==$n or .templateName==$n) | .uuid // empty' <<<"$resp" 2>/dev/null | head -1 || true)"
   if [[ -n "$existing_uuid" ]]; then
-    note "Шаблон подписки уже существует: $tname ($existing_uuid) — пропускаю создание"
+    local patch_payload
+    patch_payload="$(jq -n --arg uuid "$existing_uuid" --argjson tmpl "$content" '{uuid: $uuid, templateJson: $tmpl}' 2>/dev/null || true)"
+    resp="$(panel_api_retry PATCH "/subscription-templates" "$patch_payload" 2>/dev/null || true)"
+    if panel_api_success "$resp"; then
+      note "Шаблон подписки обновлён: $tname ($existing_uuid)"
+    else
+      note "Шаблон подписки уже существует: $tname ($existing_uuid) — содержимое обновить не удалось: $(panel_api_error "$resp")"
+    fi
     return 0
   fi
-  # Пробуем несколько вариантов API (разные версии панели)
-  local payload resp2
-  payload="$(jq -n --arg name "$tname" --argjson tmpl "$content" '{name: $name, template: $tmpl, isEnabled: true}' 2>/dev/null || true)"
-  for path in "/subscription-templates" "/templates" "/subscription_template"; do
+  # POST создаёт только имя и тип; содержимое загружается отдельным PATCH.
+  local payload resp2 created_uuid content_payload
+  payload="$(jq -n --arg name "$tname" '{name: $name, templateType: "XRAY_JSON"}' 2>/dev/null || true)"
+  for path in "/subscription-templates" "/templates"; do
     resp2="$(panel_api_retry POST "$path" "$payload" 2>/dev/null || true)"
     if panel_api_success "$resp2"; then
-      ok "Шаблон подписки создан: $tname"
+      created_uuid="$(jq -r '.response.uuid // .data.uuid // empty' <<<"$resp2" 2>/dev/null || true)"
+      if [[ -n "$created_uuid" ]]; then
+        content_payload="$(jq -n --arg uuid "$created_uuid" --argjson tmpl "$content" '{uuid: $uuid, templateJson: $tmpl}' 2>/dev/null || true)"
+        resp2="$(panel_api_retry PATCH "/subscription-templates" "$content_payload" 2>/dev/null || true)"
+        if panel_api_success "$resp2"; then
+          ok "Шаблон подписки создан: $tname ($created_uuid)"
+        else
+          warn "Шаблон подписки создан без содержимого ($created_uuid): $(panel_api_error "$resp2")"
+          note "Вставьте $src вручную: Templates → $tname → XRAY_JSON"
+        fi
+      else
+        ok "Шаблон подписки создан: $tname"
+      fi
       return 0
     fi
   done
@@ -1357,14 +1467,21 @@ panel_auto_setup() {
   if [[ -z "${PANEL_CURL_CFG:-}" || ! -f "$PANEL_CURL_CFG" ]]; then
     panel_curl_cfg_init
   fi
+  # HTTP-код запросов живёт в PANEL_STATE_DIR. Каталог обязан существовать в
+  # родительской оболочке: panel_api вызывается через $(...) и созданный внутри
+  # подоболочки каталог потерялся бы вместе с кодом (та же ошибка, из-за которой
+  # «не удалось подключиться» появлялось при рабочем токене).
+  if [[ -z "${PANEL_STATE_DIR:-}" ]]; then
+    panel_state_init
+  fi
   # Нормализуем URL (убираем хвостовой слэш)
   REMNAWAVE_PANEL_URL="${REMNAWAVE_PANEL_URL%/}"
   log "Авто-настройка панели Remnawave через API ($REMNAWAVE_PANEL_URL)..."
 
   local profile_json="" profile_uuid="" profile_name=""
-  profile_name="multi-${BASE_DOMAIN:-auto}-$(date +%Y%m%d)"
-  # Ограничим имя 30 символов (лимит API)
-  profile_name="${profile_name:0:30}"
+  # API разрешает в имени только буквы, цифры, «_», «-» и пробелы: точки из
+  # домена недопустимы, поэтому имя санируется и ограничивается 30 символами.
+  profile_name="$(panel_profile_name)"
 
   if [[ -r "$NODE_DIR/Multiselect.json" ]]; then
     profile_json="$(cat "$NODE_DIR/Multiselect.json" 2>/dev/null || true)"
@@ -1374,17 +1491,23 @@ panel_auto_setup() {
     return 0
   fi
   # 1) Config Profile upsert
-  profile_uuid="$(panel_upsert_config_profile "$profile_name" "$profile_json" 2>/dev/null || true)"
-  # Если функция печатала ok/warn и вернула uuid в последней строке, достаём uuid
-  profile_uuid="$(printf '%s' "$profile_uuid" | tail -1 | tr -d '[:space:]')"
+  local profile_out="" profile_rc=0
+  profile_out="$(panel_upsert_config_profile "$profile_name" "$profile_json" 2>/dev/null)" \
+    || profile_rc=$?
+  profile_uuid="$(panel_result_uuid "$profile_out" "$profile_rc")"
+  # Вывод функции перехвачен ради uuid — при ошибке показываем его целиком,
+  # иначе причина («HTTP 403», «HTTP 500») пропадёт из лога.
+  if (( profile_rc != 0 )) && [[ -n "$profile_out" ]]; then
+    printf '%s\n' "$profile_out"
+  fi
+  # "(created)" — профиль создан, но API не вернул uuid: ищем по имени.
   if [[ -z "$profile_uuid" || "$profile_uuid" == "(created)" ]]; then
-    # Попробуем найти по имени если создание вернуло пустышку
     profile_uuid="$(panel_find_profile_by_name "$profile_name" || true)"
   fi
-  if [[ -z "$profile_uuid" || "$profile_uuid" == "(created)" ]]; then
+  if [[ -z "$profile_uuid" ]]; then
     warn "Не удалось определить UUID Config Profile — хосты/нода не будут созданы автоматически"
     note "Создайте вручную: Config Profiles → Create → вставьте $NODE_DIR/Multiselect.json"
-    return 0
+    return 1
   fi
   kv "Panel: Config Profile" "$profile_name ($profile_uuid)"
 
@@ -1410,44 +1533,74 @@ panel_auto_setup() {
     if [[ -n "$inbounds_csv" ]]; then inbounds_csv+=","; fi
     inbounds_csv+="${INBOUND_UUID_BY_TAG[$tag]}"
   done
-  local node_uuid=""
+  local node_uuid="" node_out="" node_rc=0 node_failed=0
   if [[ -n "$inbounds_csv" ]]; then
-    node_uuid="$(panel_upsert_node "$profile_uuid" "$inbounds_csv" 2>/dev/null | tail -1 || true)"
-    node_uuid="$(printf '%s' "$node_uuid" | tail -1 | tr -d '[:space:]')"
-    if [[ -n "$node_uuid" && "$node_uuid" != "(created)" ]]; then
+    node_out="$(panel_upsert_node "$profile_uuid" "$inbounds_csv" 2>/dev/null)" \
+      || node_rc=$?
+    node_uuid="$(panel_result_uuid "$node_out" "$node_rc")"
+    if (( node_rc != 0 )) && [[ -n "$node_out" ]]; then
+      printf '%s\n' "$node_out"
+    fi
+    if [[ "$node_uuid" == "(created)" ]]; then
+      # Нода создана, но uuid в ответе не пришёл — это не ошибка.
+      node_uuid=""
+    elif [[ -z "$node_uuid" ]]; then
+      node_failed=1
+    fi
+    if [[ -n "$node_uuid" ]]; then
       kv "Panel: Node" "$node_uuid ($SERVER_IP:$NODE_API_PORT)"
     fi
   fi
 
-  # 4) Хосты — по одному на каждый inbound
-  local host_count=0
+  # 4) Хосты — по одному на каждый inbound. Успех считаем по коду возврата:
+  # раньше ошибка глушилась в /dev/null, счётчик рос всегда, и установщик
+  # рапортовал «Хосты созданы», даже когда панель отвергла все запросы.
+  local host_count=0 host_failed=0
   # REALITY_VISION
   if [[ -n "${INBOUND_UUID_BY_TAG[REALITY_VISION]:-}" ]]; then
-    panel_upsert_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[REALITY_VISION]}" "VLESS Vision $PREFIX" "$VLESS_HOST" "443" '{"securityLayer":"REALITY","tag":"USA"}' >/dev/null 2>&1 || true
-    host_count=$((host_count+1))
+    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[REALITY_VISION]}" "VLESS Vision $PREFIX" "$VLESS_HOST" "443" '{"securityLayer":"REALITY","tags":["USA"]}'; then
+      host_count=$((host_count+1))
+    else
+      host_failed=$((host_failed+1))
+    fi
   fi
   if [[ -n "${INBOUND_UUID_BY_TAG[REALITY_XHTTP]:-}" && -n "$XHTTP_SNI" ]]; then
     local extra
-    extra="$(jq -n --arg sni "$XHTTP_SNI" --arg path "$XHTTP_PATH" '{securityLayer:"REALITY", tag:"USA", sni: $sni, path: $path}' 2>/dev/null || echo '{"securityLayer":"REALITY","tag":"USA"}')"
-    panel_upsert_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[REALITY_XHTTP]}" "VLESS XHTTP $PREFIX" "$VLESS_HOST" "443" "$extra" >/dev/null 2>&1 || true
-    host_count=$((host_count+1))
+    extra="$(jq -n --arg sni "$XHTTP_SNI" --arg path "$XHTTP_PATH" '{securityLayer:"REALITY", tags:["USA"], sni: $sni, path: $path}' 2>/dev/null || echo '{"securityLayer":"REALITY","tags":["USA"]}')"
+    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[REALITY_XHTTP]}" "VLESS XHTTP $PREFIX" "$VLESS_HOST" "443" "$extra"; then
+      host_count=$((host_count+1))
+    else
+      host_failed=$((host_failed+1))
+    fi
   fi
   if [[ -n "${INBOUND_UUID_BY_TAG[HYSTERIA2]:-}" ]]; then
-    panel_upsert_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[HYSTERIA2]}" "Hysteria2 $PREFIX" "$HY_HOST" "443" '{"securityLayer":"TLS","tag":"USA"}' >/dev/null 2>&1 || true
-    host_count=$((host_count+1))
+    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[HYSTERIA2]}" "Hysteria2 $PREFIX" "$HY_HOST" "443" '{"securityLayer":"TLS","tags":["USA"]}'; then
+      host_count=$((host_count+1))
+    else
+      host_failed=$((host_failed+1))
+    fi
   fi
   # CDN хосты
   if [[ -n "${INBOUND_UUID_BY_TAG[VLESS_CDN_WS]:-}" ]]; then
-    panel_upsert_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[VLESS_CDN_WS]}" "VLESS CDN WS $PREFIX" "$CDN_HOST" "443" '{"securityLayer":"TLS","tag":"USA","path":"'"${CDN_WS_PATH:-/api/v1/stream}"'"}' >/dev/null 2>&1 || true
-    host_count=$((host_count+1))
+    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[VLESS_CDN_WS]}" "VLESS CDN WS $PREFIX" "$CDN_HOST" "443" '{"securityLayer":"TLS","tags":["USA"],"path":"'"${CDN_WS_PATH:-/api/v1/stream}"'"}'; then
+      host_count=$((host_count+1))
+    else
+      host_failed=$((host_failed+1))
+    fi
   fi
   if [[ -n "${INBOUND_UUID_BY_TAG[VLESS_CDN_XHTTP]:-}" ]]; then
-    panel_upsert_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[VLESS_CDN_XHTTP]}" "VLESS CDN XHTTP $PREFIX" "$CDN_HOST" "443" '{"securityLayer":"TLS","tag":"USA","path":"'"${CDN_XHTTP_PATH:-/api/v3/sync/c1}"'"}' >/dev/null 2>&1 || true
-    host_count=$((host_count+1))
+    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[VLESS_CDN_XHTTP]}" "VLESS CDN XHTTP $PREFIX" "$CDN_HOST" "443" '{"securityLayer":"TLS","tags":["USA"],"path":"'"${CDN_XHTTP_PATH:-/api/v3/sync/c1}"'"}'; then
+      host_count=$((host_count+1))
+    else
+      host_failed=$((host_failed+1))
+    fi
   fi
   if [[ -n "${INBOUND_UUID_BY_TAG[VLESS_CDN_GRPC]:-}" ]]; then
-    panel_upsert_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[VLESS_CDN_GRPC]}" "VLESS CDN gRPC $PREFIX" "$CDN_HOST" "443" '{"securityLayer":"TLS","tag":"USA"}' >/dev/null 2>&1 || true
-    host_count=$((host_count+1))
+    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[VLESS_CDN_GRPC]}" "VLESS CDN gRPC $PREFIX" "$CDN_HOST" "443" '{"securityLayer":"TLS","tags":["USA"]}'; then
+      host_count=$((host_count+1))
+    else
+      host_failed=$((host_failed+1))
+    fi
   fi
   if (( host_count > 0 )); then
     ok "Хосты созданы/обновлены: $host_count шт. (проверьте Hosts в панели)"
@@ -1463,6 +1616,13 @@ panel_auto_setup() {
   # 6) Шаблон подписки
   panel_upsert_subscription_template "$XRAY_TEMPLATE_CHOICE" || true
 
+  if (( host_failed > 0 || node_failed )); then
+    local details=""
+    if (( node_failed )); then details="нода не создана/не обновлена"; fi
+    if (( host_failed > 0 )); then details="${details:+$details, }хостов с ошибкой: $host_failed"; fi
+    warn "Авто-настройка панели завершена с ошибками: $details — проверьте Hosts/Nodes в панели и права токена"
+    return 1
+  fi
   ok "Авто-настройка панели завершена: профиль=$profile_name, нода=$SERVER_IP:$NODE_API_PORT, хостов=$host_count"
   return 0
 }
@@ -1652,34 +1812,103 @@ ask_choice() {
 
 # ——— Remnawave Panel API: автоматическая настройка ———
 panel_curl_cfg_init() {
+  local token
+  # Токен — JWT/base64url без пробелов; случайно вставленный пробел или
+  # перевод строки в заголовке сделал бы его невалидным.
+  token="$(printf '%s' "${REMNAWAVE_API_TOKEN:-}" | tr -d '[:space:]')"
+  # Повторный ввод токена не должен оставлять прежний файл с секретом в /tmp.
+  if [[ -n "${PANEL_CURL_CFG:-}" && -f "${PANEL_CURL_CFG}" ]]; then
+    rm -f -- "$PANEL_CURL_CFG"
+  fi
   PANEL_CURL_CFG="$(mktemp)"
-  ( umask 077; printf 'header = "Authorization: Bearer %s"\n' "$REMNAWAVE_API_TOKEN" > "$PANEL_CURL_CFG" )
+  ( umask 077; printf 'header = "Authorization: Bearer %s"\n' "$token" > "$PANEL_CURL_CFG" )
+  panel_state_init
 }
 
-# panel_api делает запрос и сохраняет HTTP-код в PANEL_HTTP_CODE, тело — в stdout.
-# Успех определяется отдельно через panel_api_success (проверяет код 2xx + JSON success).
-PANEL_HTTP_CODE=""
+# panel_api вызывают из $(...), а переменные, выставленные в подоболочке, до
+# вызывающего не доходят. Поэтому HTTP-код и ошибку curl храним в файлах:
+# иначе panel_api_success всегда видел пустой код и ЛЮБОЙ ответ панели считал
+# ошибкой — даже 200 с валидным токеном («не удалось подключиться»).
 PANEL_HTTP_BODY=""
+PANEL_HTTP_CODE_FILE=""
+PANEL_HTTP_ERROR_FILE=""
+
+# Пути берутся из приватного каталога PANEL_STATE_DIR: его создаёт
+# родительская оболочка, а подоболочки $(...) наследуют путь. Поэтому HTTP-код,
+# записанный внутри panel_api, читается вызывающим.
+panel_http_code_file() {
+  if [[ -n "${PANEL_HTTP_CODE_FILE:-}" ]]; then
+    printf '%s' "$PANEL_HTTP_CODE_FILE"
+  elif [[ -n "${PANEL_STATE_DIR:-}" ]]; then
+    printf '%s' "$PANEL_STATE_DIR/code"
+  fi
+}
+
+panel_http_error_file() {
+  if [[ -n "${PANEL_HTTP_ERROR_FILE:-}" ]]; then
+    printf '%s' "$PANEL_HTTP_ERROR_FILE"
+  elif [[ -n "${PANEL_STATE_DIR:-}" ]]; then
+    printf '%s' "$PANEL_STATE_DIR/error"
+  fi
+}
+
+panel_state_init() {
+  # Приватный каталог создаётся в родительской оболочке (panel_curl_cfg_init),
+  # а подоболочки $(...) наследуют его путь: поэтому HTTP-код, записанный
+  # внутри panel_api, читается снаружи. Предсказуемых имён в /tmp нет —
+  # установщик работает от root, и symlink-атака исключена.
+  if [[ -z "${PANEL_STATE_DIR:-}" ]]; then
+    PANEL_STATE_DIR="$(mktemp -d)"
+  fi
+  PANEL_HTTP_CODE_FILE="${PANEL_HTTP_CODE_FILE:-$PANEL_STATE_DIR/code}"
+  PANEL_HTTP_ERROR_FILE="${PANEL_HTTP_ERROR_FILE:-$PANEL_STATE_DIR/error}"
+  ( umask 077; : > "$PANEL_HTTP_CODE_FILE"; : > "$PANEL_HTTP_ERROR_FILE" )
+}
+
+panel_api_code() {
+  local code="" code_file
+  code_file="$(panel_http_code_file)"
+  if [[ -r "$code_file" ]]; then
+    code="$(tr -d '[:space:]' < "$code_file" 2>/dev/null || true)"
+  fi
+  [[ "$code" =~ ^[0-9]{3}$ ]] || code="000"
+  printf '%s' "$code"
+}
+
+# Тело ответа — в stdout, HTTP-код — в PANEL_HTTP_CODE_FILE,
+# ошибка транспорта curl — в PANEL_HTTP_ERROR_FILE.
 panel_api() {
   local method="$1" path="$2" body="${3:-}"
   local url="${REMNAWAVE_PANEL_URL%/}/api$path"
   local -a args=(-sS --max-time 20 -X "$method" -K "$PANEL_CURL_CFG" -H "Content-Type: application/json" -w "\n%{http_code}")
   if [[ -n "$body" ]]; then args+=(-d "$body"); fi
-  local raw
-  raw="$(curl "${args[@]}" "$url" 2>/dev/null || true)"
+  panel_state_init
+  local raw rc code err_file err_text
+  err_file="$(mktemp)"
+  # Присваивание в условии: иначе set -e завершит установщик на сетевой
+  # ошибке curl раньше, чем мы сохраним её текст для пользователя.
+  if raw="$(curl "${args[@]}" "$url" 2>"$err_file")"; then rc=0; else rc=$?; fi
+  err_text="$(tr '\n' ' ' < "$err_file" 2>/dev/null | cut -c1-300 || true)"
+  rm -f "$err_file"
   # Последняя строка — HTTP код, остальное — тело
-  PANEL_HTTP_CODE="${raw##*$'\n'}"
-  PANEL_HTTP_BODY="${raw%$'\n'*}"
-  if ! [[ "$PANEL_HTTP_CODE" =~ ^[0-9]{3}$ ]]; then
-    PANEL_HTTP_CODE="000"
-    PANEL_HTTP_BODY="$raw"
+  code="${raw##*$'\n'}"
+  if [[ "$code" =~ ^[0-9]{3}$ ]]; then
+    raw="${raw%$'\n'*}"
+  else
+    code="000"
   fi
-  printf '%s' "$PANEL_HTTP_BODY"
+  # Ненулевой код возврата curl означает, что HTTP-ответа не было вовсе
+  # (DNS, TLS, таймаут): даже «000» от -w в этом случае не доверяем.
+  if (( rc != 0 )); then code="000"; fi
+  printf '%s' "$code" > "$(panel_http_code_file)"
+  printf '%s' "$err_text" > "$(panel_http_error_file)"
+  PANEL_HTTP_BODY="$raw"
+  printf '%s' "$raw"
 }
 
 panel_api_success() {
   # Код должен быть 2xx и JSON без errors
-  if ! [[ "${PANEL_HTTP_CODE:-000}" =~ ^2[0-9]{2}$ ]]; then return 1; fi
+  if ! [[ "$(panel_api_code)" =~ ^2[0-9]{2}$ ]]; then return 1; fi
   # Успешный ответ панели содержит либо response, либо success:true, и не содержит ошибок
   local body="${1:-$PANEL_HTTP_BODY}"
   if jq -e '.success == false' >/dev/null 2>&1 <<<"$body"; then return 1; fi
@@ -1688,39 +1917,119 @@ panel_api_success() {
 }
 
 panel_api_error() {
-  local msg body="${1:-$PANEL_HTTP_BODY}"
-  # Пробуем достать человекочитаемую ошибку
+  local msg code api_code body="${1:-$PANEL_HTTP_BODY}" error_file=""
+  code="$(panel_api_code)"
+  if [[ "$code" == "000" ]]; then
+    error_file="$(panel_http_error_file)"
+    if [[ -n "$error_file" && -r "$error_file" ]]; then
+      msg="$(tr -s '[:space:]' ' ' < "$error_file" 2>/dev/null | cut -c1-240 || true)"
+    fi
+    if [[ -n "${msg// /}" ]]; then
+      printf 'нет соединения: %s' "$msg"
+    else
+      printf 'нет соединения с панелью (проверьте домен, DNS/TLS и доступность)'
+    fi
+    return 0
+  fi
+  if grep -qi '<html\|<!doctype' <<<"$body"; then
+    printf 'панель вернула HTML вместо JSON (HTTP %s) — вероятно, Cloudflare/WAF или страница входа' "$code"
+    return 0
+  fi
+  # Пробуем достать человекочитаемую ошибку (Remnawave 3.x: message + code)
   msg="$(jq -r '.message // .error // .errors[0].message // .errors[0] // empty' <<<"$body" 2>/dev/null)"
+  api_code="$(jq -r 'if (.code|type)=="string" or (.code|type)=="number" then .code else empty end' <<<"$body" 2>/dev/null)"
   if [[ -n "$msg" && "$msg" != "null" ]]; then
-    if [[ "${PANEL_HTTP_CODE:-}" != "200" && -n "$PANEL_HTTP_CODE" ]]; then
-      printf '%s (HTTP %s)' "$msg" "$PANEL_HTTP_CODE"
+    if [[ -n "$api_code" && "$api_code" != "null" ]]; then
+      printf '%s (код %s, HTTP %s)' "$msg" "$api_code" "$code"
     else
-      printf '%s' "$msg"
+      printf '%s (HTTP %s)' "$msg" "$code"
     fi
+  elif [[ "$code" =~ ^2[0-9]{2}$ ]]; then
+    printf 'ответ панели не похож на ожидаемый JSON (HTTP %s)' "$code"
   else
-    if [[ -n "${PANEL_HTTP_CODE:-}" && "$PANEL_HTTP_CODE" != "200" ]]; then
-      printf 'неизвестная ошибка Panel API (HTTP %s)' "$PANEL_HTTP_CODE"
-    else
-      printf 'неизвестная ошибка Panel API'
-    fi
+    printf 'неизвестная ошибка Panel API (HTTP %s)' "$code"
   fi
 }
 
+# Причина неудачной проверки — для понятной подсказки в мастере.
+PANEL_CONN_REASON=""
+PANEL_CONN_DETAIL=""
+PANEL_CONN_CODE=""
+
 panel_check_connection() {
-  local resp
-  resp="$(panel_api GET "/config-profiles")" || return 1
-  if panel_api_success "$resp"; then return 0; fi
-  # Фолбэк: если профили недоступны, проверим ноды
-  resp="$(panel_api GET "/nodes")" || return 1
-  panel_api_success "$resp"
+  local resource resp code denied=""
+  PANEL_CONN_REASON=""; PANEL_CONN_DETAIL=""; PANEL_CONN_CODE=""
+  # Проверяем чтение всех разделов, которые нужны автонастройке: токен может
+  # иметь право на профили, но не на хосты/сквады — лучше узнать это сразу.
+  for resource in config-profiles nodes hosts internal-squads; do
+    resp="$(panel_api GET "/$resource")"
+    code="$(panel_api_code)"
+    if panel_api_success "$resp"; then continue; fi
+    # HTML вместо JSON — это не API панели, а прокси/страница входа: права
+    # токена тут ни при чём, поэтому 403/401 от Cloudflare не путаем с API.
+    if grep -qi '<html\|<!doctype' <<<"$resp"; then
+      PANEL_CONN_CODE="$code"
+      PANEL_CONN_DETAIL="$(panel_api_error "$resp")"
+      PANEL_CONN_REASON="not-json"
+      return 1
+    fi
+    if [[ "$code" == "403" ]]; then
+      denied+="${denied:+, }$resource"
+      continue
+    fi
+    PANEL_CONN_CODE="$code"
+    PANEL_CONN_DETAIL="$(panel_api_error "$resp")"
+    case "$code" in
+      000) PANEL_CONN_REASON="network" ;;
+      401) PANEL_CONN_REASON="unauthorized" ;;
+      404) PANEL_CONN_REASON="not-found" ;;
+      5[0-9][0-9]) PANEL_CONN_REASON="server" ;;
+      4[0-9][0-9]) PANEL_CONN_REASON="bad-request" ;;
+      *)   PANEL_CONN_REASON="not-json" ;;
+    esac
+    return 1
+  done
+  if [[ -n "$denied" ]]; then
+    PANEL_CONN_REASON="scope"
+    PANEL_CONN_CODE="403"
+    PANEL_CONN_DETAIL="нет доступа на чтение: $denied"
+    return 1
+  fi
+  return 0
 }
 
-# Повтор с бэкофом для сетевых сбоев панели (001/000/5xx)
+# Человеческое объяснение к PANEL_CONN_REASON: 401 — токен, 403 — права,
+# 404 — адрес, 000 — сеть, 2xx без JSON — Cloudflare/страница входа.
+panel_connection_hint() {
+  local reason="${PANEL_CONN_REASON:-}" detail="${PANEL_CONN_DETAIL:-}"
+  case "$reason" in
+    network)
+      detail="${detail#нет соединения: }"
+      printf 'Нет соединения с %s: %s. Проверьте домен, DNS, сертификат и доступность панели с этого сервера.' \
+        "${REMNAWAVE_PANEL_URL:-панелью}" "$detail" ;;
+    unauthorized)
+      printf 'Панель доступна, но токен отклонён (HTTP 401): %s. Создайте новый токен в Settings → API Tokens; SECRET_KEY ноды и пароль администратора не подходят.' "$detail" ;;
+    scope)
+      printf 'Панель доступна, но токену не хватает прав (HTTP 403): %s. Нужны чтение И запись для config-profiles, nodes, hosts, internal-squads (например, config-profiles:*, nodes:*, hosts:*, internal-squads:*).' "$detail" ;;
+    not-found)
+      printf 'По адресу %s нет API панели (HTTP 404): %s. Укажите корень панели без пути: https://panel.example.com (порт — если он нестандартный).' "${REMNAWAVE_PANEL_URL:-?}" "$detail" ;;
+    server)
+      printf 'Панель ответила ошибкой сервера (HTTP %s): %s. Проверьте, что панель запущена, и её логи.' "${PANEL_CONN_CODE:-5xx}" "$detail" ;;
+    not-json)
+      printf 'Панель ответила HTTP %s, но это не JSON API: %s. Обычно так отвечает Cloudflare Access, страница входа или неверный домен.' "${PANEL_CONN_CODE:-?}" "$detail" ;;
+    bad-request)
+      printf 'Панель отклонила запрос (HTTP %s): %s.' "${PANEL_CONN_CODE:-?}" "$detail" ;;
+    *)
+      printf 'Проверка панели не удалась: %s' "$detail" ;;
+  esac
+}
+
+# Повтор с бэкофом для сетевых сбоев панели (000/5xx/429)
 panel_api_retry() {
   local tries=3 delay=5 n=1 resp code
   while :; do
     resp="$(panel_api "$@" || true)"
-    code="${PANEL_HTTP_CODE:-000}"
+    code="$(panel_api_code)"
     if panel_api_success "$resp"; then
       printf '%s' "$resp"
       return 0
@@ -1734,7 +2043,9 @@ panel_api_retry() {
       printf '%s' "$resp"
       return 1
     fi
-    warn "Panel API $1 $2 → HTTP $code, повтор $n/$tries через ${delay}s"
+    # Предупреждение — в stderr: тело ответа, которое вернёт функция, должно
+    # оставаться чистым JSON, даже когда её вызывают через $(...).
+    warn "Panel API $1 $2 → HTTP $code, повтор $n/$tries через ${delay}s" >&2
     sleep "$delay"
     n=$((n+1))
     delay=$((delay*2))
@@ -1793,6 +2104,9 @@ on_exit() {
   fi
   if [[ -n "${PANEL_CURL_CFG:-}" && -f "$PANEL_CURL_CFG" ]]; then
     rm -f -- "$PANEL_CURL_CFG"
+  fi
+  if [[ -n "${PANEL_STATE_DIR:-}" && -d "$PANEL_STATE_DIR" ]]; then
+    rm -rf -- "$PANEL_STATE_DIR"
   fi
   # При сбое сборка не доходит до штатной очистки: убираем тулчейн и кэши здесь,
   # чтобы неудачная попытка не оставляла сотни МБ на диске. Пакеты apt не трогаем.
@@ -1879,9 +2193,12 @@ if [[ -f "$ENV_STORE" ]]; then
   if confirm "Найден $ENV_STORE. Загрузить сохранённые переменные?" "y"; then
     # ENV_STORE — намеренно настраиваемый путь.
     # shellcheck disable=SC1090
-    source "$ENV_STORE" || warn "Не удалось прочитать $ENV_STORE — продолжаю без него."
-    ENV_STORE_LOADED=1
-    ok "Переменные загружены из $ENV_STORE"
+    if source "$ENV_STORE"; then
+      ENV_STORE_LOADED=1
+      ok "Переменные загружены из $ENV_STORE"
+    else
+      warn "Не удалось прочитать $ENV_STORE — продолжаю без него."
+    fi
   fi
 fi
 # Нормализуем флаги из ENV_STORE (там y/n, логика ожидает 0/1). Повторный запуск
@@ -2233,11 +2550,13 @@ else
   ask_bool REMNAWAVE_AUTO_SETUP "Настроить панель автоматически через Remnawave API?" "${REMNAWAVE_AUTO_SETUP:-n}"
 fi
 if (( REMNAWAVE_AUTO_SETUP )); then
-  note "Домен панели пишите полным URL — с https:// в начале, без слэша и пути в конце:"
-  note "правильно: https://panel.example.com — если введёте просто panel.example.com,"
-  note "установщик сам добавит https://. Неправильно: panel.example.com/login, https://panel.example.com/"
-  note "API-токен создаётся в панели: Settings → API Tokens (права config-profiles:write,"
-  note "nodes:write, hosts:write, internal-squads:write)."
+  note "Домен панели пишите полным URL — с https:// в начале. Слэш в конце можно:"
+  note "https://panel.example.com/ установщик сам приведёт к https://panel.example.com."
+  note "Путь в конце не нужен: panel.example.com/login — ошибка. Без схемы тоже можно —"
+  note "https:// добавится автоматически."
+  note "API-токен создаётся в панели: Settings → API Tokens. Нужны права на ЧТЕНИЕ и запись:"
+  note "config-profiles, nodes, hosts, internal-squads (проще всего выдать config-profiles:*,"
+  note "nodes:*, hosts:*, internal-squads:* или полный доступ *)."
   ask REMNAWAVE_PANEL_URL "Домен панели (URL, напр. https://panel.example.com)" "${REMNAWAVE_PANEL_URL:-}"
   while :; do
     __normalized_panel_url="$(normalize_panel_url "$REMNAWAVE_PANEL_URL")" || __normalized_panel_url=""
@@ -2249,7 +2568,7 @@ if (( REMNAWAVE_AUTO_SETUP )); then
       warn "Некорректный URL панели — нужен адрес вида https://panel.example.com без пути."
       ask REMNAWAVE_PANEL_URL "Введите домен панели ещё раз" ""
     else
-      die "Некорректный домен панели «$REMNAWAVE_PANEL_URL»: нужен URL вида https://panel.example.com (https:// можно не писать — добавится сам, а вот путь и слэш в конце не нужны)."
+      die "Некорректный домен панели «$REMNAWAVE_PANEL_URL»: нужен URL вида https://panel.example.com (https:// можно не писать — добавится сам; слэш в конце допустим, а путь — нет)."
     fi
   done
   ok "URL панели: $REMNAWAVE_PANEL_URL"
@@ -2262,8 +2581,8 @@ if (( REMNAWAVE_AUTO_SETUP )); then
     ok "Панель доступна и токен валиден — авто-настройка будет выполнена после установки ноды"
   elif [[ "${QUICK_SETUP:-0}" == 1 && "$NONINTERACTIVE" != 1 ]] && has_tty; then
     while :; do
-      warn "Не удалось подключиться к панели или токен невалиден. Проверьте домен и права токена."
-      warn "Нужны права: nodes:write, config-profiles:write, hosts:write."
+      warn "Не удалось проверить панель:"
+      note "$(panel_connection_hint)"
       [[ -n "${PANEL_CURL_CFG:-}" ]] && rm -f "$PANEL_CURL_CFG"
       PANEL_CURL_CFG=""
       ask REMNAWAVE_PANEL_URL "Введите домен панели ещё раз" "$REMNAWAVE_PANEL_URL"
@@ -2281,8 +2600,8 @@ if (( REMNAWAVE_AUTO_SETUP )); then
       fi
     done
   else
-    warn "Не удалось подключиться к панели или токен невалиден — авто-настройка может не сработать."
-    warn "Проверьте URL и права токена (нужны: nodes:write, config-profiles:write, hosts:write)."
+    warn "Не удалось проверить панель — авто-настройка может не сработать."
+    note "$(panel_connection_hint)"
     if ! confirm "Продолжить установку несмотря на ошибку соединения?" "n"; then
       die "Отменено: исправьте URL/токен панели."
     fi
