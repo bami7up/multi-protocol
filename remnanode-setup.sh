@@ -1113,6 +1113,23 @@ panel_result_uuid() {
   printf '%s' "$out" | tail -1 | tr -d '[:space:]'
 }
 
+# panel_fetch_node_secret — получить SECRET_KEY ноды через Remnawave Panel API (GET /keygen).
+# В Remnawave 3.x поле называется secretKey, в старых 2.x — pubKey.
+# Возвращает чистый base64 ключ или пустую строку при ошибке.
+panel_fetch_node_secret() {
+  local resp key
+  resp="$(panel_api GET "/keygen" 2>/dev/null || true)"
+  if panel_api_success "$resp"; then
+    key="$(jq -r '.response.secretKey // .response.pubKey // .data.secretKey // .data.pubKey // .secretKey // .pubKey // empty' <<<"$resp" 2>/dev/null || true)"
+    key="$(printf '%s' "$key" | tr -d '[:space:]')"
+    if [[ -n "$key" && "$key" != "null" ]]; then
+      printf '%s' "$key"
+      return 0
+    fi
+  fi
+  return 1
+}
+
 # Обёртка для panel_upsert_host: в успешном случае молчим (функция печатает
 # uuid в stdout — в консоли он не нужен), при ошибке показываем диагностику
 # целиком и возвращаем ненулевой код, чтобы вызывающий её посчитал.
@@ -2010,7 +2027,7 @@ panel_connection_hint() {
     unauthorized)
       printf 'Панель доступна, но токен отклонён (HTTP 401): %s. Создайте новый токен в Settings → API Tokens; SECRET_KEY ноды и пароль администратора не подходят.' "$detail" ;;
     scope)
-      printf 'Панель доступна, но токену не хватает прав (HTTP 403): %s. Нужны чтение И запись для config-profiles, nodes, hosts, internal-squads (например, config-profiles:*, nodes:*, hosts:*, internal-squads:*).' "$detail" ;;
+      printf 'Панель доступна, но токену не хватает прав (HTTP 403): %s. Нужны чтение И запись для config-profiles, nodes, hosts, internal-squads (например, config-profiles:*, nodes:*, hosts:*, internal-squads:*, keygen:*).' "$detail" ;;
     not-found)
       printf 'По адресу %s нет API панели (HTTP 404): %s. Укажите корень панели без пути: https://panel.example.com (порт — если он нестандартный).' "${REMNAWAVE_PANEL_URL:-?}" "$detail" ;;
     server)
@@ -2555,8 +2572,8 @@ if (( REMNAWAVE_AUTO_SETUP )); then
   note "Путь в конце не нужен: panel.example.com/login — ошибка. Без схемы тоже можно —"
   note "https:// добавится автоматически."
   note "API-токен создаётся в панели: Settings → API Tokens. Нужны права на ЧТЕНИЕ и запись:"
-  note "config-profiles, nodes, hosts, internal-squads (проще всего выдать config-profiles:*,"
-  note "nodes:*, hosts:*, internal-squads:* или полный доступ *)."
+  note "config-profiles, nodes, hosts, internal-squads, keygen (проще всего выдать"
+  note "config-profiles:*, nodes:*, hosts:*, internal-squads:*, keygen:* или полный доступ *)."
   ask REMNAWAVE_PANEL_URL "Домен панели (URL, напр. https://panel.example.com)" "${REMNAWAVE_PANEL_URL:-}"
   while :; do
     __normalized_panel_url="$(normalize_panel_url "$REMNAWAVE_PANEL_URL")" || __normalized_panel_url=""
@@ -3408,15 +3425,32 @@ fi
 step 9 "Нода Remnawave (compose)"
 mkdir -p "$NODE_DIR"
 echo
-note "Создайте ноду в панели (Nodes -> Add) с IP $SERVER_IP и портом $NODE_API_PORT."
-if (( REMNAWAVE_AUTO_SETUP )); then
-  note "Профиль, хосты и шаблон подписки установщик привяжет сам через API после запуска ноды —"
-  note "вручную в панели нужна только сама нода (адрес и порт выше)."
+
+AUTO_SECRET_KEY=""
+if (( REMNAWAVE_AUTO_SETUP )) && [[ -z "${SECRET_KEY:-}" ]]; then
+  note "Получение SECRET_KEY ноды из Remnawave Panel API (GET /keygen)..."
+  panel_curl_cfg_init
+  AUTO_SECRET_KEY="$(panel_fetch_node_secret 2>/dev/null || true)"
+  if [[ -n "$AUTO_SECRET_KEY" ]]; then
+    ok "SECRET_KEY ноды получен автоматически через Panel API"
+  else
+    warn "Не удалось автоматически получить SECRET_KEY через Panel API (проверьте права токена на keygen)."
+  fi
 fi
-note "Панель выдаст SECRET_KEY (публичный ключ ноды). Вставьте его целиком."
-note "Можно как чистое значение (eyJ...), так и строку 'SECRET_KEY=...'."
-echo
-ask_secret SECRET_RAW "SECRET_KEY из панели" "${SECRET_KEY:-}"
+
+if [[ -n "$AUTO_SECRET_KEY" ]]; then
+  SECRET_RAW="$AUTO_SECRET_KEY"
+else
+  note "Создайте ноду в панели (Nodes -> Add) с IP $SERVER_IP и портом $NODE_API_PORT."
+  if (( REMNAWAVE_AUTO_SETUP )); then
+    note "Профиль, хосты и шаблон подписки установщик привяжет сам через API после запуска ноды —"
+    note "вручную в панели нужна только сама нода (адрес и порт выше)."
+  fi
+  note "Панель выдаст SECRET_KEY (публичный ключ ноды). Вставьте его целиком."
+  note "Можно как чистое значение (eyJ...), так и строку 'SECRET_KEY=...'."
+  echo
+  ask_secret SECRET_RAW "SECRET_KEY из панели" "${SECRET_KEY:-}"
+fi
 
 SECRET_VALUE="$SECRET_RAW"
 SECRET_VALUE="${SECRET_VALUE#SECRET_KEY=}"
