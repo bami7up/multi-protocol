@@ -501,4 +501,16 @@ jobs:
             fail "в panel_auto_setup вернулся невалидный securityLayer=REALITY (HTTP 400 в Remnawave 3.x)"
           fi
 
+          # 52. Шаблон подписки XRAY_JSON критичен для балансировки скрытых хостов:
+          #     проверка соединения обязана проверять subscription-templates,
+          #     подсказывать право subscription-template:*, а panel_auto_setup —
+          #     не игнорировать отказ создания шаблона через || true.
+          grep -q 'for resource in .*subscription-templates' remnanode-setup.sh \
+            || fail "panel_check_connection не проверяет доступ к subscription-templates"
+          grep -qF 'subscription-template:*' remnanode-setup.sh \
+            || fail "в подсказках прав токена не указано subscription-template:*"
+          if grep -q 'panel_upsert_subscription_template .*|| true' remnanode-setup.sh; then
+            fail "ошибка создания XRAY шаблона снова игнорируется через || true"
+          fi
+
           echo "✔ инварианты переменных окружения на месте"

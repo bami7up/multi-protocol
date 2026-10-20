@@ -40,7 +40,7 @@ Caddy L4 на `443/tcp` раскладывает соединения по SNI, 
 
 1. **Домен в Cloudflare** (например `example.com`), NS зоны — на Cloudflare.
 2. **Cloudflare API Token** с правами `Zone:Zone:Read` + `Zone:DNS:Edit` на вашу зону. Создаётся: Cloudflare → My Profile → API Tokens → Create Token (привяжите к конкретной зоне, не глобальный ключ). **Куда:** понадобится установщику для A-записей и DNS-01 сертификата CDN. **Зачем:** без токена нельзя автоматически завести DNS.
-3. **Remnawave Panel 3.x** и её **API токен**: Panel → Settings → API Tokens → Create. Нужны права на **чтение и запись** для `config-profiles`, `nodes`, `hosts`, `internal-squads` — проще всего выдать `config-profiles:*`, `nodes:*`, `hosts:*`, `internal-squads:*` (или полный доступ `*`). Только `:write` недостаточно: проверка соединения и поиск существующих объектов читают эти разделы, и панель ответит `403`. **Куда:** панель. **Зачем:** чтобы установщик мог создать профиль без вашего участия. Можно пропустить — тогда сделаете руками по [ручной инструкции](#-ручная-установка-пошагово).
+3. **Remnawave Panel 3.x** и её **API токен**: Panel → Settings → API Tokens → Create. Проще всего выдать **полный доступ `*`**, либо права на **чтение и запись**: `config-profiles:*`, `nodes:*`, `hosts:*`, `internal-squads:*`, **`subscription-template:*`**, `keygen:*`. Обратите внимание: без `subscription-template:*` не создастся `XRAY_JSON` шаблон балансировки скрытых хостов, а только `:write` недостаточно — проверка соединения и поиск существующих объектов читают эти разделы (`GET`), иначе панель ответит `403`. **Куда:** панель. **Зачем:** чтобы установщик полностью создал профиль, ноду, шаблон XRAY и хосты без ручных действий. Можно пропустить — тогда сделаете руками по [ручной инструкции](#-ручная-установка-пошагово).
 4. **Сервер ноды:** Debian 11/12 или Ubuntu 20.04+, `amd64`/`arm64`, root, 1 ГБ RAM, 3 ГБ диска, публичный IPv4.
 
 ### Запуск
@@ -92,7 +92,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/
 
 **Блок 4/4 — Панель Remnawave:**
 - `IP панели` и `Порт ноды` (обычно `2222`) — нужны для UFW (открыть `NODE_PORT` только с IP панели). **Куда:** firewall ноды.
-- `Настроить панель автоматически через Remnawave API?` — `y`/`n`. При `y` — `URL панели` (`https://panel.example.com`, слэш в конце допустим) и `API токен` (скрытый ввод). Нужны права на **чтение и запись**: `config-profiles`, `nodes`, `hosts`, `internal-squads`, `keygen` (например, `config-profiles:*`, `nodes:*`, `hosts:*`, `internal-squads:*`, `keygen:*` или полный доступ `*`). Мастер проверит соединение и на шаге 9 полностью настроит панель: создаст/обновит Config Profile, ноду, шаблон подписки, скрытые рабочие и видимый хосты и Internal Squad, получит `SECRET_KEY` и запустит ноду.
+- `Настроить панель автоматически через Remnawave API?` — `y`/`n`. При `y` — `URL панели` (`https://panel.example.com`, слэш в конце допустим) и `API токен` (скрытый ввод). Нужны права на **чтение и запись**: `config-profiles`, `nodes`, `hosts`, `internal-squads`, **`subscription-template`**, `keygen` (проще всего полный доступ `*` или `config-profiles:*`, `nodes:*`, `hosts:*`, `internal-squads:*`, `subscription-template:*`, `keygen:*`). Мастер проверит соединение (включая `subscription-templates`) и на шаге 9 полностью настроит панель: создаст/обновит Config Profile, ноду, шаблон подписки XRAY, скрытые рабочие и видимый хосты и Internal Squad, получит `SECRET_KEY` и запустит ноду.
 
 После блоков мастер покажет сводку (`SERVER_IP`, `VLESS`, `HYSTERIA2`, `SELF_STEAL`, `Фасад`, `XHTTP`, `CDN`, `DNS`, `Авто-панель`) и спросит `Всё верно, продолжаем?`.
 
@@ -563,7 +563,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/
 | Нет 301 на `:80` | Caddyfile, UFW, `curl` | 301 обязателен |
 | IPv6 панель | `IPV6=yes` в `/etc/default/ufw` | иначе правило не сработает |
 | Панель: «не удалось проверить» / HTTP 401 | токен из Settings → API Tokens (не `SECRET_KEY` ноды и не пароль) | 401 — токен неверный, просрочен или удалён |
-| Панель: HTTP 403 | права токена: чтение **и** запись для `config-profiles`, `nodes`, `hosts`, `internal-squads`, плюс `keygen` для авто-получения `SECRET_KEY` | `:write` без `:read` не даёт читать список; проще выдать `config-profiles:*`, `nodes:*`, `hosts:*`, `internal-squads:*`, `keygen:*` или `*` |
+| Панель: HTTP 403 | права токена: чтение **и** запись для `config-profiles`, `nodes`, `hosts`, `internal-squads`, **`subscription-template`**, плюс `keygen` для авто-получения `SECRET_KEY` | `:write` без `:read` не даёт читать список; проще выдать `*` или `config-profiles:*`, `nodes:*`, `hosts:*`, `internal-squads:*`, `subscription-template:*`, `keygen:*` |
 | Панель: HTTP 404 | URL — корень панели без пути: `https://panel.example.com` | `/api` установщик добавляет сам |
 | Панель: HTML вместо JSON | Cloudflare Access/страница входа перед панелью | API недоступен без обхода Access |
 | Панель: нет соединения (`000`) | DNS/сертификат/доступность домена с сервера ноды | проверьте `curl -I https://panel.example.com` |

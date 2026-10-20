@@ -1028,11 +1028,12 @@ ok "normalize_node_image и docker-compose.yml: голый образ latest и�
 ok "write_config_profile: валидные X25519 ключи REALITY генерируются и сохраняются при повторе"
 
 # --- Полный цикл panel_auto_setup против строгого мока Remnawave 3.x API ------
-for fn in panel_node_slug panel_node_name panel_canonical_inbound_tag \
+for fn in write_xray_template panel_node_slug panel_node_name panel_canonical_inbound_tag \
           panel_prepare_profile_for_api panel_get_inbounds panel_find_node_by_address \
           panel_find_host_by_remark panel_upsert_host \
           panel_upsert_config_profile panel_upsert_node panel_trigger_node_start \
-          panel_upsert_internal_squad panel_upsert_subscription_template panel_auto_setup; do
+          panel_upsert_internal_squad panel_find_subscription_template_uuid \
+          panel_upsert_subscription_template panel_auto_setup; do
   sed -n "/^${fn}() {\$/,/^}\$/p" "$SETUP" > "$WORK/$fn.sh"
   grep -q "^${fn}() {" "$WORK/$fn.sh" || fail "не удалось извлечь $fn"
   # shellcheck source=/dev/null
@@ -1244,21 +1245,68 @@ JS
   [[ "$(jq '.profiles | length' "$DB")" == "1" ]] || fail "повторный запуск продублировал Config Profile"
   [[ "$(jq '.hosts | length' "$DB")" == "5" ]] || fail "повторный запуск продублировал хосты"
 
-  # 3. Вторая нода в ту же панель (проверка обхода @@unique([tag]) и слияния Default-Squad)
+  # 3. Вторая нода + большой split-шаблон (>30 КБ, проверка буфера mawk + write_xray_template)
   NODE_DIR="$WORK/auto-node2"
   VLESS_HOST="amber-falcon.example.com"
   SELF_STEAL_HOST="amber-falcon.example.com"
   HY_HOST="silver-birch.example.com"
   SERVER_IP="198.51.100.42"
   NODE_API_PORT=41234
+  XRAY_TEMPLATE_CHOICE="split"
   write_config_profile >/dev/null
-  cp "$SRC/Xray_template.json" "$NODE_DIR/Xray_template.json"
-  panel_auto_setup >/dev/null || fail "установка второй ноды в ту же панель упала на коллизии тегов"
+  # Намеренно не копируем Xray_template.json вручную: panel_upsert_subscription_template
+  # обязан вызвать write_xray_template сам, распарсить 32 КБ JSON5 и привязать к хосту.
+  panel_auto_setup >/dev/null || fail "установка второй ноды со split-шаблоном упала"
   [[ "$(jq '.nodes | length' "$DB")" == "2" ]] || fail "вторая нода не создана в панели"
+  [[ "$(jq '[.templates[] | select(.name == "XRAY split" and (.templateJson.remnawave != null))] | length' "$DB")" == "1" ]] \
+    || fail "шаблон XRAY split не создан или не загружен в templateJson"
   [[ "$(jq '.squads[0].inbounds | length' "$DB")" == "8" ]] \
     || fail "Internal Squad затёр inbound'ы первой ноды вместо объединения: $(jq '.squads[0].inbounds | length' "$DB")"
+
+  # 4. Отказ 403 на /subscription-templates (нет права subscription-template:*):
+  #    panel_check_connection обязан ловить его на шаге 1, а panel_auto_setup —
+  #    возвращать ненулевой код и называть subscription-template:*, а не молчать.
+  # shellcheck disable=SC2317,SC2329
+  panel_api() {
+    if [[ "$2" == /subscription-templates* || "$2" == /templates* ]]; then
+      printf '403' > "$(panel_http_code_file)"
+      printf '%s' '{"message":"Forbidden resource","code":"A040"}'
+      return 1
+    fi
+    printf '200' > "$(panel_http_code_file)"
+    printf '%s' '{"response":{"total":0,"configProfiles":[],"internalSquads":[],"nodes":[],"hosts":[]}}'
+    return 0
+  }
+  if panel_check_connection; then
+    fail "panel_check_connection пропустил отсутствие доступа к subscription-templates"
+  fi
+  [[ "$PANEL_CONN_REASON" == "scope" && "$PANEL_CONN_DETAIL" == *"subscription-templates"* ]] \
+    || fail "panel_check_connection не указал subscription-templates: $PANEL_CONN_REASON / $PANEL_CONN_DETAIL"
+  [[ "$(panel_connection_hint)" == *"subscription-template:*"* ]] \
+    || fail "panel_connection_hint не подсказывает право subscription-template:*"
+  # shellcheck disable=SC2317,SC2329
+  warn() { printf '▲ %s\n' "$*"; }
+  # shellcheck disable=SC2317,SC2329
+  note() { printf '   %s\n' "$*"; }
+  out_403=""
+  if out_403="$(panel_upsert_subscription_template "standard" 2>&1)"; then
+    fail "panel_upsert_subscription_template вернул 0 при HTTP 403"
+  fi
+  [[ "$out_403" == *"subscription-template:*"* ]] \
+    || fail "ошибка создания шаблона не подсказывает право subscription-template:*: $out_403"
 )
-ok "panel_auto_setup: Remnawave 3.x (создание ноды, ключи REALITY, хосты, шаблон, squad, рестарт и мульти-нода)"
+ok "panel_auto_setup: Remnawave 3.x (создание ноды, ключи REALITY, хосты, XRAY шаблон, squad, рестарт и 403 диагностика)"
+
+# Проверка буфера mawk (>8192 байт с висячими запятыми в json5_to_json)
+big_json5="$(awk 'BEGIN {
+  printf "{\n  // comment\n  \"pad\": \"";
+  for (i = 0; i < 12000; i++) printf "x";
+  printf "\",\n  \"items\": [1, 2, ],\n}\n";
+}')"
+big_parsed="$(json5_to_json <<<"$big_json5" | jq -r '.items | length')" \
+  || fail "json5_to_json упал на файле >8192 байт с висячими запятыми (лимит sprintf в mawk)"
+[[ "$big_parsed" == "2" ]] || fail "json5_to_json повредил большой JSON5 ($big_parsed)"
+ok "json5_to_json: шаблоны >8 КБ с комментариями и висячими запятыми не режутся в mawk"
 
 # --- Порядок шага 9: сначала нода в панели, затем SECRET_KEY и Docker --------
 step9="$(awk '/^step 9 /{flag=1} /^step 10 /{flag=0} flag' "$SETUP")"
