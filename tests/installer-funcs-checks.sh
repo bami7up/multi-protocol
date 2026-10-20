@@ -391,12 +391,22 @@ cf_setup_cdn_host
 unset CF_MODE_SETTING
 ok "cf_setup_cdn_host: --no-cloudflare не трогает Cloudflare API"
 
-# Мастер обязан предлагать CDN-домен сам (Enter — cdn.<базовый домен>),
-# а не требовать выдумывать его с пустым дефолтом.
-# shellcheck disable=SC2016 # ищем литеральный фрагмент кода установщика, подстановка не нужна
-grep -qF 'cdn.${BASE_DOMAIN' "$SETUP" \
-  || fail "мастер не предлагает CDN-домен по умолчанию (cdn.<базовый домен>)"
-ok "CDN_HOST: по умолчанию предлагается cdn.<BASE_DOMAIN>"
+# Мастер обязан предлагать уникальный CDN-домен для каждой ноды сам
+# (cdn-<6 hex>.<базовый домен> — без коллизии между несколькими нодами на домене).
+sed -n '/^gen_cdn_host() {$/,/^}$/p' "$SETUP" > "$WORK/gen_cdn_host.sh"
+grep -q '^gen_cdn_host() {' "$WORK/gen_cdn_host.sh" || fail "не найдена функция gen_cdn_host"
+# shellcheck source=/dev/null
+. "$WORK/gen_cdn_host.sh"
+cdn_gen_1="$(gen_cdn_host "example.com")"
+cdn_gen_2="$(gen_cdn_host "example.com")"
+[[ "$cdn_gen_1" =~ ^cdn-[0-9a-f]{6}\.example\.com$ ]] \
+  || fail "gen_cdn_host вернул неожиданный формат: $cdn_gen_1"
+[[ "$cdn_gen_1" != "$cdn_gen_2" ]] \
+  || fail "gen_cdn_host сгенерировал одинаковый домен дважды подряд: $cdn_gen_1"
+# shellcheck disable=SC2016
+grep -qF 'gen_cdn_host "${BASE_DOMAIN:-}"' "$SETUP" \
+  || fail "мастер не предлагает уникальный CDN-домен через gen_cdn_host"
+ok "CDN_HOST: по умолчанию генерируется уникальный cdn-<hex6>.<BASE_DOMAIN> на каждую ноду"
 
 # --- Быстрый режим: нормализация вводов и случайные значения ---------------
 # Домен и URL панели люди вставляют «как из браузера»: со схемой, слэшем в
@@ -1028,7 +1038,7 @@ ok "normalize_node_image и docker-compose.yml: голый образ latest и�
 ok "write_config_profile: валидные X25519 ключи REALITY генерируются и сохраняются при повторе"
 
 # --- Полный цикл panel_auto_setup против строгого мока Remnawave 3.x API ------
-for fn in write_xray_template panel_node_slug panel_node_name panel_canonical_inbound_tag \
+for fn in write_xray_template panel_node_slug panel_node_tag panel_node_name panel_canonical_inbound_tag \
           panel_prepare_profile_for_api panel_get_inbounds panel_find_node_by_address \
           panel_find_host_by_remark panel_upsert_host \
           panel_upsert_config_profile panel_upsert_node panel_trigger_node_start \
@@ -1230,6 +1240,12 @@ JS
   [[ "$(jq '.nodes | length' "$DB")" == "1" ]] || fail "ожидалась 1 созданная нода"
   [[ "$(jq '.hosts | length' "$DB")" == "5" ]] || fail "ожидалось 5 хостов (4 скрытых + 1 видимый), получено $(jq '.hosts | length' "$DB")"
   [[ "$(jq '[.hosts[] | select(.isHidden == true)] | length' "$DB")" == "4" ]] || fail "ожидалось 4 скрытых хоста"
+  [[ "$(jq '[.hosts[] | select(.isHidden == true and .tags == ["QUIET_OTTER"])] | length' "$DB")" == "4" ]] \
+    || fail "скрытые хосты Node 1 должны иметь уникальный тег QUIET_OTTER, а не общий USA: $(jq -c '[.hosts[].tags]' "$DB")"
+  [[ "$(jq '[.hosts[] | select((.tags // []) | index("USA"))] | length' "$DB")" == "0" ]] \
+    || fail "остался захардкоженный тег USA у хостов"
+  [[ "$(jq '[.templates[] | select(.name == "XRAY standard quiet-otter" and .templateJson.routing.balancers[0].tag == "QUIET_OTTER" and .templateJson.remnawave.injectHosts[0].selector.pattern == "^QUIET_OTTER$")] | length' "$DB")" == "1" ]] \
+    || fail "шаблон XRAY standard quiet-otter не переписал тег балансировки под QUIET_OTTER"
   [[ "$(jq '[.hosts[] | select(.isHidden == false and (.xrayJsonTemplateUuid != null))] | length' "$DB")" == "1" ]] \
     || fail "видимый виртуальный хост не связан с XRAY_JSON шаблоном"
   [[ "$(jq '.squads[0].inbounds | length' "$DB")" == "4" ]] || fail "Default-Squad не создан с 4 inbound'ами"
@@ -1250,6 +1266,7 @@ JS
   VLESS_HOST="amber-falcon.example.com"
   SELF_STEAL_HOST="amber-falcon.example.com"
   HY_HOST="silver-birch.example.com"
+  CDN_HOST="cdn-99aa11.example.com"
   SERVER_IP="198.51.100.42"
   NODE_API_PORT=41234
   XRAY_TEMPLATE_CHOICE="split"
@@ -1258,8 +1275,12 @@ JS
   # обязан вызвать write_xray_template сам, распарсить 32 КБ JSON5 и привязать к хосту.
   panel_auto_setup >/dev/null || fail "установка второй ноды со split-шаблоном упала"
   [[ "$(jq '.nodes | length' "$DB")" == "2" ]] || fail "вторая нода не создана в панели"
-  [[ "$(jq '[.templates[] | select(.name == "XRAY split" and (.templateJson.remnawave != null))] | length' "$DB")" == "1" ]] \
-    || fail "шаблон XRAY split не создан или не загружен в templateJson"
+  [[ "$(jq '[.hosts[] | select(.isHidden == true and .tags == ["AMBER_FALCON"])] | length' "$DB")" == "4" ]] \
+    || fail "скрытые хосты второй ноды не получили изолированный тег AMBER_FALCON"
+  [[ "$(jq '[.templates[] | select(.name == "XRAY split amber-falcon" and .templateJson.routing.balancers[0].tag == "AMBER_FALCON" and .templateJson.remnawave.injectHosts[0].selector.pattern == "^AMBER_FALCON$")] | length' "$DB")" == "1" ]] \
+    || fail "шаблон XRAY split amber-falcon не создан с тегом AMBER_FALCON"
+  [[ "$(jq '[.hosts[] | select(.isHidden == false) | .xrayJsonTemplateUuid] | unique | length' "$DB")" == "2" ]] \
+    || fail "видимые хосты разных нод должны ссылаться на собственные XRAY_JSON шаблоны"
   [[ "$(jq '.squads[0].inbounds | length' "$DB")" == "8" ]] \
     || fail "Internal Squad затёр inbound'ы первой ноды вместо объединения: $(jq '.squads[0].inbounds | length' "$DB")"
 

@@ -513,4 +513,18 @@ jobs:
             fail "ошибка создания XRAY шаблона снова игнорируется через || true"
           fi
 
+          # 53. Мульти-нода и быстрый режим:
+          #     - у каждой ноды собственный тег балансировки panel_node_tag() вместо захардкоженного USA;
+          #     - у каждой ноды уникальный CDN-домен gen_cdn_host() (cdn-<hex6>.<домен>);
+          #     - выбор XRAY шаблона (standard / split) предлагается и в быстром режиме.
+          grep -q '^panel_node_tag() {' remnanode-setup.sh \
+            || fail "нет функции panel_node_tag() для уникального тега ноды"
+          grep -q '^gen_cdn_host() {' remnanode-setup.sh \
+            || fail "нет функции gen_cdn_host() для уникального CDN-домена ноды"
+          if grep -q 'tags:\["USA"\]' remnanode-setup.sh; then
+            fail "в remnanode-setup.sh вернулся захардкоженный тег USA у хостов"
+          fi
+          grep -q '^ask_choice XRAY_TEMPLATE_CHOICE ' remnanode-setup.sh \
+            || fail "выбор шаблона XRAY_TEMPLATE_CHOICE снова спрятан от быстрого режима"
+
           echo "✔ инварианты переменных окружения на месте"

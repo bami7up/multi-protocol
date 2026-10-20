@@ -183,6 +183,10 @@ while [[ $# -gt 0 ]]; do
       XRAY_TEMPLATE_CHOICE="${2:-}"
       [[ -n "$XRAY_TEMPLATE_CHOICE" ]] || { echo "--xray-template требует значение (standard или split)" >&2; exit 2; }
       shift ;;
+    --node-tag)
+      NODE_TAG="${2:-}"
+      [[ -n "$NODE_TAG" ]] || { echo "--node-tag требует значение (например NL1)" >&2; exit 2; }
+      shift ;;
     --panel-url)
       REMNAWAVE_PANEL_URL="${2:-}"
       [[ -n "$REMNAWAVE_PANEL_URL" ]] || { echo "--panel-url требует значение" >&2; exit 2; }
@@ -516,6 +520,18 @@ gen_random_api_path() {
   local prefix="${1:-/api/v3/sync}" suffix
   suffix="$(random_hex 8)" || return 1
   printf '%s/%s' "$prefix" "$suffix"
+}
+
+# Уникальный CDN-поддомен для каждой ноды: cdn-<6 hex>.<базовый домен>.
+# Поддомен первого уровня (*.example.com) покрывается бесплатным Universal SSL
+# Cloudflare (в отличие от <rand>.cdn.example.com, требующего платный ACM) и не
+# конфликтует при размещении нескольких нод на одном базовом домене.
+gen_cdn_host() {
+  local base="${1:-${BASE_DOMAIN:-}}" suffix=""
+  [[ -n "$base" ]] || return 1
+  suffix="$(random_hex 6 2>/dev/null || true)"
+  [[ -n "$suffix" ]] || suffix="node01"
+  printf 'cdn-%s.%s' "$suffix" "$base"
 }
 
 # Случайный порт Node API для быстрого режима: диапазон 11000–59999 не
@@ -1160,12 +1176,24 @@ write_xray_template() {
   fi
   mkdir -p "$NODE_DIR"
   if [[ -s "$src" ]]; then
-    install -m 644 "$src" "$out"
-    rm -f "${tmp2:-}" 2>/dev/null || true
-    if [[ "$choice" == "split" ]]; then
-      ok "Шаблон подписки сохранён: $out (split-routing — только часть трафика через VPN)"
+    local xtag=""
+    if declare -F panel_node_tag >/dev/null 2>&1; then
+      xtag="$(panel_node_tag)"
     else
-      ok "Шаблон подписки сохранён: $out (standard — весь трафик через VPN)"
+      xtag="$(printf '%s' "${VLESS_HOST%%.*}" | tr 'a-z-' 'A-Z_' | tr -cd 'A-Z0-9_:')"
+      [[ -n "$xtag" ]] || xtag="NODE"
+    fi
+    sed \
+      -e "s/\"balancerTag\": \"USA\"/\"balancerTag\": \"$xtag\"/g" \
+      -e "s/\"tag\": \"USA\"/\"tag\": \"$xtag\"/g" \
+      -e "s/\"pattern\": \"\\^USA\\$\"/\"pattern\": \"^${xtag}\$\"/g" \
+      "$src" > "$out.tmp"
+    install -m 644 "$out.tmp" "$out"
+    rm -f "$out.tmp" "${tmp2:-}" 2>/dev/null || true
+    if [[ "$choice" == "split" ]]; then
+      ok "Шаблон подписки сохранён: $out (split-routing, тег $xtag)"
+    else
+      ok "Шаблон подписки сохранён: $out (standard — весь трафик через VPN, тег $xtag)"
     fi
   fi
   return 0
@@ -1183,6 +1211,22 @@ panel_node_slug() {
   raw="${raw//[^A-Za-z0-9_-]/_}"
   raw="${raw#_}"; raw="${raw%_}"
   [[ -n "$raw" ]] || raw="node"
+  printf '%s' "$raw"
+}
+
+# Уникальный тег балансировки скрытых хостов этой ноды (формат Remnawave 3.x:
+# ^[A-Z0-9_:]{1,36}$). У каждой ноды свой тег и свой XRAY_JSON шаблон, чтобы
+# подписка не смешивала хосты разных нод под общим тегом «USA».
+panel_node_tag() {
+  local raw="${NODE_TAG:-}"
+  if [[ -z "$raw" ]]; then
+    raw="$(panel_node_slug)"
+  fi
+  raw="$(printf '%s' "$raw" | tr 'a-z-' 'A-Z_' | tr -cd 'A-Z0-9_:')"
+  while [[ "$raw" == _* ]]; do raw="${raw#_}"; done
+  while [[ "$raw" == *_ ]]; do raw="${raw%_}"; done
+  raw="${raw:0:32}"
+  [[ -n "$raw" ]] || raw="NODE"
   printf '%s' "$raw"
 }
 
@@ -1745,12 +1789,14 @@ panel_find_subscription_template_uuid() {
 panel_upsert_subscription_template() {
   local choice="$1"
   local src="$NODE_DIR/Xray_template.json"
-  local tname
+  local tname node_slug node_tag
   PANEL_TEMPLATE_UUID=""
+  node_slug="$(panel_node_slug)"
+  node_tag="$(panel_node_tag)"
   if [[ "${choice,,}" == "split" ]]; then
-    tname="XRAY split"
+    tname="XRAY split ${node_slug}"
   else
-    tname="XRAY standard"
+    tname="XRAY standard ${node_slug}"
   fi
   if [[ ! -r "$src" ]] && declare -F write_xray_template >/dev/null 2>&1; then
     write_xray_template || true
@@ -1760,7 +1806,11 @@ panel_upsert_subscription_template() {
     return 1
   fi
   local content
-  content="$(json5_to_json < "$src" 2>/dev/null | jq -c . 2>/dev/null || true)"
+  content="$(json5_to_json < "$src" 2>/dev/null | jq -c --arg tag "$node_tag" '
+    (.routing.rules[]? | select(.balancerTag == "USA") | .balancerTag) = $tag
+    | (.routing.balancers[]? | select(.tag == "USA") | .tag) = $tag
+    | (.remnawave.injectHosts[]? | select(.selector.pattern == "^USA$") | .selector.pattern) = ("^" + $tag + "$")
+  ' 2>/dev/null || true)"
   if [[ -z "$content" || "$content" == "null" ]]; then
     warn "Шаблон подписки $src не является корректным JSON — загрузите вручную: Templates → XRAY_JSON"
     return 1
@@ -1934,15 +1984,16 @@ panel_auto_setup() {
   local template_failed=0
   panel_upsert_subscription_template "$XRAY_TEMPLATE_CHOICE" || template_failed=1
 
-  # 5) Хосты — скрытые рабочие (tags=["USA"], isHidden=true для балансировщика
-  # Xray_template.json) + видимая оболочка подписки. В Remnawave 3.x допустимы
+  # 5) Хосты — скрытые рабочие (tags=[<node_tag>], isHidden=true для балансировщика
+  # Xray_template.json этой ноды) + видимая оболочка подписки. В Remnawave 3.x допустимы
   # только securityLayer: DEFAULT | TLS | NONE («REALITY» вызывает HTTP 400).
-  local host_count=0 host_failed=0 host_label="$PREFIX" extra
+  local host_count=0 host_failed=0 host_label="$PREFIX" node_tag extra
+  node_tag="$(panel_node_tag)"
   if (( CF_MODE )) && [[ -n "${VLESS_HOST:-}" ]]; then
     host_label="${VLESS_HOST%%.*}"
   fi
   if [[ -n "${INBOUND_UUID_BY_TAG[REALITY_VISION]:-}" ]]; then
-    extra="$(jq -n -c --arg sni "$SELF_STEAL_HOST" '{securityLayer:"DEFAULT", sni:$sni, fingerprint:"chrome", tags:["USA"], isHidden:true}')"
+    extra="$(jq -n -c --arg sni "$SELF_STEAL_HOST" --arg tag "$node_tag" '{securityLayer:"DEFAULT", sni:$sni, fingerprint:"chrome", tags:[$tag], isHidden:true}')"
     if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[REALITY_VISION]}" "VLESS Vision $host_label" "$VLESS_HOST" "443" "$extra"; then
       host_count=$((host_count+1))
     else
@@ -1950,7 +2001,7 @@ panel_auto_setup() {
     fi
   fi
   if [[ -n "${INBOUND_UUID_BY_TAG[REALITY_XHTTP]:-}" && -n "$XHTTP_SNI" ]]; then
-    extra="$(jq -n -c --arg sni "$XHTTP_SNI" --arg path "$XHTTP_PATH" '{securityLayer:"DEFAULT", sni:$sni, path:$path, fingerprint:"chrome", tags:["USA"], isHidden:true}')"
+    extra="$(jq -n -c --arg sni "$XHTTP_SNI" --arg path "$XHTTP_PATH" --arg tag "$node_tag" '{securityLayer:"DEFAULT", sni:$sni, path:$path, fingerprint:"chrome", tags:[$tag], isHidden:true}')"
     if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[REALITY_XHTTP]}" "VLESS XHTTP $host_label" "$VLESS_HOST" "443" "$extra"; then
       host_count=$((host_count+1))
     else
@@ -1958,7 +2009,7 @@ panel_auto_setup() {
     fi
   fi
   if [[ -n "${INBOUND_UUID_BY_TAG[HYSTERIA2]:-}" ]]; then
-    extra="$(jq -n -c --arg sni "$HY_HOST" '{securityLayer:"DEFAULT", sni:$sni, alpn:"h3", tags:["USA"], isHidden:true}')"
+    extra="$(jq -n -c --arg sni "$HY_HOST" --arg tag "$node_tag" '{securityLayer:"DEFAULT", sni:$sni, alpn:"h3", tags:[$tag], isHidden:true}')"
     if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[HYSTERIA2]}" "Hysteria2 $host_label" "$HY_HOST" "443" "$extra"; then
       host_count=$((host_count+1))
     else
@@ -1967,7 +2018,7 @@ panel_auto_setup() {
   fi
   # CDN хосты (внешний TLS терминирует CDN → securityLayer="TLS")
   if [[ -n "${INBOUND_UUID_BY_TAG[VLESS_CDN_WS]:-}" ]]; then
-    extra="$(jq -n -c --arg host "$CDN_HOST" --arg path "${CDN_WS_PATH:-/api/v1/stream}" '{securityLayer:"TLS", sni:$host, host:$host, path:$path, fingerprint:"chrome", tags:["USA"], isHidden:true}')"
+    extra="$(jq -n -c --arg host "$CDN_HOST" --arg path "${CDN_WS_PATH:-/api/v1/stream}" --arg tag "$node_tag" '{securityLayer:"TLS", sni:$host, host:$host, path:$path, fingerprint:"chrome", tags:[$tag], isHidden:true}')"
     if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[VLESS_CDN_WS]}" "VLESS CDN WS $host_label" "$CDN_HOST" "443" "$extra"; then
       host_count=$((host_count+1))
     else
@@ -1975,7 +2026,7 @@ panel_auto_setup() {
     fi
   fi
   if [[ -n "${INBOUND_UUID_BY_TAG[VLESS_CDN_XHTTP]:-}" ]]; then
-    extra="$(jq -n -c --arg host "$CDN_HOST" --arg path "${CDN_XHTTP_PATH:-/api/v3/sync/c1}" '{securityLayer:"TLS", sni:$host, host:$host, path:$path, fingerprint:"chrome", tags:["USA"], isHidden:true}')"
+    extra="$(jq -n -c --arg host "$CDN_HOST" --arg path "${CDN_XHTTP_PATH:-/api/v3/sync/c1}" --arg tag "$node_tag" '{securityLayer:"TLS", sni:$host, host:$host, path:$path, fingerprint:"chrome", tags:[$tag], isHidden:true}')"
     if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[VLESS_CDN_XHTTP]}" "VLESS CDN XHTTP $host_label" "$CDN_HOST" "443" "$extra"; then
       host_count=$((host_count+1))
     else
@@ -1983,7 +2034,7 @@ panel_auto_setup() {
     fi
   fi
   if [[ -n "${INBOUND_UUID_BY_TAG[VLESS_CDN_GRPC]:-}" ]]; then
-    extra="$(jq -n -c --arg host "$CDN_HOST" --arg path "${CDN_GRPC_PATH:-/api/v4/stream}" '{securityLayer:"TLS", sni:$host, alpn:"h2", path:$path, fingerprint:"chrome", tags:["USA"], isHidden:true}')"
+    extra="$(jq -n -c --arg host "$CDN_HOST" --arg path "${CDN_GRPC_PATH:-/api/v4/stream}" --arg tag "$node_tag" '{securityLayer:"TLS", sni:$host, alpn:"h2", path:$path, fingerprint:"chrome", tags:[$tag], isHidden:true}')"
     if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[VLESS_CDN_GRPC]}" "VLESS CDN gRPC $host_label" "$CDN_HOST" "443" "$extra"; then
       host_count=$((host_count+1))
     else
@@ -2817,15 +2868,13 @@ else
   ok "Используется кастомный фасад: $SELF_STEAL_TEMPLATE_URL"
 fi
 
-# Выбор шаблона подписки — full vs split. В быстром режиме не спрашиваем:
-# берётся сохранённый выбор, а на свежей установке — standard (весь трафик).
+# Выбор шаблона подписки — full vs split (предлагаем и в быстром, и в расширенном режиме;
+# в --non-interactive ask_choice сам выбирает дефолт без ожидания ввода).
 __default_tpl_num=1
 if [[ "${XRAY_TEMPLATE_CHOICE,,}" == "split" ]]; then __default_tpl_num=2; fi
-if (( ! QUICK_SETUP )); then
-  ask_choice XRAY_TEMPLATE_CHOICE "Выберите шаблон подписки для клиентов" "$__default_tpl_num" \
-    "standard: Весь трафик через VPN (рекомендуется для обхода блокировок)" \
-    "split: Только RU/частные сети через VPN, остальное напрямую (экономия трафика)"
-fi
+ask_choice XRAY_TEMPLATE_CHOICE "Выберите шаблон подписки для клиентов" "$__default_tpl_num" \
+  "standard: Весь трафик через VPN (рекомендуется для обхода блокировок)" \
+  "split: Только часть сайтов/сервисов через VPN, остальное напрямую (split-routing)"
 # Нормализуем к стандартным значениям
 case "${XRAY_TEMPLATE_CHOICE,,}" in
   split|2) XRAY_TEMPLATE_CHOICE="split" ;;
@@ -2850,7 +2899,9 @@ fi
 # === flags block start ===
 # Быстрый режим (QUICK_SETUP=1): XHTTP и CDN включены без вопросов; SNI —
 # проверенный дефолт, пути на свежей установке — случайные, CDN-домен —
-# cdn.<базовый домен>. Значения из env/сохранённого env-файла не затираются.
+# уникальный cdn-<hex>.<базовый домен> (поддомен 1-го уровня для бесплатного
+# Cloudflare Universal SSL, без коллизии между несколькими нодами на домене).
+# Значения из env/сохранённого env-файла не затираются.
 if [[ "${QUICK_SETUP:-0}" == 1 ]]; then
   ENABLE_XHTTP=1
 else
@@ -2882,14 +2933,24 @@ if (( ENABLE_CDN )); then
   note "Публичный TLS терминирует CDN, между CDN и нодой — сертификат origin (DNS-01 через Cloudflare)."
   note "Проксируемую A-запись для CDN-домена установщик создаст сам в Cloudflare (оранжевое облако) —"
   note "вручную её создавать не нужно. Исключение — запуск с --no-cloudflare: тогда запись делаете вы."
+  if [[ -z "${CDN_HOST:-}" ]]; then
+    if declare -F gen_cdn_host >/dev/null 2>&1; then
+      __cdn_default="$(gen_cdn_host "${BASE_DOMAIN:-}" 2>/dev/null || printf 'cdn.%s' "${BASE_DOMAIN:-}")"
+    else
+      __cdn_default="cdn-$(od -An -N3 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n').${BASE_DOMAIN:-}"
+    fi
+  else
+    __cdn_default="$CDN_HOST"
+  fi
   if [[ "${QUICK_SETUP:-0}" == 1 ]]; then
-    CDN_HOST="${CDN_HOST:-cdn.${BASE_DOMAIN:-}}"
+    CDN_HOST="$__cdn_default"
     CDN_TRANSPORT="${CDN_TRANSPORT:-ws}"
     note "CDN: включён автоматически (домен $CDN_HOST, транспорт ${CDN_TRANSPORT,,})"
   else
-    ask CDN_HOST "Домен, проксируемый CDN (A-запись под оранжевым облаком)" "${CDN_HOST:-cdn.${BASE_DOMAIN:-}}"
+    ask CDN_HOST "Домен, проксируемый CDN (A-запись под оранжевым облаком)" "$__cdn_default"
     ask CDN_TRANSPORT "Транспорт CDN: ws, xhttp, grpc, both (ws+xhttp) или all" "${CDN_TRANSPORT:-ws}"
   fi
+  unset __cdn_default
   CDN_TRANSPORT="${CDN_TRANSPORT,,}"
   case "$CDN_TRANSPORT" in
     ws|xhttp|grpc|both|all) ;;
@@ -3197,6 +3258,7 @@ fi
     printf 'export PANEL_IP=%q\n' "${PANEL_IP:-}"
     printf 'export NODE_API_PORT=%q\n' "${NODE_API_PORT:-2222}"
     # Новые интерактивные ответы — сохраняем для идемпотентного повторного запуска
+    printf 'export NODE_TAG=%q\n' "$(panel_node_tag)"
     printf 'export SELF_STEAL_TEMPLATE=%q\n' "${SELF_STEAL_TEMPLATE:-vaultdrop}"
     if [[ -n "${SELF_STEAL_TEMPLATE_URL:-}" ]]; then
       printf 'export SELF_STEAL_TEMPLATE_URL=%q\n' "$SELF_STEAL_TEMPLATE_URL"
@@ -4178,6 +4240,7 @@ if (( SELF_STEAL_THEME_USED )); then
   kv "Тема фасада"    "$SELF_STEAL_TEMPLATE"
 fi
 kv "Config Profile" "$NODE_DIR/Multiselect.json  (вставьте в панели → Config Profiles)"
+kv "Шаблон XRAY"    "$NODE_DIR/Xray_template.json  ($XRAY_TEMPLATE_CHOICE, тег $(panel_node_tag))"
 kv "Лог установки"   "$LOG_FILE"
 kv "Логи ноды"       "docker logs remnanode --tail 120"
 kv "Логи Xray"      "docker exec -it remnanode tail -n +1 -f /var/log/xray/current"
