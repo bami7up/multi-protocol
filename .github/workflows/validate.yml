@@ -485,4 +485,20 @@ jobs:
             fail "ошибки создания хостов снова глушатся в /dev/null"
           fi
 
+          # 50. Образ ноды всегда содержит репозиторий (remnawave/node:latest),
+          #     а не голый тег «latest», который вызывает pull access denied.
+          grep -q '^normalize_node_image() {' remnanode-setup.sh \
+            || fail "нет normalize_node_image (голый тег в NODE_IMAGE сломает docker compose pull)"
+          grep -qF 'NODE_IMAGE="${NODE_IMAGE:-remnawave/node:latest}"' remnanode-setup.sh \
+            || fail "дефолт NODE_IMAGE не remnawave/node:latest"
+          if grep -qF 'image: ${NODE_IMAGE:-latest}' remnanode-setup.sh; then
+            fail "в docker-compose.yml вернулся голый образ latest без репозитория"
+          fi
+
+          # 51. В Remnawave 3.x securityLayer допускает только DEFAULT | TLS | NONE;
+          #     «REALITY» отклоняется валидатором с HTTP 400.
+          if grep -q '"securityLayer"[[:space:]]*:[[:space:]]*"REALITY"' remnanode-setup.sh; then
+            fail "в panel_auto_setup вернулся невалидный securityLayer=REALITY (HTTP 400 в Remnawave 3.x)"
+          fi
+
           echo "✔ инварианты переменных окружения на месте"
