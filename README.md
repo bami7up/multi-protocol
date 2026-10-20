@@ -69,7 +69,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/
   4. `API токен панели` (скрытый ввод) — соединение сразу проверяется. Длина токена (например, 228 символов у JWT) роли не играет; важен только выданный набор прав.
   5. `IP сервера панели` для firewall — обычно уже подставлен автоматически (определяется по домену панели), остаётся нажать Enter. Если панель за Cloudflare-прокси, мастер предупредит: нужен реальный IP сервера, а не IP Cloudflare.
 
-  Автоматически и без вопросов: XHTTP включён (SNI `www.gstatic.com`), пути транспортов XHTTP/CDN — случайные, CDN включён (`cdn.<домен>`, транспорт `ws`, запись создаёт сам установщик), тема фасада на свежей установке — случайная из пяти, шаблон подписки — `standard`, **порт ноды — случайный** из диапазона 11000–59999 (показывается в сводке и сохраняется; повторный запуск порт, пути и тему не меняет). `SECRET_KEY` ноды установщик получает сам через API панели (`GET /keygen`), а затем связывает ноду, хосты и шаблон подписки — без ручного ввода ключа.
+  Автоматически и без вопросов: XHTTP включён (SNI `www.gstatic.com`), пути транспортов XHTTP/CDN — случайные, CDN включён (`cdn.<домен>`, транспорт `ws`, запись создаёт сам установщик), тема фасада на свежей установке — случайная из пяти, шаблон подписки — `standard`, **порт ноды — случайный** из диапазона 11000–59999 (показывается в сводке и сохраняется; повторный запуск порт, пути и тему не меняет). На шаге 9 установщик сначала создаёт в панели Config Profile (с автоматически сгенерированными X25519 ключами REALITY), саму ноду, шаблон подписки, скрытые рабочие и видимый виртуальный хосты и Internal Squad, затем получает `SECRET_KEY` через `GET /keygen`, запускает `remnawave/node:latest` и сразу синхронизирует Xray.
 - **Расширенная настройка** — прежние 4 блока с полным ручным контролем (ниже). Нужна, если нет Cloudflare, поддомены создаёте вручную или хотите свои пути/транспорт CDN/шаблон `split`.
 
 **Расширенный режим — 4 блока:**
@@ -92,7 +92,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/
 
 **Блок 4/4 — Панель Remnawave:**
 - `IP панели` и `Порт ноды` (обычно `2222`) — нужны для UFW (открыть `NODE_PORT` только с IP панели). **Куда:** firewall ноды.
-- `Настроить панель автоматически через Remnawave API?` — `y`/`n`. При `y` — `URL панели` (`https://panel.example.com`, слэш в конце допустим) и `API токен` (скрытый ввод). Нужны права на **чтение и запись**: `config-profiles`, `nodes`, `hosts`, `internal-squads` (например, `config-profiles:*`, `nodes:*`, `hosts:*`, `internal-squads:*`). Мастер проверит соединение и после установки ноды полностью настроит панель: создаст/обновит Config Profile, ноду, хосты, squad и шаблон подписки.
+- `Настроить панель автоматически через Remnawave API?` — `y`/`n`. При `y` — `URL панели` (`https://panel.example.com`, слэш в конце допустим) и `API токен` (скрытый ввод). Нужны права на **чтение и запись**: `config-profiles`, `nodes`, `hosts`, `internal-squads`, `keygen` (например, `config-profiles:*`, `nodes:*`, `hosts:*`, `internal-squads:*`, `keygen:*` или полный доступ `*`). Мастер проверит соединение и на шаге 9 полностью настроит панель: создаст/обновит Config Profile, ноду, шаблон подписки, скрытые рабочие и видимый хосты и Internal Squad, получит `SECRET_KEY` и запустит ноду.
 
 После блоков мастер покажет сводку (`SERVER_IP`, `VLESS`, `HYSTERIA2`, `SELF_STEAL`, `Фасад`, `XHTTP`, `CDN`, `DNS`, `Авто-панель`) и спросит `Всё верно, продолжаем?`.
 
@@ -106,7 +106,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/
 - `Caddyfile` с L4-маршрутами и локальными сайтами `127.0.0.1:9443` (self-steal) и `127.0.0.1:9444` (CDN).
 - `docker-compose.yml` в `/opt/remnanode` и ноду `remnanode` (host network).
 - `Multiselect.json` и `Xray_template.json` в `/opt/remnanode`.
-- **В панели (при авто-режиме):** Config Profile (`multi-example.com-YYYYMMDD`), нода (`node-usa-example.com` → `SERVER_IP:<порт ноды>`; в быстром режиме порт случайный и показывается в сводке мастера, в расширенном по умолчанию `2222`), хосты по каждому inbound (Vision/XHTTP/Hysteria2/CDN, `Hide ON`, `Tag USA`, `Port 443`), Internal Squad с включёнными inbound'ами, шаблон подписки. Нода сразу `Online` — без ручных шагов 1–8. Повторный запуск обновляет существующие объекты, не дублируя.
+- **В панели (при авто-режиме):** Config Profile (`multi-<нода>-<домен>` с X25519 ключами REALITY), нода (`node-<хост>` → `SERVER_IP:<порт ноды>`; в быстром режиме порт случайный и показывается в сводке мастера, в расширенном по умолчанию `2222`), скрытые рабочие хосты по каждому inbound (`Hide ON`, `Tag USA`, `Port 443`) + видимый виртуальный хост подписки с привязанным `XRAY_JSON` шаблоном, Internal Squad с включёнными inbound'ами. Нода сразу `Online` — без ручных шагов 1–8. Повторный запуск обновляет существующие объекты и сохраняет ключи REALITY, не дублируя профили и хосты.
 
 Ручной режим: проверьте `Online` в **Nodes → Management** и продолжите с [шага 5 ручной инструкции](#шаг-5-создайте-рабочие-хосты) (хосты, virtual host, squad, клиент). В авто-режиме эти шаги уже выполнены — проверьте хосты и выдайте подписку пользователю.
 
@@ -127,13 +127,12 @@ PANEL_IP=203.0.113.10 NODE_API_PORT=2222 SECRET_KEY='eyJ...' \
 bash remnanode-setup.sh --non-interactive --yes --cloudflare
 ```
 
-Тот же быстрый режим без вопросов (`--quick`): нужны только домен, токены и панель — пути, CDN-домен и поддомены выберутся автоматически (`PANEL_IP` можно не задавать, если домен панели резолвится в её реальный IP). `NODE_API_PORT` здесь зафиксирован тем портом, с которым нода уже создана в панели ради `SECRET_KEY`; без него порт сгенерируется случайно и сохранится для повторных запусков:
+Тот же быстрый режим без вопросов (`--quick`): нужны только домен, токены и панель — поддомены, CDN-домен, пути, порт ноды, сама нода в панели и её `SECRET_KEY` создаются/получаются автоматически (`PANEL_IP` можно не задавать, если домен панели резолвится в её реальный IP):
 
 ```bash
 BASE_DOMAIN=example.com \
 CLOUDFLARE_API_TOKEN=xxxx \
 REMNAWAVE_PANEL_URL=https://panel.example.com REMNAWAVE_API_TOKEN=xxxx \
-NODE_API_PORT=2222 SECRET_KEY='eyJ...' \
 bash remnanode-setup.sh --quick --non-interactive --yes
 ```
 
@@ -502,7 +501,7 @@ PANEL_IP=203.0.113.10 NODE_API_PORT=2222 SECRET_KEY='eyJ...' \
 bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/remnanode-setup.sh) --non-interactive --yes
 ```
 
-С CDN/Cloudflare — см. выше. `ENABLE_XHTTP=n` отключает XHTTP в selfsteal (не спрашивает SNI/path, вырезает inbound/маршрут). `ENABLE_CDN=y` включает CDN. `NODE_IMAGE=remnawave/node:3.1.1` фиксирует образ (иначе `latest`). Версии Caddy `v2.11.7`/`l4 v0.1.2`/`xcaddy v0.4.7`/Go `1.26.9` (проверка SHA256, `caddy-l4` требует Caddy `v2.11.7`). Шаблоны берутся из `Multiselect.json` рядом со скриптом или `MULTISELECT_TEMPLATE_URL`/`SELF_STEAL_RAW_BASE`.
+С CDN/Cloudflare — см. выше. `ENABLE_XHTTP=n` отключает XHTTP в selfsteal (не спрашивает SNI/path, вырезает inbound/маршрут). `ENABLE_CDN=y` включает CDN. `NODE_IMAGE=remnawave/node:3.1.1` фиксирует образ (иначе `remnawave/node:latest`; короткий тег без репозитория вроде `3.1.1` дополняется до `remnawave/node:3.1.1`). Версии Caddy `v2.11.7`/`l4 v0.1.2`/`xcaddy v0.4.7`/Go `1.26.9` (проверка SHA256, `caddy-l4` требует Caddy `v2.11.7`). Шаблоны берутся из `Multiselect.json` рядом со скриптом или `MULTISELECT_TEMPLATE_URL`/`SELF_STEAL_RAW_BASE`.
 
 ## Флаги
 
@@ -514,7 +513,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/
 --force-dns           продолжить при несовпадении DNS
 --keep-build-tools    не удалять Go, xcaddy, build-essential и кэши сборки (по умолчанию удаляются)
 --ssh-port N          SSH-порт для UFW
---node-image REF      образ ноды; по умолчанию latest
+--node-image REF      образ ноды; по умолчанию remnawave/node:latest
 --self-steal-template T  тема фасада (vaultdrop, mail, cloud, admin, docs)
 --xray-template T     шаблон подписки: standard или split
 --cloudflare          создать A-записи через Cloudflare API
@@ -564,7 +563,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/
 | Нет 301 на `:80` | Caddyfile, UFW, `curl` | 301 обязателен |
 | IPv6 панель | `IPV6=yes` в `/etc/default/ufw` | иначе правило не сработает |
 | Панель: «не удалось проверить» / HTTP 401 | токен из Settings → API Tokens (не `SECRET_KEY` ноды и не пароль) | 401 — токен неверный, просрочен или удалён |
-| Панель: HTTP 403 | права токена: чтение **и** запись для `config-profiles`, `nodes`, `hosts`, `internal-squads` | `:write` без `:read` не даёт читать список; проще выдать `config-profiles:*` и т.п. |
+| Панель: HTTP 403 | права токена: чтение **и** запись для `config-profiles`, `nodes`, `hosts`, `internal-squads`, плюс `keygen` для авто-получения `SECRET_KEY` | `:write` без `:read` не даёт читать список; проще выдать `config-profiles:*`, `nodes:*`, `hosts:*`, `internal-squads:*`, `keygen:*` или `*` |
 | Панель: HTTP 404 | URL — корень панели без пути: `https://panel.example.com` | `/api` установщик добавляет сам |
 | Панель: HTML вместо JSON | Cloudflare Access/страница входа перед панелью | API недоступен без обхода Access |
 | Панель: нет соединения (`000`) | DNS/сертификат/доступность домена с сервера ноды | проверьте `curl -I https://panel.example.com` |
@@ -592,7 +591,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/
 
 ## Совместимость с Remnawave 3.x
 
-Проверено по исходникам Remnawave на 13 августа 2026. Официальный compose использует `NODE_PORT`/`SECRET_KEY`/`host`/`NET_ADMIN`; установщик добавляет лимиты/логи/сертификаты, образ `latest` (фиксируйте `NODE_IMAGE=remnawave/node:3.1.1`). `minClientVer: "0.0.0"` для Mihomo, `smux`/`brutal` не нужны. CI: Bash/ShellCheck, JSON5, JS, `env-flags`/`caddy-http`. После установки — [проверка](#проверка-после-установки).
+Проверено по исходникам Remnawave на 13 августа 2026. Официальный compose использует `NODE_PORT`/`SECRET_KEY`/`host`/`NET_ADMIN`; установщик добавляет лимиты/логи/сертификаты, образ `remnawave/node:latest` (фиксируйте `NODE_IMAGE=remnawave/node:3.1.1`). `minClientVer: "0.0.0"` для Mihomo, `smux`/`brutal` не нужны. CI: Bash/ShellCheck, JSON5, JS, `env-flags`/`caddy-http`. После установки — [проверка](#проверка-после-установки).
 
 Источники: [Node](https://docs.rw/install/remnawave-node), [Config Profiles](https://docs.rw/learn-en/config-profiles), [Hosts](https://docs.rw/learn-en/hosts/), [XRAY_JSON](https://docs.rw/learn/xray-json-advanced), [образы Node](https://github.com/remnawave/node/pkgs/container/node), [caddy-l4 v0.1.2](https://github.com/mholt/caddy-l4/blob/v0.1.2/go.mod), [Go SHA256](https://go.dev/dl/), [Caddy v2.11.7](https://github.com/caddyserver/caddy/releases/tag/v2.11.7), [caddy-l4 + Caddy v2.11.7](https://github.com/mholt/caddy-l4/commit/77044b47bccf03b57610bb303851ab31259779bd)
 

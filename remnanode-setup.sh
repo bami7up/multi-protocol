@@ -49,7 +49,7 @@ XRAY_TEMPLATE_CHOICE="${XRAY_TEMPLATE_CHOICE:-standard}"
 NODE_DIR="${NODE_DIR:-/opt/remnanode}"
 CERT_DIR="${CERT_DIR:-/etc/remna-certs}"
 ENV_STORE="${ENV_STORE:-/root/remnanode.env}"
-NODE_IMAGE="${NODE_IMAGE:-latest}"
+NODE_IMAGE="${NODE_IMAGE:-remnawave/node:latest}"
 # Темы фасада self-steal: файлы self-steal-templates/<тема>.html в репозитории.
 # Дефолт — прежний «файлообменник», чтобы поведение не менялось без запроса.
 # Базу URL шаблонов фасада можно переопределить (свой форк, тег или коммит):
@@ -118,7 +118,7 @@ remnanode-setup.sh — установка ноды Remnawave (VLESS + Hysteria2 
   --keep-build-tools    не удалять Go, xcaddy, build-essential и кэши сборки после Caddy
                         (по умолчанию удаляются; нужно, только если Caddy будет пересобираться)
   --ssh-port N          явно указать SSH-порт для правила ufw
-  --node-image REF      образ ноды (по умолчанию latest)
+  --node-image REF      образ ноды (по умолчанию remnawave/node:latest)
   --self-steal-template T
                         тема фасада self-steal (vaultdrop, mail, cloud, admin, docs)
   --xray-template T     шаблон подписки: standard (весь трафик через VPN) или split
@@ -536,6 +536,28 @@ random_node_port() {
     guard=$((guard + 1))
   done
   return 1
+}
+
+# Приводит короткую ссылку на образ (например, «latest» или «3.1.1», в т. ч.
+# из старых env-файлов) к полному репозиторию remnawave/node:<тег>. Без слэша
+# Docker ищет library/<имя> в Docker Hub и падает с
+# «pull access denied for latest, repository does not exist».
+normalize_node_image() {
+  local img="${1:-}"
+  img="$(printf '%s' "$img" | tr -d '[:space:]')"
+  if [[ -z "$img" ]]; then
+    printf 'remnawave/node:latest'
+  elif [[ "$img" != */* ]]; then
+    if [[ "$img" == @sha256:* ]]; then
+      printf 'remnawave/node%s' "$img"
+    elif [[ "$img" == *:* || "$img" == *@* ]]; then
+      printf 'remnawave/%s' "$img"
+    else
+      printf 'remnawave/node:%s' "$img"
+    fi
+  else
+    printf '%s' "$img"
+  fi
 }
 
 # Домен, как его вводят люди (https://Example.COM/, www.example.com.),
@@ -1018,8 +1040,64 @@ write_config_profile() {
     fi
   fi
   mkdir -p "$NODE_DIR"
+  # Сохраняем уже сгенерированные ключи REALITY при повторном запуске, чтобы не
+  # ломать выданные подписки; для пустых privateKey/shortIds генерируем X25519
+  # ключ (совместимый с Xray REALITY и resolveInboundAndPublicKey в Remnawave).
+  local existing_reality='{}'
+  if [[ -s "$out" ]]; then
+    existing_reality="$(jq -c '
+      [ .inbounds[]? | select(.streamSettings.realitySettings? != null)
+        | select((.streamSettings.realitySettings.privateKey // "") != "")
+        | { key: .tag, value: {
+              privateKey: .streamSettings.realitySettings.privateKey,
+              shortIds: (
+                if ((.streamSettings.realitySettings.shortIds // []) | map(select(length > 0)) | length) > 0
+                then (.streamSettings.realitySettings.shortIds | map(select(length > 0)))
+                else [] end
+              )
+            } } ] | from_entries
+    ' "$out" 2>/dev/null || echo '{}')"
+  fi
   # Пишем через временный файл: jq не должен оставить обрезанный профиль.
   if multiselect_filter < "$src" > "$out.tmp" && [[ -s "$out.tmp" ]]; then
+    if jq --argjson saved "$existing_reality" '
+      .inbounds |= map(
+        if (.streamSettings.realitySettings? != null) and (($saved[.tag] // null) != null) then
+          .streamSettings.realitySettings.privateKey = $saved[.tag].privateKey
+          | if (($saved[.tag].shortIds | length) > 0) then
+              .streamSettings.realitySettings.shortIds = $saved[.tag].shortIds
+            else . end
+        else . end
+      )
+    ' "$out.tmp" > "$out.tmp2" && [[ -s "$out.tmp2" ]]; then
+      mv -f "$out.tmp2" "$out.tmp"
+    else
+      rm -f "$out.tmp2"
+    fi
+    if have openssl; then
+      local rtag rpriv rsid
+      while IFS= read -r rtag; do
+        [[ -n "$rtag" ]] || continue
+        rpriv="$(openssl genpkey -algorithm X25519 -outform DER 2>/dev/null | tail -c 32 | base64 | tr '+/' '-_' | tr -d '=[:space:]' || true)"
+        rsid="$(od -An -N4 -tx1 </dev/urandom 2>/dev/null | tr -d '[:space:]' || true)"
+        if [[ -n "$rpriv" && -n "$rsid" ]]; then
+          if jq --arg t "$rtag" --arg pk "$rpriv" --arg sid "$rsid" '
+            .inbounds |= map(
+              if .tag == $t then
+                .streamSettings.realitySettings.privateKey = $pk
+                | if (((.streamSettings.realitySettings.shortIds // []) | map(select(length > 0)) | length) == 0) then
+                    .streamSettings.realitySettings.shortIds = [$sid]
+                  else . end
+              else . end
+            )
+          ' "$out.tmp" > "$out.tmp2" && [[ -s "$out.tmp2" ]]; then
+            mv -f "$out.tmp2" "$out.tmp"
+          else
+            rm -f "$out.tmp2"
+          fi
+        fi
+      done < <(jq -r '.inbounds[]? | select(.streamSettings.realitySettings? != null) | select((.streamSettings.realitySettings.privateKey // "") == "") | .tag' "$out.tmp" 2>/dev/null || true)
+    fi
     install -m 644 "$out.tmp" "$out"
     rm -f "$out.tmp" "$tmp"
     local profile_inbounds="Vision/Reality + Hysteria2"
@@ -1094,13 +1172,193 @@ write_xray_template() {
 }
 
 # ——— Авто-настройка панели через API (если выбран REMNAWAVE_AUTO_SETUP) ———
+# Короткий детерминированный идентификатор текущей ноды (из VLESS_HOST или PREFIX).
+panel_node_slug() {
+  local raw=""
+  if [[ -n "${VLESS_HOST:-}" ]]; then
+    raw="${VLESS_HOST%%.*}"
+  else
+    raw="${PREFIX:-node}"
+  fi
+  raw="${raw//[^A-Za-z0-9_-]/_}"
+  raw="${raw#_}"; raw="${raw%_}"
+  [[ -n "$raw" ]] || raw="node"
+  printf '%s' "$raw"
+}
+
 # Имя Config Profile: API разрешает только буквы, цифры, пробелы, «_» и «-»
-# (точки из домена запрещены), длина 2–30 символов.
+# (точки из домена запрещены), длина 2–30 символов. Без штампа даты: повторный
+# запуск в другой день обязан находить и обновлять профиль этой же ноды, а не
+# плодить дубликаты и натыкаться на уникальность тегов inbound'ов в БД панели.
 panel_profile_name() {
-  local base="${BASE_DOMAIN:-auto}" name
+  local base="${BASE_DOMAIN:-auto}" host_part="" name
   base="${base//[^A-Za-z0-9_-]/-}"
-  name="multi-${base}-$(date +%Y%m%d)"
-  printf '%s' "${name:0:30}"
+  if [[ -n "${VLESS_HOST:-}" ]]; then
+    host_part="${VLESS_HOST%%.*}"
+    host_part="${host_part//[^A-Za-z0-9_-]/-}"
+    name="multi-${host_part}-${base}"
+  else
+    name="multi-${base}"
+  fi
+  name="${name:0:30}"
+  while [[ "$name" == *- ]]; do name="${name%-}"; done
+  [[ ${#name} -ge 2 ]] || name="multi-node"
+  printf '%s' "$name"
+}
+
+# Имя ноды в панели (3–30 символов, уникально в таблице nodes).
+panel_node_name() {
+  local name
+  if [[ -n "${VLESS_HOST:-}" ]]; then
+    name="node-${VLESS_HOST}"
+  else
+    name="node-${PREFIX:-auto}-${BASE_DOMAIN:-local}"
+  fi
+  name="${name:0:30}"
+  while [[ "$name" == *- || "$name" == *. ]]; do name="${name%?}"; done
+  [[ ${#name} -ge 3 ]] || name="node-auto"
+  printf '%s' "$name"
+}
+
+# Возвращает каноническое базовое имя тега inbound'а независимо от суффикса ноды
+# (например, REALITY_VISION_QUIET_OTTER → REALITY_VISION).
+panel_canonical_inbound_tag() {
+  local tag="${1:-}" base
+  for base in REALITY_VISION REALITY_XHTTP HYSTERIA2 VLESS_CDN_WS VLESS_CDN_XHTTP VLESS_CDN_GRPC; do
+    if [[ "$tag" == "$base" || "$tag" == "${base}_"* ]]; then
+      printf '%s' "$base"
+      return 0
+    fi
+  done
+  printf '%s' "$tag"
+}
+
+# Подготавливает JSON Config Profile для отправки в Panel API:
+#  1) переиспользует существующие REALITY privateKey/shortIds и теги этой же ноды;
+#  2) гарантирует непустой X25519 privateKey + shortIds у всех REALITY inbound'ов
+#     (панель Remnawave не генерирует ключи на сервере — с пустым privateKey Xray
+#     не поднимает слушатели и подписка не выдаёт pbk);
+#  3) обходит глобальный @@unique([tag]) в таблице config_profile_inbounds: если
+#     базовый тег уже занят другим профилем в панели (вторая нода или старый
+#     профиль), добавляет к тегам детерминированный суффикс текущей ноды.
+panel_prepare_profile_for_api() {
+  local profile_name="$1" profile_json="$2"
+  local resp work_json saved_map='{}' other_tags='[]' slug suffix try_suffix n
+  resp="$(panel_api GET "/config-profiles" 2>/dev/null || true)"
+
+  saved_map="$(jq -c --arg n "$profile_name" '
+    ((.response // .data // .)
+      | if type=="object" and has("configProfiles") then .configProfiles
+        elif type=="array" then .
+        else [] end)
+    | map(select(.name == $n))[0] // {}
+    | [ (.config.inbounds // [])[]?
+        | {
+            tag: .tag,
+            base: (
+              if (.tag | startswith("REALITY_VISION")) then "REALITY_VISION"
+              elif (.tag | startswith("REALITY_XHTTP")) then "REALITY_XHTTP"
+              elif (.tag | startswith("HYSTERIA2")) then "HYSTERIA2"
+              elif (.tag | startswith("VLESS_CDN_WS")) then "VLESS_CDN_WS"
+              elif (.tag | startswith("VLESS_CDN_XHTTP")) then "VLESS_CDN_XHTTP"
+              elif (.tag | startswith("VLESS_CDN_GRPC")) then "VLESS_CDN_GRPC"
+              else .tag end
+            ),
+            privateKey: (.streamSettings.realitySettings.privateKey // ""),
+            shortIds: ((.streamSettings.realitySettings.shortIds // []) | map(select(length > 0)))
+          }
+        | { key: .base, value: { tag: .tag, privateKey: .privateKey, shortIds: .shortIds } }
+      ] | from_entries
+  ' <<<"$resp" 2>/dev/null || echo '{}')"
+
+  other_tags="$(jq -c --arg n "$profile_name" '
+    ((.response // .data // .)
+      | if type=="object" and has("configProfiles") then .configProfiles
+        elif type=="array" then .
+        else [] end)
+    | map(select(.name != $n))
+    | [ .[] | ((.inbounds // [])[]?.tag // empty), ((.config.inbounds // [])[]?.tag // empty) ]
+    | unique
+  ' <<<"$resp" 2>/dev/null || echo '[]')"
+
+  work_json="$(jq -c --argjson saved "$saved_map" '
+    .inbounds |= map(
+      . as $inb
+      | ($saved[$inb.tag] // null) as $prev
+      | if $prev != null then
+          .tag = ($prev.tag // .tag)
+          | if (.streamSettings.realitySettings? != null) and (($prev.privateKey // "") != "") then
+              .streamSettings.realitySettings.privateKey = $prev.privateKey
+              | if (($prev.shortIds | length) > 0) then
+                  .streamSettings.realitySettings.shortIds = $prev.shortIds
+                else . end
+            else . end
+        else . end
+    )
+  ' <<<"$profile_json" 2>/dev/null || printf '%s' "$profile_json")"
+
+  # Проверяем коллизию тегов с чужими профилями в панели.
+  if jq -e --argjson other "$other_tags" '
+    [ .inbounds[]?.tag ] | any(. as $t | ($other | index($t)) != null)
+  ' <<<"$work_json" >/dev/null 2>&1; then
+    slug="$(panel_node_slug | tr 'a-z-' 'A-Z_')"
+    slug="${slug:0:16}"
+    suffix="_${slug}"
+    for n in 0 2 3 4 5 6 7 8 9; do
+      if (( n == 0 )); then try_suffix="$suffix"; else try_suffix="${suffix}_${n}"; fi
+      if ! jq -e --argjson other "$other_tags" --arg s "$try_suffix" '
+        [ .inbounds[]?.tag
+          | (if startswith("REALITY_VISION") then "REALITY_VISION"
+             elif startswith("REALITY_XHTTP") then "REALITY_XHTTP"
+             elif startswith("HYSTERIA2") then "HYSTERIA2"
+             elif startswith("VLESS_CDN_WS") then "VLESS_CDN_WS"
+             elif startswith("VLESS_CDN_XHTTP") then "VLESS_CDN_XHTTP"
+             elif startswith("VLESS_CDN_GRPC") then "VLESS_CDN_GRPC"
+             else . end) + $s
+        ] | any(. as $t | ($other | index($t)) != null)
+      ' <<<"$work_json" >/dev/null 2>&1; then
+        suffix="$try_suffix"
+        break
+      fi
+    done
+    work_json="$(jq -c --arg s "$suffix" '
+      .inbounds |= map(
+        .tag = (
+          (if (.tag | startswith("REALITY_VISION")) then "REALITY_VISION"
+           elif (.tag | startswith("REALITY_XHTTP")) then "REALITY_XHTTP"
+           elif (.tag | startswith("HYSTERIA2")) then "HYSTERIA2"
+           elif (.tag | startswith("VLESS_CDN_WS")) then "VLESS_CDN_WS"
+           elif (.tag | startswith("VLESS_CDN_XHTTP")) then "VLESS_CDN_XHTTP"
+           elif (.tag | startswith("VLESS_CDN_GRPC")) then "VLESS_CDN_GRPC"
+           else .tag end) + $s
+        )
+      )
+    ' <<<"$work_json" 2>/dev/null || printf '%s' "$work_json")"
+  fi
+
+  # Страховка: если в Multiselect.json остались пустые ключи REALITY — генерируем.
+  if have openssl; then
+    local rtag rpriv rsid
+    while IFS= read -r rtag; do
+      [[ -n "$rtag" ]] || continue
+      rpriv="$(openssl genpkey -algorithm X25519 -outform DER 2>/dev/null | tail -c 32 | base64 | tr '+/' '-_' | tr -d '=[:space:]' || true)"
+      rsid="$(od -An -N4 -tx1 </dev/urandom 2>/dev/null | tr -d '[:space:]' || true)"
+      if [[ -n "$rpriv" && -n "$rsid" ]]; then
+        work_json="$(jq -c --arg t "$rtag" --arg pk "$rpriv" --arg sid "$rsid" '
+          .inbounds |= map(
+            if .tag == $t then
+              .streamSettings.realitySettings.privateKey = $pk
+              | if (((.streamSettings.realitySettings.shortIds // []) | map(select(length > 0)) | length) == 0) then
+                  .streamSettings.realitySettings.shortIds = [$sid]
+                else . end
+            else . end
+          )
+        ' <<<"$work_json" 2>/dev/null || printf '%s' "$work_json")"
+      fi
+    done < <(jq -r '.inbounds[]? | select(.streamSettings.realitySettings? != null) | select((.streamSettings.realitySettings.privateKey // "") == "") | .tag' <<<"$work_json" 2>/dev/null || true)
+  fi
+
+  printf '%s' "$work_json"
 }
 
 # Результат функции, которая печатает диагностику (ok/warn) и лишь последней
@@ -1118,7 +1376,7 @@ panel_result_uuid() {
 # Возвращает чистый base64 ключ или пустую строку при ошибке.
 panel_fetch_node_secret() {
   local resp key
-  resp="$(panel_api GET "/keygen" 2>/dev/null || true)"
+  resp="$(panel_api_retry GET "/keygen" 2>/dev/null || true)"
   if panel_api_success "$resp"; then
     key="$(jq -r '.response.secretKey // .response.pubKey // .data.secretKey // .data.pubKey // .secretKey // .pubKey // empty' <<<"$resp" 2>/dev/null || true)"
     key="$(printf '%s' "$key" | tr -d '[:space:]')"
@@ -1166,23 +1424,42 @@ panel_get_inbounds() {
   jq -r '.. | objects | select(has("uuid") and has("tag")) | "\(.uuid)|\(.tag)"' <<<"$resp" 2>/dev/null | sort -u
 }
 
+# Ищет существующую ноду в панели. В БД Remnawave уникален сам address (IP), а не
+# пара (address, port), плюс уникально имя name — поэтому при смене порта ноды
+# поиск по старому (address && port) не находил запись и POST /nodes падал с 409.
 panel_find_node_by_address() {
-  local addr="$1" port="$2" resp uuid
+  local addr="$1" port="${2:-}" expected_name="${3:-}" resp uuid
   resp="$(panel_api GET "/nodes" 2>/dev/null || true)"
-  uuid="$(jq -r --arg a "$addr" --arg p "$port" '(.response // .data // .) | if type=="array" then .[] else . end | select(.address==$a and (.port|tostring)==$p) | .uuid // empty' <<<"$resp" 2>/dev/null | head -1)"
+  uuid="$(jq -r --arg a "$addr" --arg p "$port" --arg n "$expected_name" '
+    ((.response // .data // .)
+      | if type=="object" and has("nodes") then .nodes
+        elif type=="array" then .
+        else [] end) as $nodes
+    | (
+        [ $nodes[]? | select(.address == $a) | .uuid // empty ]
+        + (if $n != "" then [ $nodes[]? | select(.name == $n) | .uuid // empty ] else [] end)
+      )
+    | map(select(length > 0))[0] // empty
+  ' <<<"$resp" 2>/dev/null | head -1 || true)"
   printf '%s' "$uuid"
 }
 
 panel_find_host_by_remark() {
   local remark="$1" resp uuid
   resp="$(panel_api GET "/hosts" 2>/dev/null || true)"
-  uuid="$(jq -r --arg r "$remark" '(.response // .data // .) | if type=="array" then .[] else . end | select(.remark==$r) | .uuid // empty' <<<"$resp" 2>/dev/null | head -1)"
+  uuid="$(jq -r --arg r "$remark" '
+    (.response // .data // .)
+    | if type=="object" and has("hosts") then .hosts
+      elif type=="array" then .
+      else [] end
+    | .[] | select(.remark==$r) | .uuid // empty' <<<"$resp" 2>/dev/null | head -1 || true)"
   printf '%s' "$uuid"
 }
 
 panel_upsert_config_profile() {
   local profile_name="$1" profile_json="$2"
   local existing_uuid payload resp result_uuid
+  profile_json="$(panel_prepare_profile_for_api "$profile_name" "$profile_json")"
   existing_uuid="$(panel_find_profile_by_name "$profile_name" || true)"
   payload="$(jq -n --arg name "$profile_name" --argjson config "$profile_json" '{name: $name, config: $config}' 2>/dev/null || true)"
   if [[ -z "$payload" ]]; then
@@ -1237,10 +1514,10 @@ panel_upsert_config_profile() {
 
 panel_upsert_node() {
   local profile_uuid="$1" profile_inbounds_csv="$2" # comma-separated uuids
-  local node_name="node-${PREFIX:-auto}-${BASE_DOMAIN}"
-  node_name="${node_name:0:30}" # имя 3-30 символов в API
+  local node_name
+  node_name="$(panel_node_name)"
   local existing_uuid resp result_uuid
-  existing_uuid="$(panel_find_node_by_address "$SERVER_IP" "$NODE_API_PORT" || true)"
+  existing_uuid="$(panel_find_node_by_address "$SERVER_IP" "$NODE_API_PORT" "$node_name" || true)"
   # Собираем activeInbounds как массив UUID
   local inbounds_json
   inbounds_json="$(printf '%s' "$profile_inbounds_csv" | jq -R 'split(",") | map(select(length>0))' 2>/dev/null || echo '[]')"
@@ -1266,6 +1543,8 @@ panel_upsert_node() {
         return 1
       fi
     fi
+    # Если нода раньше отключалась панелью из-за пустого профиля — включаем обратно.
+    panel_api POST "/nodes/$result_uuid/actions/enable" '{}' >/dev/null 2>&1 || true
   else
     resp="$(panel_api_retry POST "/nodes" "$payload" 2>/dev/null || true)"
     if panel_api_success "$resp"; then
@@ -1279,6 +1558,28 @@ panel_upsert_node() {
     fi
   fi
   printf '%s' "$result_uuid"
+}
+
+# Инициирует немедленный запуск/синхронизацию Xray на ноде после старта контейнера
+# remnanode (POST /nodes/{uuid}/actions/restart с {"forceRestart":false}), чтобы
+# панель сразу отправила конфиг Xray и подняла слушатели к шагу 10.
+panel_trigger_node_start() {
+  local node_uuid="${1:-}" resp
+  [[ -n "$node_uuid" && "$node_uuid" != "(created)" ]] || return 0
+  if [[ -z "${REMNAWAVE_PANEL_URL:-}" || -z "${REMNAWAVE_API_TOKEN:-}" ]]; then
+    return 0
+  fi
+  if [[ -z "${PANEL_CURL_CFG:-}" || ! -f "$PANEL_CURL_CFG" ]]; then
+    panel_curl_cfg_init
+  fi
+  if [[ -z "${PANEL_STATE_DIR:-}" ]]; then
+    panel_state_init
+  fi
+  resp="$(panel_api_retry POST "/nodes/$node_uuid/actions/restart" '{"forceRestart":false}' 2>/dev/null || true)"
+  if panel_api_success "$resp"; then
+    ok "Панель запустила синхронизацию Xray с нодой ($node_uuid)"
+  fi
+  return 0
 }
 
 panel_upsert_host() {
@@ -1336,8 +1637,9 @@ panel_upsert_host() {
 
 panel_upsert_internal_squad() {
   local -a inbounds=("$@")
-  local resp squad_uuid inbounds_json payload
+  local resp squad_uuid existing_json inbounds_json merged_json payload create_payload
   resp="$(panel_api GET "/internal-squads" 2>/dev/null || true)"
+  inbounds_json="$(printf '%s\n' "${inbounds[@]}" | jq -R . | jq -s 'map(select(length>0))' 2>/dev/null || echo '[]')"
   # Remnawave 3.x: {response:{total, internalSquads:[...]}}; старые версии — массив
   squad_uuid="$(jq -r '
     (.response // .data // .)
@@ -1346,11 +1648,29 @@ panel_upsert_internal_squad() {
       else [] end
     | .[0].uuid // empty' <<<"$resp" 2>/dev/null || true)"
   if [[ -z "$squad_uuid" ]]; then
+    create_payload="$(jq -n --argjson inbounds "$inbounds_json" '{name: "Default-Squad", inbounds: $inbounds}' 2>/dev/null || true)"
+    if [[ -n "$create_payload" ]]; then
+      resp="$(panel_api_retry POST "/internal-squads" "$create_payload" 2>/dev/null || true)"
+      if panel_api_success "$resp"; then
+        squad_uuid="$(jq -r '.response.uuid // .data.uuid // empty' <<<"$resp" 2>/dev/null || true)"
+        ok "Internal Squad создан: Default-Squad (${squad_uuid:-ok})"
+        return 0
+      fi
+    fi
     note "Internal Squad не найден — создайте его вручную и включите inbound'ы"
     return 0
   fi
-  inbounds_json="$(printf '%s\n' "${inbounds[@]}" | jq -R . | jq -s 'map(select(length>0))' 2>/dev/null || echo '[]')"
-  payload="$(jq -n --arg uuid "$squad_uuid" --argjson inbounds "$inbounds_json" '{uuid: $uuid, inbounds: $inbounds}' 2>/dev/null || true)"
+  # PATCH заменяет массив inbound'ов целиком — объединяем с уже включёнными, чтобы
+  # не отвязать другие ноды панели.
+  existing_json="$(jq -c '
+    (.response // .data // .)
+    | if type=="object" and has("internalSquads") then .internalSquads
+      elif type=="array" then .
+      else [] end
+    | [ .[0].inbounds[]? | if type=="object" then (.uuid // empty) else . end | select(length > 0) ]
+  ' <<<"$resp" 2>/dev/null || echo '[]')"
+  merged_json="$(jq -n -c --argjson a "$existing_json" --argjson b "$inbounds_json" '($a + $b) | unique' 2>/dev/null || printf '%s' "$inbounds_json")"
+  payload="$(jq -n --arg uuid "$squad_uuid" --argjson inbounds "$merged_json" '{uuid: $uuid, inbounds: $inbounds}' 2>/dev/null || true)"
   resp="$(panel_api_retry PATCH "/internal-squads" "$payload" 2>/dev/null || true)"
   if panel_api_success "$resp"; then
     ok "Internal Squad обновлён: добавлены inbound'ы ($squad_uuid)"
@@ -1404,10 +1724,11 @@ panel_upsert_subscription_template() {
   local choice="$1"
   local src="$NODE_DIR/Xray_template.json"
   local tname
+  PANEL_TEMPLATE_UUID=""
   if [[ "${choice,,}" == "split" ]]; then
-    tname="XRAY split $(date +%Y-%m-%d)"
+    tname="XRAY split"
   else
-    tname="XRAY standard $(date +%Y-%m-%d)"
+    tname="XRAY standard"
   fi
   if [[ ! -r "$src" ]]; then
     note "Шаблон подписки не найден: $src — пропускаю загрузку в панель"
@@ -1441,6 +1762,7 @@ panel_upsert_subscription_template() {
     else
       note "Шаблон подписки уже существует: $tname ($existing_uuid) — содержимое обновить не удалось: $(panel_api_error "$resp")"
     fi
+    PANEL_TEMPLATE_UUID="$existing_uuid"
     return 0
   fi
   # POST создаёт только имя и тип; содержимое загружается отдельным PATCH.
@@ -1451,6 +1773,7 @@ panel_upsert_subscription_template() {
     if panel_api_success "$resp2"; then
       created_uuid="$(jq -r '.response.uuid // .data.uuid // empty' <<<"$resp2" 2>/dev/null || true)"
       if [[ -n "$created_uuid" ]]; then
+        PANEL_TEMPLATE_UUID="$created_uuid"
         content_payload="$(jq -n --arg uuid "$created_uuid" --argjson tmpl "$content" '{uuid: $uuid, templateJson: $tmpl}' 2>/dev/null || true)"
         resp2="$(panel_api_retry PATCH "/subscription-templates" "$content_payload" 2>/dev/null || true)"
         if panel_api_success "$resp2"; then
@@ -1470,6 +1793,8 @@ panel_upsert_subscription_template() {
 }
 
 panel_auto_setup() {
+  PANEL_NODE_UUID=""
+  PANEL_TEMPLATE_UUID=""
   if (( ! REMNAWAVE_AUTO_SETUP )); then
     return 0
   fi
@@ -1528,13 +1853,15 @@ panel_auto_setup() {
   fi
   kv "Panel: Config Profile" "$profile_name ($profile_uuid)"
 
-  # 2) Собираем inbounds профиля
-  local inbounds_raw=""
+  # 2) Собираем inbounds профиля (ключуем по каноническому имени тега, чтобы
+  # суффикс второй ноды не мешал привязке хостов).
+  local inbounds_raw="" canon_tag=""
   inbounds_raw="$(panel_get_inbounds "$profile_uuid" 2>/dev/null || true)"
   declare -A INBOUND_UUID_BY_TAG=()
   while IFS='|' read -r uuid tag; do
     [[ -n "$uuid" && -n "$tag" ]] || continue
-    INBOUND_UUID_BY_TAG["$tag"]="$uuid"
+    canon_tag="$(panel_canonical_inbound_tag "$tag")"
+    INBOUND_UUID_BY_TAG["$canon_tag"]="$uuid"
   done <<<"$inbounds_raw"
 
   if (( ${#INBOUND_UUID_BY_TAG[@]} == 0 )); then
@@ -1559,61 +1886,84 @@ panel_auto_setup() {
       printf '%s\n' "$node_out"
     fi
     if [[ "$node_uuid" == "(created)" ]]; then
-      # Нода создана, но uuid в ответе не пришёл — это не ошибка.
-      node_uuid=""
+      node_uuid="$(panel_find_node_by_address "$SERVER_IP" "$NODE_API_PORT" "$(panel_node_name)" || true)"
     elif [[ -z "$node_uuid" ]]; then
       node_failed=1
     fi
     if [[ -n "$node_uuid" ]]; then
+      PANEL_NODE_UUID="$node_uuid"
       kv "Panel: Node" "$node_uuid ($SERVER_IP:$NODE_API_PORT)"
     fi
   fi
 
-  # 4) Хосты — по одному на каждый inbound. Успех считаем по коду возврата:
-  # раньше ошибка глушилась в /dev/null, счётчик рос всегда, и установщик
-  # рапортовал «Хосты созданы», даже когда панель отвергла все запросы.
-  local host_count=0 host_failed=0
-  # REALITY_VISION
+  # 4) Шаблон подписки загружаем до хостов, чтобы привязать его к видимому
+  # виртуальному хосту подписки (xrayJsonTemplateUuid).
+  panel_upsert_subscription_template "$XRAY_TEMPLATE_CHOICE" || true
+
+  # 5) Хосты — скрытые рабочие (tags=["USA"], isHidden=true для балансировщика
+  # Xray_template.json) + видимая оболочка подписки. В Remnawave 3.x допустимы
+  # только securityLayer: DEFAULT | TLS | NONE («REALITY» вызывает HTTP 400).
+  local host_count=0 host_failed=0 host_label="$PREFIX" extra
+  if (( CF_MODE )) && [[ -n "${VLESS_HOST:-}" ]]; then
+    host_label="${VLESS_HOST%%.*}"
+  fi
   if [[ -n "${INBOUND_UUID_BY_TAG[REALITY_VISION]:-}" ]]; then
-    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[REALITY_VISION]}" "VLESS Vision $PREFIX" "$VLESS_HOST" "443" '{"securityLayer":"REALITY","tags":["USA"]}'; then
+    extra="$(jq -n -c --arg sni "$SELF_STEAL_HOST" '{securityLayer:"DEFAULT", sni:$sni, fingerprint:"chrome", tags:["USA"], isHidden:true}')"
+    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[REALITY_VISION]}" "VLESS Vision $host_label" "$VLESS_HOST" "443" "$extra"; then
       host_count=$((host_count+1))
     else
       host_failed=$((host_failed+1))
     fi
   fi
   if [[ -n "${INBOUND_UUID_BY_TAG[REALITY_XHTTP]:-}" && -n "$XHTTP_SNI" ]]; then
-    local extra
-    extra="$(jq -n --arg sni "$XHTTP_SNI" --arg path "$XHTTP_PATH" '{securityLayer:"REALITY", tags:["USA"], sni: $sni, path: $path}' 2>/dev/null || echo '{"securityLayer":"REALITY","tags":["USA"]}')"
-    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[REALITY_XHTTP]}" "VLESS XHTTP $PREFIX" "$VLESS_HOST" "443" "$extra"; then
+    extra="$(jq -n -c --arg sni "$XHTTP_SNI" --arg path "$XHTTP_PATH" '{securityLayer:"DEFAULT", sni:$sni, path:$path, fingerprint:"chrome", tags:["USA"], isHidden:true}')"
+    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[REALITY_XHTTP]}" "VLESS XHTTP $host_label" "$VLESS_HOST" "443" "$extra"; then
       host_count=$((host_count+1))
     else
       host_failed=$((host_failed+1))
     fi
   fi
   if [[ -n "${INBOUND_UUID_BY_TAG[HYSTERIA2]:-}" ]]; then
-    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[HYSTERIA2]}" "Hysteria2 $PREFIX" "$HY_HOST" "443" '{"securityLayer":"TLS","tags":["USA"]}'; then
+    extra="$(jq -n -c --arg sni "$HY_HOST" '{securityLayer:"DEFAULT", sni:$sni, alpn:"h3", tags:["USA"], isHidden:true}')"
+    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[HYSTERIA2]}" "Hysteria2 $host_label" "$HY_HOST" "443" "$extra"; then
       host_count=$((host_count+1))
     else
       host_failed=$((host_failed+1))
     fi
   fi
-  # CDN хосты
+  # CDN хосты (внешний TLS терминирует CDN → securityLayer="TLS")
   if [[ -n "${INBOUND_UUID_BY_TAG[VLESS_CDN_WS]:-}" ]]; then
-    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[VLESS_CDN_WS]}" "VLESS CDN WS $PREFIX" "$CDN_HOST" "443" '{"securityLayer":"TLS","tags":["USA"],"path":"'"${CDN_WS_PATH:-/api/v1/stream}"'"}'; then
+    extra="$(jq -n -c --arg host "$CDN_HOST" --arg path "${CDN_WS_PATH:-/api/v1/stream}" '{securityLayer:"TLS", sni:$host, host:$host, path:$path, fingerprint:"chrome", tags:["USA"], isHidden:true}')"
+    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[VLESS_CDN_WS]}" "VLESS CDN WS $host_label" "$CDN_HOST" "443" "$extra"; then
       host_count=$((host_count+1))
     else
       host_failed=$((host_failed+1))
     fi
   fi
   if [[ -n "${INBOUND_UUID_BY_TAG[VLESS_CDN_XHTTP]:-}" ]]; then
-    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[VLESS_CDN_XHTTP]}" "VLESS CDN XHTTP $PREFIX" "$CDN_HOST" "443" '{"securityLayer":"TLS","tags":["USA"],"path":"'"${CDN_XHTTP_PATH:-/api/v3/sync/c1}"'"}'; then
+    extra="$(jq -n -c --arg host "$CDN_HOST" --arg path "${CDN_XHTTP_PATH:-/api/v3/sync/c1}" '{securityLayer:"TLS", sni:$host, host:$host, path:$path, fingerprint:"chrome", tags:["USA"], isHidden:true}')"
+    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[VLESS_CDN_XHTTP]}" "VLESS CDN XHTTP $host_label" "$CDN_HOST" "443" "$extra"; then
       host_count=$((host_count+1))
     else
       host_failed=$((host_failed+1))
     fi
   fi
   if [[ -n "${INBOUND_UUID_BY_TAG[VLESS_CDN_GRPC]:-}" ]]; then
-    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[VLESS_CDN_GRPC]}" "VLESS CDN gRPC $PREFIX" "$CDN_HOST" "443" '{"securityLayer":"TLS","tags":["USA"]}'; then
+    extra="$(jq -n -c --arg host "$CDN_HOST" --arg path "${CDN_GRPC_PATH:-/api/v4/stream}" '{securityLayer:"TLS", sni:$host, alpn:"h2", path:$path, fingerprint:"chrome", tags:["USA"], isHidden:true}')"
+    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[VLESS_CDN_GRPC]}" "VLESS CDN gRPC $host_label" "$CDN_HOST" "443" "$extra"; then
+      host_count=$((host_count+1))
+    else
+      host_failed=$((host_failed+1))
+    fi
+  fi
+  # Видимый виртуальный хост-оболочка для подписки (подключает XRAY_JSON шаблон)
+  if [[ -n "${INBOUND_UUID_BY_TAG[REALITY_VISION]:-}" ]]; then
+    if [[ -n "${PANEL_TEMPLATE_UUID:-}" ]]; then
+      extra="$(jq -n -c --arg sni "$SELF_STEAL_HOST" --arg tmpl "$PANEL_TEMPLATE_UUID" '{securityLayer:"DEFAULT", sni:$sni, fingerprint:"chrome", tags:[], isHidden:false, xrayJsonTemplateUuid:$tmpl}')"
+    else
+      extra="$(jq -n -c --arg sni "$SELF_STEAL_HOST" '{securityLayer:"DEFAULT", sni:$sni, fingerprint:"chrome", tags:[], isHidden:false}')"
+    fi
+    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[REALITY_VISION]}" "VPN $host_label" "$VLESS_HOST" "443" "$extra"; then
       host_count=$((host_count+1))
     else
       host_failed=$((host_failed+1))
@@ -1623,15 +1973,12 @@ panel_auto_setup() {
     ok "Хосты созданы/обновлены: $host_count шт. (проверьте Hosts в панели)"
   fi
 
-  # 5) Internal Squad — включить все inbounds
+  # 6) Internal Squad — объединить существующие и новые inbound'ы (или создать отряд)
   if (( ${#INBOUND_UUID_BY_TAG[@]} > 0 )); then
     local -a squad_inbounds=()
     for tag in "${!INBOUND_UUID_BY_TAG[@]}"; do squad_inbounds+=("${INBOUND_UUID_BY_TAG[$tag]}"); done
     panel_upsert_internal_squad "${squad_inbounds[@]}" || true
   fi
-
-  # 6) Шаблон подписки
-  panel_upsert_subscription_template "$XRAY_TEMPLATE_CHOICE" || true
 
   if (( host_failed > 0 || node_failed )); then
     local details=""
@@ -2595,7 +2942,10 @@ if (( REMNAWAVE_AUTO_SETUP )); then
   note "Проверка соединения с панелью..."
   panel_curl_cfg_init
   if panel_check_connection; then
-    ok "Панель доступна и токен валиден — авто-настройка будет выполнена после установки ноды"
+    ok "Панель доступна и токен валиден — профиль, нода и хосты будут созданы на шаге 9"
+    if [[ -z "${SECRET_KEY:-}" ]] && ! panel_fetch_node_secret >/dev/null 2>&1; then
+      warn "Токену не выдано право keygen (GET /keygen → HTTP $(panel_api_code)): профиль, нода и хосты создадутся сами, но для авто-получения SECRET_KEY добавьте keygen:* в Settings → API Tokens."
+    fi
   elif [[ "${QUICK_SETUP:-0}" == 1 && "$NONINTERACTIVE" != 1 ]] && has_tty; then
     while :; do
       warn "Не удалось проверить панель:"
@@ -2612,7 +2962,10 @@ if (( REMNAWAVE_AUTO_SETUP )); then
       ask_secret REMNAWAVE_API_TOKEN "Введите API токен панели ещё раз (скрытый ввод)" ""
       panel_curl_cfg_init
       if panel_check_connection; then
-        ok "Панель доступна и токен валиден — авто-настройка будет выполнена после установки ноды"
+        ok "Панель доступна и токен валиден — профиль, нода и хосты будут созданы на шаге 9"
+        if [[ -z "${SECRET_KEY:-}" ]] && ! panel_fetch_node_secret >/dev/null 2>&1; then
+          warn "Токену не выдано право keygen (GET /keygen → HTTP $(panel_api_code)): профиль, нода и хосты создадутся сами, но для авто-получения SECRET_KEY добавьте keygen:* в Settings → API Tokens."
+        fi
         break
       fi
     done
@@ -2733,7 +3086,9 @@ if [[ -z "$SELF_STEAL_TEMPLATE_URL" ]]; then
 fi
 [[ "$SELF_STEAL_TEMPLATE_URL" == https://* ]] \
   || die "SELF_STEAL_TEMPLATE_URL должен начинаться с https://"
-[[ "$NODE_IMAGE" =~ ^[a-zA-Z0-9][a-zA-Z0-9._/:@-]+$ ]] || die "Некорректная ссылка на образ: $NODE_IMAGE"
+NODE_IMAGE="$(normalize_node_image "${NODE_IMAGE:-}")"
+[[ "$NODE_IMAGE" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*(:[0-9]+)?/[a-zA-Z0-9._/-]+(:[a-zA-Z0-9._-]+)?(@sha256:[0-9a-fA-F]{64})?$ ]] \
+  || die "Некорректная ссылка на образ: $NODE_IMAGE"
 [[ "$XCADDY_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Некорректная версия xcaddy: $XCADDY_VERSION"
 [[ "$CADDY_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Некорректная версия Caddy: $CADDY_VERSION"
 [[ "$CADDY_L4_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Некорректная версия caddy-l4: $CADDY_L4_VERSION"
@@ -3426,6 +3781,16 @@ step 9 "Нода Remnawave (compose)"
 mkdir -p "$NODE_DIR"
 echo
 
+# 1) Авто-настройка панели ДО запроса SECRET_KEY и запуска контейнера:
+# сначала создаём/обновляем Config Profile, ноду, шаблон подписки, хосты и
+# Internal Squad в панели, чтобы нода гарантированно существовала в панели даже
+# при ручном вводе SECRET_KEY или сбое сети Docker.
+PANEL_NODE_UUID=""
+if (( REMNAWAVE_AUTO_SETUP )); then
+  panel_auto_setup || warn "Авто-настройка панели завершилась с ошибкой — проверьте панель вручную (README шаги 1–8)"
+fi
+
+# 2) Получаем SECRET_KEY (автоматически через GET /keygen или из ввода)
 AUTO_SECRET_KEY=""
 if (( REMNAWAVE_AUTO_SETUP )) && [[ -z "${SECRET_KEY:-}" ]]; then
   note "Получение SECRET_KEY ноды из Remnawave Panel API (GET /keygen)..."
@@ -3434,19 +3799,19 @@ if (( REMNAWAVE_AUTO_SETUP )) && [[ -z "${SECRET_KEY:-}" ]]; then
   if [[ -n "$AUTO_SECRET_KEY" ]]; then
     ok "SECRET_KEY ноды получен автоматически через Panel API"
   else
-    warn "Не удалось автоматически получить SECRET_KEY через Panel API (проверьте права токена на keygen)."
+    warn "Не удалось автоматически получить SECRET_KEY через Panel API (HTTP $(panel_api_code); выдайте токену право keygen:*)."
   fi
 fi
 
 if [[ -n "$AUTO_SECRET_KEY" ]]; then
   SECRET_RAW="$AUTO_SECRET_KEY"
 else
-  note "Создайте ноду в панели (Nodes -> Add) с IP $SERVER_IP и портом $NODE_API_PORT."
-  if (( REMNAWAVE_AUTO_SETUP )); then
-    note "Профиль, хосты и шаблон подписки установщик привяжет сам через API после запуска ноды —"
-    note "вручную в панели нужна только сама нода (адрес и порт выше)."
+  if [[ -n "${PANEL_NODE_UUID:-}" ]]; then
+    note "Нода уже создана в панели ($SERVER_IP:$NODE_API_PORT) — откройте её в Nodes → Management и скопируйте SECRET_KEY."
+  else
+    note "Создайте ноду в панели (Nodes -> Add) с IP $SERVER_IP и портом $NODE_API_PORT."
   fi
-  note "Панель выдаст SECRET_KEY (публичный ключ ноды). Вставьте его целиком."
+  note "Панель выдаст SECRET_KEY (ключ связи с нодой). Вставьте его целиком."
   note "Можно как чистое значение (eyJ...), так и строку 'SECRET_KEY=...'."
   echo
   ask_secret SECRET_RAW "SECRET_KEY из панели" "${SECRET_KEY:-}"
@@ -3458,6 +3823,9 @@ SECRET_VALUE="${SECRET_VALUE#\"}"; SECRET_VALUE="${SECRET_VALUE%\"}"
 SECRET_VALUE="${SECRET_VALUE#\'}"; SECRET_VALUE="${SECRET_VALUE%\'}"
 SECRET_VALUE="$(printf '%s' "$SECRET_VALUE" | tr -d '[:space:]')"
 [[ -n "$SECRET_VALUE" ]] || die "Пустой SECRET_KEY."
+
+# На случай, если в старом окружении или .env оставался голый тег без репозитория
+NODE_IMAGE="$(normalize_node_image "$NODE_IMAGE")"
 
 if [[ "$BUILD_COMPOSE" -eq 1 ]]; then
   ( umask 077
@@ -3475,7 +3843,7 @@ services:
   remnanode:
     container_name: remnanode
     hostname: remnanode
-    image: ${NODE_IMAGE:-latest}
+    image: ${NODE_IMAGE:-remnawave/node:latest}
     network_mode: host
     restart: always
     cap_add:
@@ -3544,9 +3912,11 @@ ls -l $files | sort
 SH
 ok "Контейнер remnanode запущен"
 
-# Авто-настройка панели, если включена (не роняет установку при ошибках)
-if (( REMNAWAVE_AUTO_SETUP )); then
-  panel_auto_setup || warn "Авто-настройка панели завершилась с ошибкой — проверьте панель вручную (README шаги 1–8)"
+# 3) Контейнер remnanode уже слушает API-порт — просим панель немедленно
+# подключиться и передать конфиг Xray (не дожидаясь периодического опроса),
+# чтобы к шагу 10 все слушатели Xray уже поднялись.
+if (( REMNAWAVE_AUTO_SETUP )) && [[ -n "${PANEL_NODE_UUID:-}" ]]; then
+  panel_trigger_node_start "$PANEL_NODE_UUID" || true
 fi
 
 step 10 "Проверка слушателей и маршрутизации"

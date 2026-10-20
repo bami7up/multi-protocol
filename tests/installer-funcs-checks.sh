@@ -3,6 +3,7 @@
 # Функции извлекаются из установщика и выполняются здесь, чтобы регрессия
 # (например, «висячие» одинарные двоеточия в is_ipv6 или отвергание punycode
 # TLD в is_fqdn) ломала CI, а не сервер пользователя.
+# shellcheck disable=SC2030,SC2031
 set -Eeuo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -19,7 +20,7 @@ for fn in is_ipv4 is_ipv6 is_private_ipv4 is_fqdn is_safe_xhttp_path \
            acme_cert_days_left cf_rand_index cf_make_hosts cf_valid_saved_host \
            multiselect_filter cdn_transport_enabled write_config_profile self_steal_template_url \
            self_steal_template_list random_hex gen_random_api_path random_node_port \
-           normalize_domain_input normalize_panel_url panel_url_host resolve_ipv4_host; do
+           normalize_node_image normalize_domain_input normalize_panel_url panel_url_host resolve_ipv4_host; do
   sed -n "/^${fn}() {\$/,/^}\$/p" "$SETUP" > "$WORK/$fn.sh"
   grep -q "^${fn}() {" "$WORK/$fn.sh" || fail "не удалось извлечь $fn из установщика"
   grep -q '^}$' "$WORK/$fn.sh" || fail "тело $fn обрезано (нет закрывающей скобки)"
@@ -956,5 +957,319 @@ if (
   fail "panel_fetch_node_secret вернул успех при ошибке API"
 fi
 ok "panel_fetch_node_secret: извлекает secretKey / pubKey и возвращает ошибку при сбое"
+
+# --- normalize_node_image и защита от голого образа «latest» -----------------
+[[ "$(normalize_node_image '')" == 'remnawave/node:latest' ]] \
+  || fail "normalize_node_image '': ожидался remnawave/node:latest"
+[[ "$(normalize_node_image 'latest')" == 'remnawave/node:latest' ]] \
+  || fail "normalize_node_image 'latest': голый тег не дополнен репозиторием"
+[[ "$(normalize_node_image '3.1.1')" == 'remnawave/node:3.1.1' ]] \
+  || fail "normalize_node_image '3.1.1': короткая версия не дополнена до remnawave/node:3.1.1"
+[[ "$(normalize_node_image 'node:3.1.1')" == 'remnawave/node:3.1.1' ]] \
+  || fail "normalize_node_image 'node:3.1.1': ожидался remnawave/node:3.1.1"
+[[ "$(normalize_node_image 'remnawave/node:3.1.1')" == 'remnawave/node:3.1.1' ]] \
+  || fail "normalize_node_image изменил валидный remnawave/node:3.1.1"
+[[ "$(normalize_node_image 'ghcr.io/remnawave/node:latest')" == 'ghcr.io/remnawave/node:latest' ]] \
+  || fail "normalize_node_image сломал внешний реестр ghcr.io"
+[[ "$(normalize_node_image 'registry.local:5000/remnawave/node:3.1.1')" == 'registry.local:5000/remnawave/node:3.1.1' ]] \
+  || fail "normalize_node_image сломал реестр с портом"
+# shellcheck disable=SC2016
+grep -qF 'NODE_IMAGE="${NODE_IMAGE:-remnawave/node:latest}"' "$SETUP" \
+  || fail "дефолт NODE_IMAGE в установщике не remnawave/node:latest"
+# shellcheck disable=SC2016
+grep -qF 'image: ${NODE_IMAGE:-remnawave/node:latest}' "$SETUP" \
+  || fail "в docker-compose.yml не указан image: \${NODE_IMAGE:-remnawave/node:latest}"
+# shellcheck disable=SC2016
+if grep -qF 'image: ${NODE_IMAGE:-latest}' "$SETUP"; then
+  fail "в docker-compose.yml остался голый образ latest без репозитория"
+fi
+ok "normalize_node_image и docker-compose.yml: голый образ latest исключён"
+
+# --- write_config_profile: X25519 ключи REALITY и их идемпотентность ----------
+(
+  NODE_DIR="$WORK/reality-keys"
+  CERT_DIR="/etc/remna-certs"
+  SCRIPT_DIR="$SRC"
+  SELF_STEAL_HOST="usa1.example.com"
+  HY_HOST="usa3.example.com"
+  ENABLE_XHTTP=1
+  XHTTP_SNI="www.gstatic.com"
+  XHTTP_PATH="/api/v3/sync/r1"
+  ENABLE_CDN=0
+  CDN_TRANSPORT="ws"
+  CDN_WS_PATH="/api/v1/stream"
+  CDN_XHTTP_PATH="/api/v3/sync/c1"
+  CDN_GRPC_PATH="/api/v4/stream"
+  write_config_profile >/dev/null
+  pk_vision="$(jq -r '.inbounds[] | select(.tag=="REALITY_VISION") | .streamSettings.realitySettings.privateKey' "$NODE_DIR/Multiselect.json")"
+  sid_vision="$(jq -r '.inbounds[] | select(.tag=="REALITY_VISION") | .streamSettings.realitySettings.shortIds[0]' "$NODE_DIR/Multiselect.json")"
+  pk_xhttp="$(jq -r '.inbounds[] | select(.tag=="REALITY_XHTTP") | .streamSettings.realitySettings.privateKey' "$NODE_DIR/Multiselect.json")"
+  [[ -n "$pk_vision" && -n "$pk_xhttp" && "$pk_vision" != "$pk_xhttp" ]] \
+    || fail "write_config_profile не сгенерировал независимые X25519 ключи REALITY"
+  [[ "$sid_vision" =~ ^[0-9a-f]{8}$ ]] \
+    || fail "write_config_profile: shortId не 8 hex-символов ($sid_vision)"
+  node -e '
+    const { createPrivateKey, createPublicKey } = require("node:crypto");
+    for (const b64 of process.argv.slice(1)) {
+      const raw = Buffer.from(b64, "base64");
+      if (raw.length !== 32) process.exit(1);
+      const priv = createPrivateKey({ key: { kty: "OKP", crv: "X25519", d: raw.toString("base64url"), x: "" }, format: "jwk" });
+      const pub = createPublicKey(priv).export({ format: "jwk" });
+      if (!pub.x || pub.x.length !== 43) process.exit(1);
+    }
+  ' -- "$pk_vision" "$pk_xhttp" "-GtSD1XDWxkwZUgqmAzNWaj4XGyw1P0p7ClRI6YHwl4" \
+    || fail "X25519 privateKey не проходит проверку Remnawave resolveInboundAndPublicKey"
+  # Повторный вызов обязан сохранить уже созданные ключи, а не вращать их.
+  write_config_profile >/dev/null
+  pk_vision_again="$(jq -r '.inbounds[] | select(.tag=="REALITY_VISION") | .streamSettings.realitySettings.privateKey' "$NODE_DIR/Multiselect.json")"
+  [[ "$pk_vision_again" == "$pk_vision" ]] \
+    || fail "повторный write_config_profile перезаписал существующий REALITY privateKey"
+)
+ok "write_config_profile: валидные X25519 ключи REALITY генерируются и сохраняются при повторе"
+
+# --- Полный цикл panel_auto_setup против строгого мока Remnawave 3.x API ------
+for fn in panel_node_slug panel_node_name panel_canonical_inbound_tag \
+          panel_prepare_profile_for_api panel_get_inbounds panel_find_node_by_address \
+          panel_find_host_by_remark panel_upsert_host \
+          panel_upsert_config_profile panel_upsert_node panel_trigger_node_start \
+          panel_upsert_internal_squad panel_upsert_subscription_template panel_auto_setup; do
+  sed -n "/^${fn}() {\$/,/^}\$/p" "$SETUP" > "$WORK/$fn.sh"
+  grep -q "^${fn}() {" "$WORK/$fn.sh" || fail "не удалось извлечь $fn"
+  # shellcheck source=/dev/null
+  . "$WORK/$fn.sh"
+done
+kv() { :; }
+
+(
+  # shellcheck disable=SC2034
+  {
+    DB="$WORK/rw3-state.json"
+    cat > "$DB" <<'JSON'
+{"profiles":[],"nodes":[],"hosts":[],"squads":[],"templates":[],"restarts":[],"enables":[]}
+JSON
+  }
+
+  # Мок panel_api со строгими ограничениями Remnawave 3.x:
+  # - securityLayer только DEFAULT | TLS | NONE («REALITY» → 400);
+  # - непустой privateKey у REALITY inbound'ов;
+  # - глобальный @@unique([tag]) у всех inbound'ов в БД (дубликат → 409);
+  # - @unique по address и name у нод (повторный POST → 409).
+  # shellcheck disable=SC2317,SC2329
+  panel_api() {
+    local method="$1" path="$2" body="${3:-}" out_file="$WORK/mock-resp.json" code_val="200"
+    node - "$DB" "$method" "$path" "$body" "$out_file" <<'JS' > "$WORK/mock-code.txt"
+const fs = require('node:fs');
+const crypto = require('node:crypto');
+const [dbPath, method, path, rawBody, outPath] = process.argv.slice(2);
+const db = JSON.parse(fs.readFileSync(dbPath, 'utf8'));
+const body = rawBody ? JSON.parse(rawBody) : {};
+const reply = (code, obj) => {
+  fs.writeFileSync(outPath, JSON.stringify(obj));
+  process.stdout.write(String(code));
+  fs.writeFileSync(dbPath, JSON.stringify(db, null, 2));
+  process.exit(0);
+};
+
+if (method === 'GET' && path === '/config-profiles') {
+  reply(200, { response: { total: db.profiles.length, configProfiles: db.profiles } });
+}
+const inbMatch = path.match(/^\/config-profiles\/([^/]+)\/inbounds$/);
+if (method === 'GET' && inbMatch) {
+  const p = db.profiles.find(x => x.uuid === inbMatch[1]);
+  reply(p ? 200 : 404, p ? { response: { total: p.inbounds.length, inbounds: p.inbounds } } : { message: 'Not found' });
+}
+if ((method === 'POST' || method === 'PATCH') && path === '/config-profiles') {
+  const existing = method === 'PATCH' ? db.profiles.find(x => x.uuid === body.uuid) : null;
+  if (method === 'PATCH' && !existing) reply(404, { message: 'Profile not found' });
+  if (method === 'POST' && db.profiles.some(x => x.name === body.name)) {
+    reply(409, { message: 'Config profile already exists' });
+  }
+  const inboundsCfg = (body.config && body.config.inbounds) || [];
+  for (const inb of inboundsCfg) {
+    if (inb.streamSettings && inb.streamSettings.realitySettings && !inb.streamSettings.realitySettings.privateKey) {
+      reply(400, { message: `Empty REALITY privateKey in ${inb.tag}` });
+    }
+    const taken = db.profiles
+      .filter(p => !existing || p.uuid !== existing.uuid)
+      .some(p => p.inbounds.some(i => i.tag === inb.tag));
+    if (taken) reply(409, { message: `Inbounds with same tag already exists: ${inb.tag}` });
+  }
+  const builtInbounds = inboundsCfg.map(inb => {
+    const prev = existing && existing.inbounds.find(i => i.tag === inb.tag);
+    return { uuid: prev ? prev.uuid : crypto.randomUUID(), tag: inb.tag, type: inb.protocol };
+  });
+  if (existing) {
+    existing.name = body.name;
+    existing.config = body.config;
+    existing.inbounds = builtInbounds;
+    reply(200, { response: existing });
+  } else {
+    const created = { uuid: crypto.randomUUID(), name: body.name, config: body.config, inbounds: builtInbounds };
+    db.profiles.push(created);
+    reply(201, { response: created });
+  }
+}
+if (method === 'GET' && path === '/nodes') {
+  reply(200, { response: db.nodes });
+}
+if (method === 'POST' && path === '/nodes') {
+  if (db.nodes.some(n => n.address === body.address)) reply(409, { message: 'Node with this address already exists' });
+  if (db.nodes.some(n => n.name === body.name)) reply(409, { message: 'Node with this name already exists' });
+  const created = { uuid: crypto.randomUUID(), ...body, isDisabled: false };
+  db.nodes.push(created);
+  reply(201, { response: created });
+}
+if (method === 'PATCH' && path === '/nodes') {
+  const n = db.nodes.find(x => x.uuid === body.uuid);
+  if (!n) reply(404, { message: 'Node not found' });
+  Object.assign(n, body);
+  reply(200, { response: n });
+}
+const enableMatch = path.match(/^\/nodes\/([^/]+)\/actions\/enable$/);
+if (method === 'POST' && enableMatch) {
+  const n = db.nodes.find(x => x.uuid === enableMatch[1]);
+  if (n) n.isDisabled = false;
+  db.enables.push(enableMatch[1]);
+  reply(200, { response: { eventSent: true } });
+}
+const restartMatch = path.match(/^\/nodes\/([^/]+)\/actions\/restart$/);
+if (method === 'POST' && restartMatch) {
+  db.restarts.push({ uuid: restartMatch[1], forceRestart: body.forceRestart });
+  reply(200, { response: { eventSent: true } });
+}
+if (method === 'GET' && path === '/hosts') {
+  reply(200, { response: db.hosts });
+}
+if ((method === 'POST' || method === 'PATCH') && path === '/hosts') {
+  const allowedLayers = ['DEFAULT', 'TLS', 'NONE'];
+  if (body.securityLayer && !allowedLayers.includes(body.securityLayer)) {
+    reply(400, { message: `Invalid securityLayer: ${body.securityLayer}` });
+  }
+  if (method === 'PATCH') {
+    const h = db.hosts.find(x => x.uuid === body.uuid);
+    if (!h) reply(404, { message: 'Host not found' });
+    Object.assign(h, body);
+    reply(200, { response: h });
+  } else {
+    const created = { uuid: crypto.randomUUID(), ...body };
+    db.hosts.push(created);
+    reply(201, { response: created });
+  }
+}
+if (method === 'GET' && path === '/internal-squads') {
+  reply(200, { response: { total: db.squads.length, internalSquads: db.squads } });
+}
+if (method === 'POST' && path === '/internal-squads') {
+  const s = { uuid: crypto.randomUUID(), name: body.name, inbounds: (body.inbounds || []).map(u => ({ uuid: u })) };
+  db.squads.push(s);
+  reply(201, { response: s });
+}
+if (method === 'PATCH' && path === '/internal-squads') {
+  const s = db.squads.find(x => x.uuid === body.uuid);
+  if (!s) reply(404, { message: 'Squad not found' });
+  s.inbounds = (body.inbounds || []).map(u => ({ uuid: u }));
+  reply(200, { response: s });
+}
+if (method === 'GET' && path === '/subscription-templates') {
+  reply(200, { response: { total: db.templates.length, templates: db.templates } });
+}
+if (method === 'POST' && path === '/subscription-templates') {
+  if (!/^[A-Za-z0-9_ -]+$/.test(body.name) || body.name === 'Default') {
+    reply(400, { message: `Invalid template name: ${body.name}` });
+  }
+  const t = { uuid: crypto.randomUUID(), name: body.name, templateType: body.templateType, templateJson: null };
+  db.templates.push(t);
+  reply(201, { response: t });
+}
+if (method === 'PATCH' && path === '/subscription-templates') {
+  const t = db.templates.find(x => x.uuid === body.uuid);
+  if (!t) reply(404, { message: 'Template not found' });
+  t.templateJson = body.templateJson;
+  reply(200, { response: t });
+}
+reply(404, { message: `Unhandled ${method} ${path}` });
+JS
+    code_val="$(cat "$WORK/mock-code.txt")"
+    printf '%s' "$code_val" > "$(panel_http_code_file)"
+    cat "$out_file"
+    [[ "$code_val" =~ ^2[0-9][0-9]$ ]]
+  }
+
+  export NODE_DIR="$WORK/auto-node1"
+  export CERT_DIR="/etc/remna-certs"
+  export SCRIPT_DIR="$SRC"
+  export REMNAWAVE_AUTO_SETUP=1
+  export REMNAWAVE_PANEL_URL="https://panel.example.com"
+  export REMNAWAVE_API_TOKEN="tok"
+  export CF_MODE=1
+  export BASE_DOMAIN="example.com"
+  export PREFIX="usa"
+  export VLESS_HOST="quiet-otter.example.com"
+  export SELF_STEAL_HOST="quiet-otter.example.com"
+  export HY_HOST="brisk-lantern.example.com"
+  export ENABLE_XHTTP=1
+  export XHTTP_SNI="www.gstatic.com"
+  export XHTTP_PATH="/api/v3/sync/aabbccdd"
+  export ENABLE_CDN=1
+  export CDN_HOST="cdn.example.com"
+  export CDN_TRANSPORT="ws"
+  export CDN_WS_PATH="/api/v1/11223344"
+  export CDN_XHTTP_PATH="/api/v3/sync/c1"
+  export CDN_GRPC_PATH="/api/v4/stream"
+  export SERVER_IP="203.0.113.10"
+  export NODE_API_PORT=2222
+  export XRAY_TEMPLATE_CHOICE="standard"
+
+  # 1. Свежая установка Node 1
+  write_config_profile >/dev/null
+  cp "$SRC/Xray_template.json" "$NODE_DIR/Xray_template.json"
+  panel_auto_setup >/dev/null || fail "panel_auto_setup упал на чистой Remnawave 3.x БД"
+  [[ -n "${PANEL_NODE_UUID:-}" ]] || fail "PANEL_NODE_UUID не заполнен после panel_auto_setup"
+  panel_trigger_node_start "$PANEL_NODE_UUID" >/dev/null
+  [[ "$(jq '.nodes | length' "$DB")" == "1" ]] || fail "ожидалась 1 созданная нода"
+  [[ "$(jq '.hosts | length' "$DB")" == "5" ]] || fail "ожидалось 5 хостов (4 скрытых + 1 видимый), получено $(jq '.hosts | length' "$DB")"
+  [[ "$(jq '[.hosts[] | select(.isHidden == true)] | length' "$DB")" == "4" ]] || fail "ожидалось 4 скрытых хоста"
+  [[ "$(jq '[.hosts[] | select(.isHidden == false and (.xrayJsonTemplateUuid != null))] | length' "$DB")" == "1" ]] \
+    || fail "видимый виртуальный хост не связан с XRAY_JSON шаблоном"
+  [[ "$(jq '.squads[0].inbounds | length' "$DB")" == "4" ]] || fail "Default-Squad не создан с 4 inbound'ами"
+  [[ "$(jq '.restarts | length' "$DB")" == "1" ]] || fail "panel_trigger_node_start не вызвал /actions/restart"
+
+  # 2. Повторный запуск на той же ноде со сменой порта и isDisabled=true
+  jq '.nodes[0].isDisabled = true' "$DB" > "$DB.tmp" && mv "$DB.tmp" "$DB"
+  NODE_API_PORT=34567
+  panel_auto_setup >/dev/null || fail "повторный panel_auto_setup со сменой порта упал"
+  [[ "$(jq '.nodes | length' "$DB")" == "1" ]] || fail "повторный запуск продублировал ноду"
+  [[ "$(jq '.nodes[0].port' "$DB")" == "34567" ]] || fail "порт существующей ноды не обновился"
+  [[ "$(jq '.nodes[0].isDisabled' "$DB")" == "false" ]] || fail "отключённая нода не была включена обратно"
+  [[ "$(jq '.profiles | length' "$DB")" == "1" ]] || fail "повторный запуск продублировал Config Profile"
+  [[ "$(jq '.hosts | length' "$DB")" == "5" ]] || fail "повторный запуск продублировал хосты"
+
+  # 3. Вторая нода в ту же панель (проверка обхода @@unique([tag]) и слияния Default-Squad)
+  NODE_DIR="$WORK/auto-node2"
+  VLESS_HOST="amber-falcon.example.com"
+  SELF_STEAL_HOST="amber-falcon.example.com"
+  HY_HOST="silver-birch.example.com"
+  SERVER_IP="198.51.100.42"
+  NODE_API_PORT=41234
+  write_config_profile >/dev/null
+  cp "$SRC/Xray_template.json" "$NODE_DIR/Xray_template.json"
+  panel_auto_setup >/dev/null || fail "установка второй ноды в ту же панель упала на коллизии тегов"
+  [[ "$(jq '.nodes | length' "$DB")" == "2" ]] || fail "вторая нода не создана в панели"
+  [[ "$(jq '.squads[0].inbounds | length' "$DB")" == "8" ]] \
+    || fail "Internal Squad затёр inbound'ы первой ноды вместо объединения: $(jq '.squads[0].inbounds | length' "$DB")"
+)
+ok "panel_auto_setup: Remnawave 3.x (создание ноды, ключи REALITY, хосты, шаблон, squad, рестарт и мульти-нода)"
+
+# --- Порядок шага 9: сначала нода в панели, затем SECRET_KEY и Docker --------
+step9="$(awk '/^step 9 /{flag=1} /^step 10 /{flag=0} flag' "$SETUP")"
+line_auto="$(printf '%s\n' "$step9" | grep -n 'panel_auto_setup' | head -1 | cut -d: -f1)"
+line_secret="$(printf '%s\n' "$step9" | grep -n 'ask_secret SECRET_RAW' | head -1 | cut -d: -f1)"
+line_pull="$(printf '%s\n' "$step9" | grep -n 'docker compose pull' | head -1 | cut -d: -f1)"
+line_start="$(printf '%s\n' "$step9" | grep -n 'panel_trigger_node_start' | head -1 | cut -d: -f1)"
+[[ -n "$line_auto" && -n "$line_secret" && -n "$line_pull" && -n "$line_start" ]] \
+  || fail "не найдены ключевые вызовы на шаге 9 ($line_auto/$line_secret/$line_pull/$line_start)"
+(( line_auto < line_secret && line_secret < line_pull && line_pull < line_start )) \
+  || fail "нарушен порядок шага 9: panel_auto_setup($line_auto) → SECRET_KEY($line_secret) → pull($line_pull) → sync($line_start)"
+ok "шаг 9: нода создаётся в панели ДО запроса SECRET_KEY и docker compose pull"
 
 printf 'все проверки функций установщика прошли\n'
