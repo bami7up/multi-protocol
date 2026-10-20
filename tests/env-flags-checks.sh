@@ -299,10 +299,11 @@ done
 ok "NODE_API_PORT: занятые порты схемы, включая CDN, отвергаются"
 
 # --- 5. Быстрый режим: блок протоколов без вопросов -------------------------
-# QUICK_SETUP=1 обязан включать XHTTP и CDN сам: домен CDN — cdn.<базовый>,
+# QUICK_SETUP=1 обязан включать XHTTP и CDN сам: домен CDN — уникальный
+# cdn-<6 hex>.<базовый> (без коллизии между несколькими нодами на одном домене),
 # пути на свежей установке — случайные, а сохранённые значения (повторный
 # запуск, ENV_STORE_LOADED=1) не затираются новыми случайными.
-for fn in cf_rand_index random_hex gen_random_api_path; do
+for fn in cf_rand_index random_hex gen_random_api_path gen_cdn_host; do
   extract "$fn"
 done
 run_quick_flags() {
@@ -323,6 +324,8 @@ run_quick_flags() {
     # shellcheck source=/dev/null
     . "$WORK/gen_random_api_path.sh"
     # shellcheck source=/dev/null
+    . "$WORK/gen_cdn_host.sh"
+    # shellcheck source=/dev/null
     . "$WORK/flags.sh"
     printf '%s|%s|%s|%s|%s|%s\n' "$ENABLE_XHTTP" "$ENABLE_CDN" "$XHTTP_SNI" \
       "$XHTTP_PATH" "$CDN_HOST" "$CDN_WS_PATH"
@@ -333,16 +336,21 @@ export XHTTP_SNI='' XHTTP_PATH='' CDN_HOST='' CDN_TRANSPORT=''
 export CDN_WS_PATH=/api/v1/stream CDN_XHTTP_PATH=/api/v3/sync/c1 CDN_GRPC_PATH=/api/v4/stream
 export ENV_STORE_LOADED=0
 quick_out="$(run_quick_flags)" || fail "быстрый режим: блок флагов завершился ошибкой"
+quick_out2="$(run_quick_flags)" || fail "быстрый режим (2-я нода): блок флагов завершился ошибкой"
 IFS='|' read -r q_xhttp q_cdn q_sni q_path q_host q_wspath <<< "$quick_out"
+IFS='|' read -r _ _ _ _ q_host2 _ <<< "$quick_out2"
 [[ "$q_xhttp" == 1 && "$q_cdn" == 1 ]] \
   || fail "быстрый режим не включил XHTTP/CDN сам: «$quick_out»"
 [[ "$q_sni" == "www.gstatic.com" ]] || fail "быстрый режим: SNI не дефолтный: «$q_sni»"
-[[ "$q_host" == "cdn.example.com" ]] || fail "быстрый режим: CDN-домен не cdn.<домен>: «$q_host»"
+[[ "$q_host" =~ ^cdn-[0-9a-f]{6}\.example\.com$ ]] \
+  || fail "быстрый режим: CDN-домен не вида cdn-<hex6>.example.com: «$q_host»"
+[[ "$q_host" != "$q_host2" ]] \
+  || fail "быстрый режим: две ноды на одном домене получили одинаковый CDN-домен: «$q_host»"
 [[ "$q_path" =~ ^/api/v3/sync/[0-9a-f]{8}$ ]] \
   || fail "быстрый режим: путь XHTTP не случайный на свежей установке: «$q_path»"
 [[ "$q_wspath" =~ ^/api/v1/[0-9a-f]{8}$ ]] \
   || fail "быстрый режим: путь CDN WS не случайный на свежей установке: «$q_wspath»"
-ok "быстрый режим: XHTTP+CDN без вопросов, домен и случайные пути — автоматически"
+ok "быстрый режим: XHTTP+CDN без вопросов, уникальный CDN-домен на каждую ноду и случайные пути"
 
 export XHTTP_PATH=/custom/sync CDN_HOST=cdn2.example.com ENV_STORE_LOADED=1
 export CDN_WS_PATH=/api/v1/stream

@@ -391,12 +391,22 @@ cf_setup_cdn_host
 unset CF_MODE_SETTING
 ok "cf_setup_cdn_host: --no-cloudflare не трогает Cloudflare API"
 
-# Мастер обязан предлагать CDN-домен сам (Enter — cdn.<базовый домен>),
-# а не требовать выдумывать его с пустым дефолтом.
-# shellcheck disable=SC2016 # ищем литеральный фрагмент кода установщика, подстановка не нужна
-grep -qF 'cdn.${BASE_DOMAIN' "$SETUP" \
-  || fail "мастер не предлагает CDN-домен по умолчанию (cdn.<базовый домен>)"
-ok "CDN_HOST: по умолчанию предлагается cdn.<BASE_DOMAIN>"
+# Мастер обязан предлагать уникальный CDN-домен для каждой ноды сам
+# (cdn-<6 hex>.<базовый домен> — без коллизии между несколькими нодами на домене).
+sed -n '/^gen_cdn_host() {$/,/^}$/p' "$SETUP" > "$WORK/gen_cdn_host.sh"
+grep -q '^gen_cdn_host() {' "$WORK/gen_cdn_host.sh" || fail "не найдена функция gen_cdn_host"
+# shellcheck source=/dev/null
+. "$WORK/gen_cdn_host.sh"
+cdn_gen_1="$(gen_cdn_host "example.com")"
+cdn_gen_2="$(gen_cdn_host "example.com")"
+[[ "$cdn_gen_1" =~ ^cdn-[0-9a-f]{6}\.example\.com$ ]] \
+  || fail "gen_cdn_host вернул неожиданный формат: $cdn_gen_1"
+[[ "$cdn_gen_1" != "$cdn_gen_2" ]] \
+  || fail "gen_cdn_host сгенерировал одинаковый домен дважды подряд: $cdn_gen_1"
+# shellcheck disable=SC2016
+grep -qF 'gen_cdn_host "${BASE_DOMAIN:-}"' "$SETUP" \
+  || fail "мастер не предлагает уникальный CDN-домен через gen_cdn_host"
+ok "CDN_HOST: по умолчанию генерируется уникальный cdn-<hex6>.<BASE_DOMAIN> на каждую ноду"
 
 # --- Быстрый режим: нормализация вводов и случайные значения ---------------
 # Домен и URL панели люди вставляют «как из браузера»: со схемой, слэшем в
@@ -1028,11 +1038,12 @@ ok "normalize_node_image и docker-compose.yml: голый образ latest и�
 ok "write_config_profile: валидные X25519 ключи REALITY генерируются и сохраняются при повторе"
 
 # --- Полный цикл panel_auto_setup против строгого мока Remnawave 3.x API ------
-for fn in panel_node_slug panel_node_name panel_canonical_inbound_tag \
+for fn in write_xray_template panel_node_slug panel_node_tag panel_node_name panel_canonical_inbound_tag \
           panel_prepare_profile_for_api panel_get_inbounds panel_find_node_by_address \
           panel_find_host_by_remark panel_upsert_host \
           panel_upsert_config_profile panel_upsert_node panel_trigger_node_start \
-          panel_upsert_internal_squad panel_upsert_subscription_template panel_auto_setup; do
+          panel_upsert_internal_squad panel_find_subscription_template_uuid \
+          panel_upsert_subscription_template panel_auto_setup; do
   sed -n "/^${fn}() {\$/,/^}\$/p" "$SETUP" > "$WORK/$fn.sh"
   grep -q "^${fn}() {" "$WORK/$fn.sh" || fail "не удалось извлечь $fn"
   # shellcheck source=/dev/null
@@ -1229,6 +1240,12 @@ JS
   [[ "$(jq '.nodes | length' "$DB")" == "1" ]] || fail "ожидалась 1 созданная нода"
   [[ "$(jq '.hosts | length' "$DB")" == "5" ]] || fail "ожидалось 5 хостов (4 скрытых + 1 видимый), получено $(jq '.hosts | length' "$DB")"
   [[ "$(jq '[.hosts[] | select(.isHidden == true)] | length' "$DB")" == "4" ]] || fail "ожидалось 4 скрытых хоста"
+  [[ "$(jq '[.hosts[] | select(.isHidden == true and .tags == ["QUIET_OTTER"])] | length' "$DB")" == "4" ]] \
+    || fail "скрытые хосты Node 1 должны иметь уникальный тег QUIET_OTTER, а не общий USA: $(jq -c '[.hosts[].tags]' "$DB")"
+  [[ "$(jq '[.hosts[] | select((.tags // []) | index("USA"))] | length' "$DB")" == "0" ]] \
+    || fail "остался захардкоженный тег USA у хостов"
+  [[ "$(jq '[.templates[] | select(.name == "XRAY standard quiet-otter" and .templateJson.routing.balancers[0].tag == "QUIET_OTTER" and .templateJson.remnawave.injectHosts[0].selector.pattern == "^QUIET_OTTER$")] | length' "$DB")" == "1" ]] \
+    || fail "шаблон XRAY standard quiet-otter не переписал тег балансировки под QUIET_OTTER"
   [[ "$(jq '[.hosts[] | select(.isHidden == false and (.xrayJsonTemplateUuid != null))] | length' "$DB")" == "1" ]] \
     || fail "видимый виртуальный хост не связан с XRAY_JSON шаблоном"
   [[ "$(jq '.squads[0].inbounds | length' "$DB")" == "4" ]] || fail "Default-Squad не создан с 4 inbound'ами"
@@ -1244,21 +1261,73 @@ JS
   [[ "$(jq '.profiles | length' "$DB")" == "1" ]] || fail "повторный запуск продублировал Config Profile"
   [[ "$(jq '.hosts | length' "$DB")" == "5" ]] || fail "повторный запуск продублировал хосты"
 
-  # 3. Вторая нода в ту же панель (проверка обхода @@unique([tag]) и слияния Default-Squad)
+  # 3. Вторая нода + большой split-шаблон (>30 КБ, проверка буфера mawk + write_xray_template)
   NODE_DIR="$WORK/auto-node2"
   VLESS_HOST="amber-falcon.example.com"
   SELF_STEAL_HOST="amber-falcon.example.com"
   HY_HOST="silver-birch.example.com"
+  CDN_HOST="cdn-99aa11.example.com"
   SERVER_IP="198.51.100.42"
   NODE_API_PORT=41234
+  XRAY_TEMPLATE_CHOICE="split"
   write_config_profile >/dev/null
-  cp "$SRC/Xray_template.json" "$NODE_DIR/Xray_template.json"
-  panel_auto_setup >/dev/null || fail "установка второй ноды в ту же панель упала на коллизии тегов"
+  # Намеренно не копируем Xray_template.json вручную: panel_upsert_subscription_template
+  # обязан вызвать write_xray_template сам, распарсить 32 КБ JSON5 и привязать к хосту.
+  panel_auto_setup >/dev/null || fail "установка второй ноды со split-шаблоном упала"
   [[ "$(jq '.nodes | length' "$DB")" == "2" ]] || fail "вторая нода не создана в панели"
+  [[ "$(jq '[.hosts[] | select(.isHidden == true and .tags == ["AMBER_FALCON"])] | length' "$DB")" == "4" ]] \
+    || fail "скрытые хосты второй ноды не получили изолированный тег AMBER_FALCON"
+  [[ "$(jq '[.templates[] | select(.name == "XRAY split amber-falcon" and .templateJson.routing.balancers[0].tag == "AMBER_FALCON" and .templateJson.remnawave.injectHosts[0].selector.pattern == "^AMBER_FALCON$")] | length' "$DB")" == "1" ]] \
+    || fail "шаблон XRAY split amber-falcon не создан с тегом AMBER_FALCON"
+  [[ "$(jq '[.hosts[] | select(.isHidden == false) | .xrayJsonTemplateUuid] | unique | length' "$DB")" == "2" ]] \
+    || fail "видимые хосты разных нод должны ссылаться на собственные XRAY_JSON шаблоны"
   [[ "$(jq '.squads[0].inbounds | length' "$DB")" == "8" ]] \
     || fail "Internal Squad затёр inbound'ы первой ноды вместо объединения: $(jq '.squads[0].inbounds | length' "$DB")"
+
+  # 4. Отказ 403 на /subscription-templates (нет права subscription-template:*):
+  #    panel_check_connection обязан ловить его на шаге 1, а panel_auto_setup —
+  #    возвращать ненулевой код и называть subscription-template:*, а не молчать.
+  # shellcheck disable=SC2317,SC2329
+  panel_api() {
+    if [[ "$2" == /subscription-templates* || "$2" == /templates* ]]; then
+      printf '403' > "$(panel_http_code_file)"
+      printf '%s' '{"message":"Forbidden resource","code":"A040"}'
+      return 1
+    fi
+    printf '200' > "$(panel_http_code_file)"
+    printf '%s' '{"response":{"total":0,"configProfiles":[],"internalSquads":[],"nodes":[],"hosts":[]}}'
+    return 0
+  }
+  if panel_check_connection; then
+    fail "panel_check_connection пропустил отсутствие доступа к subscription-templates"
+  fi
+  [[ "$PANEL_CONN_REASON" == "scope" && "$PANEL_CONN_DETAIL" == *"subscription-templates"* ]] \
+    || fail "panel_check_connection не указал subscription-templates: $PANEL_CONN_REASON / $PANEL_CONN_DETAIL"
+  [[ "$(panel_connection_hint)" == *"subscription-template:*"* ]] \
+    || fail "panel_connection_hint не подсказывает право subscription-template:*"
+  # shellcheck disable=SC2317,SC2329
+  warn() { printf '▲ %s\n' "$*"; }
+  # shellcheck disable=SC2317,SC2329
+  note() { printf '   %s\n' "$*"; }
+  out_403=""
+  if out_403="$(panel_upsert_subscription_template "standard" 2>&1)"; then
+    fail "panel_upsert_subscription_template вернул 0 при HTTP 403"
+  fi
+  [[ "$out_403" == *"subscription-template:*"* ]] \
+    || fail "ошибка создания шаблона не подсказывает право subscription-template:*: $out_403"
 )
-ok "panel_auto_setup: Remnawave 3.x (создание ноды, ключи REALITY, хосты, шаблон, squad, рестарт и мульти-нода)"
+ok "panel_auto_setup: Remnawave 3.x (создание ноды, ключи REALITY, хосты, XRAY шаблон, squad, рестарт и 403 диагностика)"
+
+# Проверка буфера mawk (>8192 байт с висячими запятыми в json5_to_json)
+big_json5="$(awk 'BEGIN {
+  printf "{\n  // comment\n  \"pad\": \"";
+  for (i = 0; i < 12000; i++) printf "x";
+  printf "\",\n  \"items\": [1, 2, ],\n}\n";
+}')"
+big_parsed="$(json5_to_json <<<"$big_json5" | jq -r '.items | length')" \
+  || fail "json5_to_json упал на файле >8192 байт с висячими запятыми (лимит sprintf в mawk)"
+[[ "$big_parsed" == "2" ]] || fail "json5_to_json повредил большой JSON5 ($big_parsed)"
+ok "json5_to_json: шаблоны >8 КБ с комментариями и висячими запятыми не режутся в mawk"
 
 # --- Порядок шага 9: сначала нода в панели, затем SECRET_KEY и Docker --------
 step9="$(awk '/^step 9 /{flag=1} /^step 10 /{flag=0} flag' "$SETUP")"
