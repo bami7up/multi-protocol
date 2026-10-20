@@ -746,6 +746,7 @@ ok "acme_cert_days_left: свежий учитывается, битый/отс�
 for fn in panel_curl_cfg_init panel_http_code_file panel_http_error_file panel_state_init panel_api_code panel_api \
          panel_api_success panel_api_error panel_check_connection \
          panel_connection_hint panel_api_retry \
+         panel_fetch_node_secret \
          panel_profile_name panel_result_uuid panel_try_host \
          panel_find_profile_by_name json5_to_json; do
   sed -n "/^${fn}() {\$/,/^}\$/p" "$SETUP" > "$WORK/panel-$fn.sh"
@@ -922,5 +923,38 @@ panel_try_host a b c >/dev/null || rc=$?
 HOST_STUB_RC=0
 unset -f panel_upsert_host
 ok "panel_try_host: успех молчит, ошибка возвращает код"
+
+# panel_fetch_node_secret: Remnawave 3.x (secretKey) и 2.x (pubKey)
+panel_mock_reset
+key="$( (
+  # shellcheck disable=SC2317,SC2329
+  panel_api() { printf '%s' '{"response":{"secretKey":"eyJhbGciOiJSUzI1NiJ9.v3key"}}'; }
+  # shellcheck disable=SC2317,SC2329
+  panel_api_code() { printf '200'; }
+  panel_fetch_node_secret
+) )"
+[[ "$key" == "eyJhbGciOiJSUzI1NiJ9.v3key" ]] || fail "panel_fetch_node_secret v3 secretKey не извлечён: '$key'"
+
+key="$( (
+  # shellcheck disable=SC2317,SC2329
+  panel_api() { printf '%s' '{"response":{"pubKey":"eyJhbGciOiJSUzI1NiJ9.v2key"}}'; }
+  # shellcheck disable=SC2317,SC2329
+  panel_api_code() { printf '200'; }
+  panel_fetch_node_secret
+) )"
+[[ "$key" == "eyJhbGciOiJSUzI1NiJ9.v2key" ]] || fail "panel_fetch_node_secret legacy pubKey не извлечён: '$key'"
+
+if (
+  # shellcheck disable=SC2317,SC2329
+  panel_api() { printf '%s' '{"message":"Forbidden resource"}'; }
+  # shellcheck disable=SC2317,SC2329
+  panel_api_code() { printf '403'; }
+  # shellcheck disable=SC2317,SC2329
+  panel_api_success() { return 1; }
+  panel_fetch_node_secret
+); then
+  fail "panel_fetch_node_secret вернул успех при ошибке API"
+fi
+ok "panel_fetch_node_secret: извлекает secretKey / pubKey и возвращает ошибку при сбое"
 
 printf 'все проверки функций установщика прошли\n'
