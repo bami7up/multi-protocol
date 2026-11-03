@@ -33,30 +33,25 @@ ok()   { printf '✔ %s\n' "$*"; }
 
 [[ -r "$SETUP" ]] || fail "не найден $SETUP"
 
-extract() { # extract <имя функции> → файл с её телом
-  local fn="$1"
-  sed -n "/^${fn}() {\$/,/^}\$/p" "$SETUP" > "$WORK/$fn.sh"
-  grep -q "^${fn}() {" "$WORK/$fn.sh" || fail "не удалось извлечь $fn из установщика"
-  grep -q '^}$' "$WORK/$fn.sh" || fail "тело $fn обрезано (нет закрывающей скобки)"
-}
-
-# Стабы: вопросы в тесте не задаются, ответ подставляется через ASK_REPLY —
-# так проверяется именно нормализация, а не диалог.
+# Источник истины — lib/*.sh; блоки флагов и env-файла теперь функции,
+# тесты вызывают их напрямую, без sed/awk-извлечения.
+for f in "$SRC"/lib/*.sh; do
+  [[ "$(basename "$f")" == "90-main.sh" ]] && continue
+  # shellcheck source=/dev/null
+  . "$f"
+done
+ok()   { printf '✔ %s\n' "$*"; }
+# Стабы: вопросы в тесте не задаются, ответ подставляется через ASK_REPLY.
 die()  { printf '✖ %s\n' "$*" >&2; exit 1; }
 warn() { printf '▲ %s\n' "$*" >&2; }
 note() { printf '   %s\n' "$*" >&2; }
-ask()  { # ask VAR PROMPT [DEFAULT]; как настоящий ask, но ответ из ASK_REPLY
+ask()  { # ask VAR PROMPT [DEFAULT]
   local __var="$1" __default="${3:-}"
   printf -v "$__var" '%s' "${ASK_REPLY:-$__default}"
 }
 
 # --- 1. parse_bool / bool_yn / ask_bool -------------------------------------
-for fn in parse_bool bool_yn ask_bool; do
-  extract "$fn"
-  # shellcheck source=/dev/null
-  . "$WORK/$fn.sh"
-done
-ok "функции разбора логических флагов извлечены из установщика"
+ok "функции разбора логических флагов загружены из lib/"
 
 # Все написания, которые встречаются в env, в env-файле прежних версий и в
 # ответах пользователя, должны пониматься одинаково.
@@ -100,11 +95,8 @@ ok "ask_bool: мусорный ответ переспрашивается, за
 
 # confirm: тот же разбор ответа, что у флагов. Раньше «1» и «yes» в ответ на
 # «Всё верно, продолжаем?» читались по-разному, а мусор молча значил «нет».
-extract confirm
 ASSUME_YES=0 # в установщике переменная всегда определена; confirm её читает
 export ASSUME_YES
-# shellcheck source=/dev/null
-. "$WORK/confirm.sh"
 if ASK_REPLY='1' confirm 'Продолжаем?' 'n'; then :; else fail "confirm: ответ «1» не считается согласием"; fi
 if ASK_REPLY='yes' confirm 'Продолжаем?' 'n'; then :; else fail "confirm: ответ «yes» не считается согласием"; fi
 if ASK_REPLY='n' confirm 'Продолжаем?' 'y'; then fail "confirm: ответ «n» считается согласием"; fi
@@ -112,24 +104,7 @@ if ASSUME_YES=1 ASK_REPLY='n' confirm 'Продолжаем?' 'n' 2>/dev/null; t
 ok "confirm: 1/yes/n и ASSUME_YES понимаются одинаково"
 
 # --- 2. Запись /root/remnanode.env и повторный запуск ------------------------
-# Извлекаем ровно те фрагменты установщика, которые читают ответы шага 1 и
-# пишут env-файл: сначала разбор флагов, затем блок записи.
-if grep -q '^# === flags block start ===' "$SETUP"; then
-  sed -n '/^# === flags block start ===/,/^# === flags block end ===/p' "$SETUP" > "$WORK/flags.sh"
-else
-  sed -n '/^ask_bool ENABLE_XHTTP/,/^ask PANEL_IP /p' "$SETUP" | sed '$d' > "$WORK/flags.sh"
-fi
-grep -q 'ask_bool ENABLE_CDN' "$WORK/flags.sh" || fail "не удалось извлечь разбор флагов из установщика"
-grep -q 'ask_bool ENABLE_XHTTP' "$WORK/flags.sh" || fail "в извлечённом фрагменте нет разбора XHTTP"
-awk '/^\( umask 077$/,/^\)$/' "$SETUP" > "$WORK/env-store.sh"
-grep -qF 'export ENABLE_CDN=' "$WORK/env-store.sh" || fail "не удалось извлечь запись env-файла"
-grep -qF 'export QUICK_SETUP=' "$WORK/env-store.sh" \
-  || fail "режим мастера не сохраняется в env-файл (повторный запуск будет спрашивать заново)"
-grep -qF '} > "$ENV_STORE"' "$WORK/env-store.sh" \
-  || fail "извлечённый блок записи env-файла не пишет в ENV_STORE"
-for fn in ask ask_secret cdn_transport_enabled bool_yn parse_bool; do
-  extract "$fn"
-done
+# prompt_flags и write_env_store — функции lib/15-wizard.sh.
 
 # first_run_values <ENABLE_XHTTP|«-» = не задано> <ENABLE_CDN|«-»> <файл>
 # Значения, которые шаг 1 установщика получает от предыдущих шагов. Пишутся
@@ -147,6 +122,7 @@ first_run_values() {
     printf 'SERVER_IP=203.0.113.10\n'
     printf 'PANEL_IP=203.0.113.10\n'
     printf 'NODE_API_PORT=2222\n'
+    printf 'NODE_IMAGE=remnawave/node:3.1.1\n'
     printf 'CLOUDFLARE_API_TOKEN=test-token\n'
     printf 'NONINTERACTIVE=1\n'
     printf 'CDN_HOST=cdn.example.com\n'
@@ -166,16 +142,8 @@ run_install() {
     set -Eeuo pipefail
     # shellcheck source=/dev/null
     . "$1"
-    # shellcheck source=/dev/null
-    . "$WORK/ask.sh"
-    # shellcheck source=/dev/null
-    . "$WORK/cdn_transport_enabled.sh"
-    # shellcheck source=/dev/null
-    . "$WORK/flags.sh"
-    # shellcheck source=/dev/null
-    . "$WORK/bool_yn.sh"
-    # shellcheck source=/dev/null
-    . "$WORK/env-store.sh"
+    prompt_flags
+    write_env_store
   ) > "$WORK/install-out" 2>&1 || fail "первый запуск не удался: $(tail -n3 "$WORK/install-out")"
 }
 
@@ -189,12 +157,7 @@ read_flags() {
     # Флаги и CDN-переменные намеренно не задаём: проверяем именно env-файл.
     # shellcheck source=/dev/null
     . "$1"
-    # shellcheck source=/dev/null
-    . "$WORK/ask.sh"
-    # shellcheck source=/dev/null
-    . "$WORK/cdn_transport_enabled.sh"
-    # shellcheck source=/dev/null
-    . "$WORK/flags.sh"
+    prompt_flags
     printf '%s|%s|%s|%s\n' "$ENABLE_XHTTP" "$ENABLE_CDN" "${XHTTP_SNI:-}" "${XHTTP_PATH:-}"
   ) 2>/dev/null | tail -n1
 }
@@ -227,6 +190,10 @@ for spec in \
   read_out="$(read_flags "$store")"
   [[ "$read_out" == "$out_xhttp|$out_cdn|$out_sni|$out_path" ]] \
     || fail "при входе $in_xhttp/$in_cdn повторный запуск дал «$read_out», ожидалось «$out_xhttp|$out_cdn|$out_sni|$out_path»"
+  [[ "$(stat -c '%a' "$store")" == "600" ]] \
+    || fail "env-файл с токенами должен быть 0600, а не $(stat -c '%a' "$store")"
+  grep -qx 'export NODE_IMAGE=remnawave/node:3.1.1' "$store" \
+    || fail "NODE_IMAGE не сохраняется в env-файл (повторный запуск вернёт latest)"
   checked=$((checked + 1))
 done
 ok "env-файл: $checked наборов вход/файл/повторный запуск совпали (y/n, 1/0, дефолты)"
@@ -240,61 +207,43 @@ printf 'export ENABLE_XHTTP=1\nexport ENABLE_CDN=1\nexport CDN_HOST=cdn.example.
 ok "совместимость: ENABLE_CDN=1 из старого env-файла по-прежнему включает CDN"
 
 # --- 3. SERVER_IP из env важнее автодетекта ----------------------------------
-awk '/^# SERVER_IP нужен для A-записей/,/^# Выбор режима мастера/' "$SETUP" | sed '$d' > "$WORK/server-ip.sh"
-grep -q 'ifconfig.me' "$WORK/server-ip.sh" || fail "не удалось извлечь блок определения SERVER_IP"
-for fn in is_ipv4 is_private_ipv4; do
-  extract "$fn"
-done
-# Внутри проверки подменяем внешние зависимости блока: curl — «ответ внешнего
-# сервиса», have — наличие команды; его собственный вывод глушим.
-curl() { printf '%s' "${CURL_FIXTURE:-}"; }
-
-resolve_server_ip() { # resolve_server_ip <SERVER_IP из env> <ответ внешнего сервиса>
+resolve_server_ip_test() { # <SERVER_IP из env> <ответ внешнего сервиса>
   (
     set -Eeuo pipefail
     SERVER_IP="$1"
     CURL_FIXTURE="$2"
-    have() { command -v "$1" >/dev/null 2>&1; }
+    have() { return 0; }
+    curl() { printf '%s' "$CURL_FIXTURE"; }
     ok() { :; }
     warn() { :; }
-    # shellcheck source=/dev/null
-    . "$WORK/is_ipv4.sh"
-    # shellcheck source=/dev/null
-    . "$WORK/is_private_ipv4.sh"
-    # shellcheck source=/dev/null
-    . "$WORK/server-ip.sh"
+    resolve_server_ip
     printf '%s\n' "$SERVER_IP"
   ) 2>/dev/null | tail -n1
 }
 
-got="$(resolve_server_ip '203.0.113.10' '198.51.100.7')"
+got="$(resolve_server_ip_test '203.0.113.10' '198.51.100.7')"
 [[ "$got" == '203.0.113.10' ]] || fail "SERVER_IP из env затирается автодетектом: $got"
-got="$(resolve_server_ip '' '198.51.100.7')"
+got="$(resolve_server_ip_test '' '198.51.100.7')"
 [[ "$got" == '198.51.100.7' ]] || fail "без SERVER_IP автодетект не работает: $got"
-got="$(resolve_server_ip '10.0.0.5' '198.51.100.7')"
+got="$(resolve_server_ip_test '10.0.0.5' '198.51.100.7')"
 [[ "$got" == '198.51.100.7' ]] || fail "приватный SERVER_IP не заменяется публичным адресом: $got"
-got="$(resolve_server_ip '' '')"
+got="$(resolve_server_ip_test 'not-an-ip' '198.51.100.7')"
+[[ "$got" == '198.51.100.7' ]] || fail "невалидный SERVER_IP не заменяется автодетектом: $got"
+got="$(resolve_server_ip_test '' '')"
 [[ -z "$got" ]] || fail "при недоступном автодетекте SERVER_IP должен остаться пустым: $got"
 ok "SERVER_IP: значение из env приоритетнее автодетекта, приватный адрес заменяется"
 
 # --- 4. Порт ноды не должен совпадать с портами схемы -----------------------
 # CDN-порты (сайт CDN-хоста и его инбаунды) объявлены константами, и проверка
 # занятости обязана их учитывать: иначе Node API займёт порт CDN-инбаунда.
-ports_line="$(sed -n '/^case "\$NODE_API_PORT" in/{n;p;}' "$SETUP")"
-[[ -n "$ports_line" ]] || fail "не найдена проверка занятости NODE_API_PORT"
-ports_line="${ports_line%)}"
-ports_line="${ports_line//\"/}"
-IFS='|' read -r -a port_tokens <<< "$ports_line"
 for port in 80 443 9443 10443 10444; do
-  found=0
-  for token in "${port_tokens[@]}"; do
-    [[ "${token// /}" == "$port" ]] && found=1
-  done
-  (( found )) || fail "порт схемы $port не исключён из NODE_API_PORT"
+  is_reserved_node_port "$port" \
+    || fail "порт схемы $port не исключён из NODE_API_PORT"
 done
 for var in CDN_TLS_PORT CDN_WS_PORT CDN_XHTTP_PORT CDN_GRPC_PORT; do
-  grep -qF "\$$var" <<< "$ports_line" \
-    || fail "$var не исключён из NODE_API_PORT (конфликт портов с CDN)"
+  port="${!var}"
+  is_reserved_node_port "$port" \
+    || fail "$var ($port) не исключён из NODE_API_PORT (конфликт портов с CDN)"
 done
 ok "NODE_API_PORT: занятые порты схемы, включая CDN, отвергаются"
 
@@ -303,9 +252,6 @@ ok "NODE_API_PORT: занятые порты схемы, включая CDN, о�
 # cdn-<6 hex>.<базовый> (без коллизии между несколькими нодами на одном домене),
 # пути на свежей установке — случайные, а сохранённые значения (повторный
 # запуск, ENV_STORE_LOADED=1) не затираются новыми случайными.
-for fn in cf_rand_index random_hex gen_random_api_path gen_cdn_host; do
-  extract "$fn"
-done
 run_quick_flags() {
   (
     set -Eeuo pipefail
@@ -313,22 +259,9 @@ run_quick_flags() {
     export BASE_DOMAIN=example.com
     export CLOUDFLARE_API_TOKEN=test-token
     export CDN_WS_ENABLED=0 CDN_XHTTP_ENABLED=0 CDN_GRPC_ENABLED=0
-    # shellcheck source=/dev/null
-    . "$WORK/ask.sh"
-    # shellcheck source=/dev/null
-    . "$WORK/cdn_transport_enabled.sh"
-    # shellcheck source=/dev/null
-    . "$WORK/cf_rand_index.sh"
-    # shellcheck source=/dev/null
-    . "$WORK/random_hex.sh"
-    # shellcheck source=/dev/null
-    . "$WORK/gen_random_api_path.sh"
-    # shellcheck source=/dev/null
-    . "$WORK/gen_cdn_host.sh"
-    # shellcheck source=/dev/null
-    . "$WORK/flags.sh"
-    printf '%s|%s|%s|%s|%s|%s\n' "$ENABLE_XHTTP" "$ENABLE_CDN" "$XHTTP_SNI" \
-      "$XHTTP_PATH" "$CDN_HOST" "$CDN_WS_PATH"
+    prompt_flags
+    printf '%s|%s|%s|%s|%s|%s|%s\n' "$ENABLE_XHTTP" "$ENABLE_CDN" "$XHTTP_SNI" \
+      "$XHTTP_PATH" "$CDN_HOST" "$CDN_WS_PATH" "$CDN_TRANSPORT"
   ) 2>/dev/null
 }
 
@@ -337,8 +270,8 @@ export CDN_WS_PATH=/api/v1/stream CDN_XHTTP_PATH=/api/v3/sync/c1 CDN_GRPC_PATH=/
 export ENV_STORE_LOADED=0
 quick_out="$(run_quick_flags)" || fail "быстрый режим: блок флагов завершился ошибкой"
 quick_out2="$(run_quick_flags)" || fail "быстрый режим (2-я нода): блок флагов завершился ошибкой"
-IFS='|' read -r q_xhttp q_cdn q_sni q_path q_host q_wspath <<< "$quick_out"
-IFS='|' read -r _ _ _ _ q_host2 _ <<< "$quick_out2"
+IFS='|' read -r q_xhttp q_cdn q_sni q_path q_host q_wspath q_cdntr <<< "$quick_out"
+IFS='|' read -r _ _ _ _ q_host2 _ _ <<< "$quick_out2"
 [[ "$q_xhttp" == 1 && "$q_cdn" == 1 ]] \
   || fail "быстрый режим не включил XHTTP/CDN сам: «$quick_out»"
 [[ "$q_sni" == "www.gstatic.com" ]] || fail "быстрый режим: SNI не дефолтный: «$q_sni»"
@@ -350,12 +283,19 @@ IFS='|' read -r _ _ _ _ q_host2 _ <<< "$quick_out2"
   || fail "быстрый режим: путь XHTTP не случайный на свежей установке: «$q_path»"
 [[ "$q_wspath" =~ ^/api/v1/[0-9a-f]{8}$ ]] \
   || fail "быстрый режим: путь CDN WS не случайный на свежей установке: «$q_wspath»"
-ok "быстрый режим: XHTTP+CDN без вопросов, уникальный CDN-домен на каждую ноду и случайные пути"
+[[ "$q_cdntr" == "ws" ]] || fail "быстрый режим: транспорт CDN по умолчанию не ws: «$q_cdntr»"
+export CDN_TRANSPORT=grpc
+quick_grpc="$(run_quick_flags)" || fail "быстрый режим: выбор grpc завершился ошибкой"
+IFS='|' read -r _ _ _ _ _ _ q_cdntr_grpc <<< "$quick_grpc"
+[[ "$q_cdntr_grpc" == "grpc" ]] \
+  || fail "быстрый режим: сохранённый CDN_TRANSPORT=grpc не выбран: «$q_cdntr_grpc»"
+export CDN_TRANSPORT=''
+ok "быстрый режим: XHTTP+CDN, выбор транспорта CDN, уникальный CDN-домен и случайные пути"
 
 export XHTTP_PATH=/custom/sync CDN_HOST=cdn2.example.com ENV_STORE_LOADED=1
 export CDN_WS_PATH=/api/v1/stream
 quick_out="$(run_quick_flags)" || fail "быстрый режим (повтор): блок флагов завершился ошибкой"
-IFS='|' read -r q_xhttp q_cdn q_sni q_path q_host q_wspath <<< "$quick_out"
+IFS='|' read -r q_xhttp q_cdn q_sni q_path q_host q_wspath q_cdntr <<< "$quick_out"
 [[ "$q_path" == "/custom/sync" && "$q_host" == "cdn2.example.com" && "$q_wspath" == "/api/v1/stream" ]] \
   || fail "быстрый режим затёр сохранённые значения при повторном запуске: «$quick_out»"
 ok "быстрый режим: сохранённые пути и домен при повторном запуске не меняются"

@@ -1,0 +1,55 @@
+name: Bug report
+description: Сообщить об ошибке установщика или конфигурации ноды
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Спасибо за отчёт. Не прикладывайте токены, SECRET_KEY, приватные ключи,
+        UUID и реальные адреса инфраструктуры. Для уязвимостей используйте
+        SECURITY.md, а не публичный issue.
+  - type: input
+    id: revision
+    attributes:
+      label: Ревизия
+      description: Вывод `bash remnanode-setup.sh --version` или git-коммит
+    validations:
+      required: true
+  - type: dropdown
+    id: install_mode
+    attributes:
+      label: Режим установки
+      options:
+        - --quick
+        - --advanced
+        - --non-interactive
+        - ручная установка
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Ожидаемое поведение
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Фактическое поведение
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Шаги воспроизведения
+      description: Минимальные шаги и очищенный фрагмент лога `/var/log/remnanode-setup-*.log`
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Окружение
+      description: ОС, архитектура, версии Caddy/Go/образа ноды, панель/нода
+    validations:
+      required: false

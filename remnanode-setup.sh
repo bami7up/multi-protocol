@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# Заголовок установщика: версия, константы, usage и цвета.
+# Единый remnanode-setup.sh собирается из lib/*.sh через build.sh.
+
+SCRIPT_VERSION="1.2.0"
+
 BUILD_COMPOSE=1
 MANAGE_FIREWALL=1
 RESET_FIREWALL=0
@@ -12,6 +17,10 @@ KEEP_BUILD_TOOLS="${KEEP_BUILD_TOOLS:-0}"
 BUILD_ESSENTIAL_ADDED=0
 ASSUME_YES="${ASSUME_YES:-0}"
 NONINTERACTIVE="${NONINTERACTIVE:-0}"
+UNINSTALL=0
+DRY_RUN="${DRY_RUN:-0}"
+# Интерактивное изменение настроек уже установленной ноды без переустановки.
+RECONFIGURE="${RECONFIGURE:-0}"
 SSH_PORT_OVERRIDE=""
 # Cloudflare: "" — судить по CLOUDFLARE_API_TOKEN, 1 — требовать (--cloudflare),
 # 0 — запретить (--no-cloudflare).
@@ -24,8 +33,9 @@ CF_ZONE_NAME=""
 # проксируемую запись сам, "manual"/"" — запись должен создать пользователь.
 # Значение показывается в сводке, чтобы отсутствие записи не было тихим.
 CDN_DNS_MANAGED=""
-# Быстрый режим мастера (--quick / QUICK_SETUP=y): только 5 вопросов —
-# домен, токен Cloudflare, домен панели, токен панели и IP панели.
+# Быстрый режим мастера (--quick / QUICK_SETUP=y): только 8 вопросов —
+# домен, токен Cloudflare, домен панели, токен панели, IP панели, шаблон
+# подписки, транспорт CDN и XHTTP target (external/local).
 # Поддомены, CDN, пути, тема фасада и порт ноды выбираются автоматически.
 # QUICK_SETUP_SETTING: "" — решать по env/сохранённому/вопросу, 1 — --quick,
 # 0 — --advanced. ENV_STORE_LOADED отличает свежую установку от повторной
@@ -49,12 +59,31 @@ XRAY_TEMPLATE_CHOICE="${XRAY_TEMPLATE_CHOICE:-standard}"
 NODE_DIR="${NODE_DIR:-/opt/remnanode}"
 CERT_DIR="${CERT_DIR:-/etc/remna-certs}"
 ENV_STORE="${ENV_STORE:-/root/remnanode.env}"
-NODE_IMAGE="${NODE_IMAGE:-remnawave/node:latest}"
+NODE_IMAGE="${NODE_IMAGE:-remnawave/node:3.4.4}"
+# Кастомный Xray-core для Remnawave Node (CUSTOM_CORE_URL). Пусто — штатный
+# Xray из образа. "uwuray" — предустановленный URL UwURay под архитектуру;
+# иначе полный https:// URL на бинарник. Мutable "latest" удобен, но не
+# воспроизводим: для продакшена лучше закрепить конкретный release URL.
+CUSTOM_CORE_URL="${CUSTOM_CORE_URL:-}"
+# Внешние install-скрипты закреплены по commit/tag и SHA256: get.docker.com и
+# get.acme.sh отдают плавающий master. Свои значения можно передать через env.
+DOCKER_INSTALL_URL="${DOCKER_INSTALL_URL:-https://raw.githubusercontent.com/docker/docker-install/ada7a567e59b/install.sh}"
+DOCKER_INSTALL_SHA256="${DOCKER_INSTALL_SHA256:-2b102d809152ea157a59f171319f489d971273b2d26dd7e9a6d1d737ce89289d}"
+ACME_INSTALL_URL="${ACME_INSTALL_URL:-https://raw.githubusercontent.com/acmesh-official/acme.sh/v3.1.6/acme.sh}"
+ACME_INSTALL_SHA256="${ACME_INSTALL_SHA256:-c7d68b021cfd6380ea83a82962abde5b484779fee0b97d38681dfa1396bbc8d7}"
+# 1 — обновлять acme.sh из upstream при каждом запуске (плавающий код).
+ACME_AUTO_UPGRADE="${ACME_AUTO_UPGRADE:-0}"
+DOCKER_INSTALL_TMP=""
+ACME_INSTALL_DIR=""
+ACME_INSTALL_TMP=""
 # Темы фасада self-steal: файлы self-steal-templates/<тема>.html в репозитории.
 # Дефолт — прежний «файлообменник», чтобы поведение не менялось без запроса.
 # Базу URL шаблонов фасада можно переопределить (свой форк, тег или коммит):
 SELF_STEAL_RAW_BASE="${SELF_STEAL_RAW_BASE:-https://raw.githubusercontent.com/bami7up/multi-protocol/main}"
 SELF_STEAL_TEMPLATES=(vaultdrop mail cloud admin docs)
+# none — не устанавливать шаблон: оставить собственный сайт в SELF_STEAL_ROOT.
+# Это не тема из репозитория, поэтому в SELF_STEAL_TEMPLATES её нет.
+SELF_STEAL_TEMPLATE_NONE="none"
 # Тема задана явно (env/--self-steal-template)? Тогда быстрый режим не вправе
 # заменять её случайной на свежей установке.
 SELF_STEAL_TEMPLATE_EXPLICIT=0
@@ -63,6 +92,9 @@ SELF_STEAL_TEMPLATE="${SELF_STEAL_TEMPLATE:-vaultdrop}"
 # Явный URL (свой фасад) важнее имени темы; проверяется при разборе переменных.
 SELF_STEAL_TEMPLATE_URL="${SELF_STEAL_TEMPLATE_URL:-}"
 SELF_STEAL_THEME_USED=0
+# Каталог фасада: при SELF_STEAL_TEMPLATE=none установщик его не трогает и
+# только проверяет, что там есть index.html.
+SELF_STEAL_ROOT="${SELF_STEAL_ROOT:-/var/www/remnanode-self-steal}"
 # VLESS за CDN: инбаунды слушают только loopback и без своего TLS — публичный
 # TLS терминирует CDN, а TLS между CDN и origin — Caddy с сертификатом для
 # CDN-хоста. HTTP-01 такой сертификат не выпустит (за прокси на :80 отвечает
@@ -92,15 +124,35 @@ CADDY_L4_VERSION="${CADDY_L4_VERSION:-v0.1.2}"
 # поэтому берём самую старую из поддерживаемых линий — 1.26 (Go сопровождает две
 # последние) и последний её патч: он содержит исправления безопасности stdlib,
 # а сам Caddy слушает публичные 80/443. Версия, архив и SHA256 меняются вместе.
-GO_VERSION="1.26.9"
+GO_VERSION="1.26.10"
 GO_INSTALL_TMP=""
 GO_ARCHIVE_TMP=""
 CADDY_RESTORE_NEEDED=0
 LOG_DIR="/var/log"
 LOG_FILE="${LOG_DIR}/remnanode-setup-$(date +%F-%H%M%S).log"
+CADDYFILE_PATH="${CADDYFILE_PATH:-/etc/caddy/Caddyfile}"
+# REALITY: минимальная версия клиента, которую пускает сервер. 0.0.0 —
+# совместимость с Mihomo (он представляется 1.8.2, см. MetaCubeX/mihomo
+# #3132/#3039); более строгие значения — осознанный opt-in.
+REALITY_MIN_CLIENT_VER="${REALITY_MIN_CLIENT_VER:-0.0.0}"
+# REALITY target для XHTTP. self → локальный self-steal сайт
+# (127.0.0.1:$SELF_STEAL_TLS_PORT); иначе host:port. Внешний target остаётся
+# дефолтом, пока local self-steal не подтверждён тестом (Xray-core #5923).
+XHTTP_TARGET="${XHTTP_TARGET:-www.gstatic.com:443}"
+# ACME: auto — DNS-01 при наличии Cloudflare-токена, иначе HTTP-01; dns —
+# только DNS-01 (не останавливает Caddy и не рвёт 443/tcp); http — только
+# HTTP-01 (короткий простой 443/tcp на время challenge).
+ACME_METHOD="${ACME_METHOD:-auto}"
+# Каталог логов Xray на хосте. Монтируется в контейнер как /var/log/xray:
+# если образ пишет туда файлы, их ротирует logrotate; stdout по-прежнему
+# ограничен Docker log-opts (50m × 5).
+XRAY_LOG_DIR="${XRAY_LOG_DIR:-/var/log/remnanode/xray}"
+SELF_STEAL_TLS_PORT="${SELF_STEAL_TLS_PORT:-9443}"
+SELF_STEAL_HTTP_PORT="${SELF_STEAL_HTTP_PORT:-}"
 # Каталог самого скрипта: при запуске из клона репозитория шаблоны берутся
 # локально, а не из сети (при `bash <(...)` каталога нет — скачаем по URL).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo /nonexistent)"
+
 
 usage() {
   cat <<'USAGE'
@@ -118,16 +170,33 @@ remnanode-setup.sh — установка ноды Remnawave (VLESS + Hysteria2 
   --keep-build-tools    не удалять Go, xcaddy, build-essential и кэши сборки после Caddy
                         (по умолчанию удаляются; нужно, только если Caddy будет пересобираться)
   --ssh-port N          явно указать SSH-порт для правила ufw
-  --node-image REF      образ ноды (по умолчанию remnawave/node:latest)
+  --node-image REF      образ ноды (по умолчанию remnawave/node:3.4.4)
+  --custom-core-url URL кастомный Xray-core для ноды (CUSTOM_CORE_URL);
+                        uwuray — предустановленный UwURay, либо https:// URL бинарника
+  --node-tag TAG        уникальный тег балансировки ноды (A-Z0-9_:, до 32 символов)
   --self-steal-template T
                         тема фасада self-steal (vaultdrop, mail, cloud, admin, docs)
+                        или none — не устанавливать шаблон, оставить свой сайт в
+                        SELF_STEAL_ROOT (по умолчанию /var/www/remnanode-self-steal)
+  --min-client-ver X.Y.Z
+                        минимальная версия клиента для REALITY (по умолчанию 0.0.0:
+                        совместимо с Mihomo; значения >1.8.2 могут отсечь Mihomo)
+  --xhttp-target TARGET target REALITY для XHTTP: host:port, self или local
+                        (self/local = локальный self-steal 127.0.0.1:9443)
+  --acme-method M       auto | dns | http. auto: DNS-01 при Cloudflare-токене,
+                        иначе HTTP-01; dns не останавливает Caddy и не рвёт 443/tcp
   --xray-template T     шаблон подписки: standard (весь трафик через VPN) или split
   --cloudflare          создать A-записи через Cloudflare API
   --no-cloudflare       не использовать Cloudflare, даже если токен в env
   --panel-url URL       URL панели Remnawave (напр. https://panel.example.com)
-  --api-token TOKEN     API токен панели для авто-настройки
-  --quick               быстрый режим мастера: 5 вопросов, остальное — авто/случайно
+  --quick               быстрый режим мастера: 8 вопросов, остальное — авто/случайно
   --advanced            расширенный режим мастера: все вопросы (как раньше)
+  --uninstall           удалить управляемые компоненты (нода, Caddyfile,
+                        сертификаты, UFW-правила, env-файл); пакеты остаются
+  --reconfigure         интерактивно изменить настройки уже установленной ноды
+                        (тема фасада, XHTTP/CDN, minClientVer, ACME method)
+  --dry-run             показать, что удалит --uninstall, без изменений
+  --version             показать версию/ревизию
   -y | --yes            авто-подтверждение всех «y/n» вопросов
   --non-interactive     не задавать вопросы: все значения из env/дефолтов
   -h | --help           показать эту справку
@@ -135,13 +204,19 @@ remnanode-setup.sh — установка ноды Remnawave (VLESS + Hysteria2 
 Переменные окружения (для --non-interactive / CI):
   BASE_DOMAIN, PREFIX, SELF_STEAL_HOST, XHTTP_SNI, XHTTP_PATH, ENABLE_XHTTP,
   ENABLE_CDN, CDN_HOST, CDN_TRANSPORT, CDN_WS_PATH, CDN_XHTTP_PATH, CDN_GRPC_PATH,
-  PANEL_IP, NODE_API_PORT, SECRET_KEY, NODE_IMAGE,
-  SELF_STEAL_TEMPLATE, SELF_STEAL_TEMPLATE_URL, MULTISELECT_TEMPLATE_URL,
+  PANEL_IP, NODE_API_PORT, SECRET_KEY, NODE_IMAGE, NODE_TAG,
+  CUSTOM_CORE_URL,
+  SELF_STEAL_TEMPLATE, SELF_STEAL_TEMPLATE_URL, SELF_STEAL_ROOT,
+  MULTISELECT_TEMPLATE_URL,
+  REALITY_MIN_CLIENT_VER, XHTTP_TARGET, ACME_METHOD,
   SELF_STEAL_RAW_BASE, XRAY_TEMPLATE_CHOICE,
   XCADDY_VERSION, CADDY_VERSION, CADDY_L4_VERSION,
+  DOCKER_INSTALL_URL, DOCKER_INSTALL_SHA256,
+  ACME_INSTALL_URL, ACME_INSTALL_SHA256, ACME_AUTO_UPGRADE,
   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ZONE,
   REMNAWAVE_PANEL_URL, REMNAWAVE_API_TOKEN, REMNAWAVE_AUTO_SETUP,
-  QUICK_SETUP, SERVER_IP, NODE_DIR, CERT_DIR, ENV_STORE, KEEP_BUILD_TOOLS
+  QUICK_SETUP, SERVER_IP, NODE_DIR, CERT_DIR, ENV_STORE, KEEP_BUILD_TOOLS,
+  XRAY_LOG_DIR
 
 Логические переменные (ENABLE_XHTTP, ENABLE_CDN, REMNAWAVE_AUTO_SETUP, QUICK_SETUP, KEEP_BUILD_TOOLS) понимают
 y/yes/1/true/on и n/no/0/false/off в любом регистре; пустое значение означает ответ по умолчанию.
@@ -149,69 +224,13 @@ y/yes/1/true/on и n/no/0/false/off в любом регистре; пустое
 задайте его, если нода за NAT или внешние сервисы определения IP недоступны.
 
 Интерактивный мастер сначала спросит режим:
-  быстрый (рекомендуется): всего 5 вопросов — домен, токен Cloudflare,
-    домен панели (полным URL: https://panel.example.com), токен панели
-    и IP панели; поддомены, CDN, пути, тема и порт ноды — автоматически;
+  быстрый (рекомендуется): всего 8 вопросов — домен, токен Cloudflare,
+    домен панели (полным URL: https://panel.example.com), токен панели,
+    IP панели, шаблон подписки, транспорт CDN и XHTTP target (external/local);
+    поддомены, CDN-домен, пути, тема и порт ноды — автоматически;
   расширенный: прежние 4 блока вопросов со всеми настройками.
 USAGE
 }
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --no-compose)  BUILD_COMPOSE=0 ;;
-    --no-firewall) MANAGE_FIREWALL=0 ;;
-    --reset-firewall) RESET_FIREWALL=1 ;;
-    --no-reset-firewall) RESET_FIREWALL=0 ;; # совместимость со старыми командами
-    --force-dns)   FORCE_DNS=1 ;;
-    --keep-build-tools) KEEP_BUILD_TOOLS=1 ;;
-    -y|--yes)      ASSUME_YES=1 ;;
-    --non-interactive) NONINTERACTIVE=1; ASSUME_YES=1 ;;
-    --ssh-port)
-      SSH_PORT_OVERRIDE="${2:-}"
-      [[ "$SSH_PORT_OVERRIDE" =~ ^[0-9]+$ ]] || { echo "--ssh-port требует число" >&2; exit 2; }
-      shift ;;
-    --node-image)
-      NODE_IMAGE="${2:-}"
-      [[ -n "$NODE_IMAGE" ]] || { echo "--node-image требует значение" >&2; exit 2; }
-      shift ;;
-    --self-steal-template)
-      SELF_STEAL_TEMPLATE_EXPLICIT=1
-      SELF_STEAL_TEMPLATE="${2:-}"
-      [[ -n "$SELF_STEAL_TEMPLATE" ]] || { echo "--self-steal-template требует значение (тема фасада)" >&2; exit 2; }
-      shift ;;
-    --xray-template)
-      XRAY_TEMPLATE_CHOICE="${2:-}"
-      [[ -n "$XRAY_TEMPLATE_CHOICE" ]] || { echo "--xray-template требует значение (standard или split)" >&2; exit 2; }
-      shift ;;
-    --node-tag)
-      NODE_TAG="${2:-}"
-      [[ -n "$NODE_TAG" ]] || { echo "--node-tag требует значение (например NL1)" >&2; exit 2; }
-      shift ;;
-    --panel-url)
-      REMNAWAVE_PANEL_URL="${2:-}"
-      [[ -n "$REMNAWAVE_PANEL_URL" ]] || { echo "--panel-url требует значение" >&2; exit 2; }
-      shift ;;
-    --api-token)
-      REMNAWAVE_API_TOKEN="${2:-}"
-      [[ -n "$REMNAWAVE_API_TOKEN" ]] || { echo "--api-token требует значение" >&2; exit 2; }
-      shift ;;
-    --cloudflare)    CF_MODE_SETTING=1 ;;
-    --no-cloudflare) CF_MODE_SETTING=0 ;;
-    --quick)         QUICK_SETUP_SETTING=1 ;;
-    --advanced)      QUICK_SETUP_SETTING=0 ;;
-    -h|--help) usage; exit 0 ;;
-    *) echo "Неизвестный аргумент: $1" >&2; usage; exit 2 ;;
-  esac
-  shift
-done
-
-if [[ "$CF_MODE_SETTING" == 1 ]]; then
-  CF_MODE=1
-elif [[ "$CF_MODE_SETTING" == 0 ]]; then
-  CF_MODE=0
-elif [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]]; then
-  CF_MODE=1
-fi
 
 if [[ -t 1 || "${FORCE_COLOR:-0}" == 1 ]]; then
   C_RST=$'\033[0m';  C_B=$'\033[1m';   C_DIM=$'\033[2m'
@@ -225,11 +244,19 @@ fi
 RULE='────────────────────────────────────────────────────────────────'
 STEP_TOTAL=10
 
+# AUTO-GENERATED: remnanode-setup.sh собирается из lib/*.sh через build.sh.
+
+# --- общие утилиты, ввод, валидаторы ---
 hr()   { printf '%s%s%s\n' "${C_DIM:-}${C_GRY:-}" "$RULE" "${C_RST:-}"; }
+
 log()  { printf ' %s➜%s %s\n'  "$C_BLU$C_B" "${C_RST:-}" "$*"; }
+
 ok()   { printf ' %s✔%s %s\n'  "$C_GRN$C_B" "${C_RST:-}" "$*"; }
+
 warn() { printf ' %s▲%s %s\n'  "$C_YLW$C_B" "${C_RST:-}" "$*"; }
+
 note() { printf '   %s%s%s\n'  "${C_DIM:-}${C_GRY:-}" "$*" "${C_RST:-}"; }
+
 die()  { printf ' %s✖%s %s\n'  "$C_RED$C_B" "${C_RST:-}" "$*" >&2; exit 1; }
 
 step() {
@@ -314,11 +341,11 @@ install_go_toolchain() {
   case "$ARCH" in
     x86_64|amd64)
       go_arch=amd64
-      go_sha=42d158b4d8f7b61ac0a830567c940a86098fb7aac52e467a5ebec03ef5cc2f8d
+      go_sha=ccfe7ae822d2c2f41f4fe7c956199967a4dac22d0ee0d2b2bfdb440aab3b20c5
       ;;
     aarch64|arm64)
       go_arch=arm64
-      go_sha=4a97373d49fcacdcf3694fea368a500b00ee3e963974f3e7514132717632f052
+      go_sha=3f4227ce7b206a513e794f1393adb473a07b46e94d18bd15d1c684bbb7319797
       ;;
     *) die "Нет Go toolchain для архитектуры $ARCH." ;;
   esac
@@ -356,11 +383,6 @@ pkg_installed() {
   dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -Fq 'install ok installed'
 }
 
-# Чистка за собой. На малых VPS диск ценен, а после сборки Caddy остаются
-# инструменты, которые ноде не нужны: Go-тулчейн (сотни МБ), кэш сборки и
-# модулей Go, xcaddy, копия собранного бинарника и build-essential с зависимостями.
-# Если Caddy понадобится пересобрать, установщик скачает всё заново.
-# Функция идемпотентна и безопасна при сбое: отсутствующие пути пропускаются.
 remove_build_leftovers() {
   local go_bin="/opt/remnanode-toolchains/go${GO_VERSION}/bin/go" p
   local removed=0
@@ -383,8 +405,6 @@ remove_build_leftovers() {
   fi
 }
 
-# build-essential ставится только для сборки. Удаляем его, лишь если он появился
-# при установке: пакет, который был в системе до нас, не трогаем.
 remove_build_packages() {
   [[ "$KEEP_BUILD_TOOLS" == 1 ]] && return 0
   if [[ "$BUILD_ESSENTIAL_ADDED" == 1 ]] && pkg_installed build-essential; then
@@ -399,9 +419,6 @@ remove_build_packages() {
   fi
 }
 
-# Финальная уборка: архивы .deb и индексы apt, неиспользуемые (dangling) образы
-# Docker от прежних версий образа ноды. Работающие образы и установленные пакеты
-# не затрагиваются. Индексы apt восстанавливаются через apt-get update.
 cleanup_system_leftovers() {
   apt_get clean >/dev/null 2>&1 || true
   rm -rf -- /var/lib/apt/lists/* 2>/dev/null || true
@@ -412,8 +429,9 @@ cleanup_system_leftovers() {
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
-# has_tty: есть ли управляющий терминал для интерактивных вопросов
+
 has_tty() { { : >/dev/tty; } 2>/dev/null; }
+
 require_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Запускать нужно от root (sudo -i)."; }
 
 is_ipv4() {
@@ -467,6 +485,13 @@ is_private_ipv4() {
   return 1
 }
 
+is_private_ipv6() {
+  # ::1, link-local (fe80::/10) и ULA (fc00::/7): такие адреса панели можно
+  # использовать по HTTP, не отправляя токен в публичную сеть.
+  local ip="${1:-}"
+  [[ "$ip" == "::1" || "$ip" == fe80:* || "$ip" == fc* || "$ip" == fd* ]]
+}
+
 is_fqdn() {
   local name="${1%.}" label
   local -a labels
@@ -487,25 +512,94 @@ is_safe_xhttp_path() {
   [[ ${#1} -le 2048 && "$1" =~ $pattern ]]
 }
 
-# ——— Cloudflare: автоматические A-записи с осмысленными случайными именами ———
-# Поддомены собираются из двух словарей как «прилагательное-существительное»:
-# в отличие от usa1/usa3 нумерация не выдаёт связь между записями, а четыре
-# разных слова делают два хоста визуально непохожими друг на друга.
-CF_HOST_ADJ=(quiet brisk amber coral golden vivid mellow crisp gentle lofty lucid nimble placid rugged serene slender sturdy tranquil azure bright clever frosty misty silken snowy sober solid sunny tidy wavy warm wild windy zesty merry prime rapid calm jolly mild)
-CF_HOST_NOUN=(otter lantern drift fern ridge cove beacon birch cinder clover dune ember falcon fjord flare forest garnet glade granite grove hazel heron iris jade jetty juniper kelp lagoon laurel lilac linen lotus maple mesa moss nectar nickel olive onyx orbit pebble pewter pine prairie quartz quarry raven reef rivet ruby sage shale shore sienna spruce stone thistle tide timber topaz valley velvet willow zenith zephyr)
-CF_API_BASE="https://api.cloudflare.com/client/v4"
-
-# Индекс [0, n) из криптографически случайных байтов (не $RANDOM).
-cf_rand_index() {
-  local n="${1:-}" raw
-  [[ "$n" =~ ^[1-9][0-9]*$ ]] || return 1
-  raw="$(od -An -N4 -tu4 </dev/urandom 2>/dev/null | tr -d '[:space:]')"
-  [[ "$raw" =~ ^[0-9]+$ ]] || return 1
-  printf '%s' $(( raw % n ))
+is_safe_path() {
+  local p="${1:-}"
+  [[ "$p" == /* && "$p" != *$'\n'* && "$p" != *$'\r'* \
+      && "$p" != *'"'* && "$p" != *'{'* && "$p" != *'}'* ]] || return 1
+  # Обратный слэш перед закрывающей кавычкой Caddyfile экранировал бы её.
+  case "$p" in *\\*) return 1 ;; esac
+  return 0
 }
 
-# N случайных hex-символов из /dev/urandom — суффиксы случайных путей
-# транспортов в быстром режиме (путь не должен быть одинаковым у всех нод).
+is_client_version() {
+  # Xray сравнивает minClientVer как три числовых компонента (x.y.z).
+  [[ "${1:-}" =~ ^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$ ]]
+}
+
+normalize_client_version() {
+  local v="${1:-}"
+  v="$(printf '%s' "$v" | tr -d '[:space:]')"
+  if [[ -z "$v" ]]; then
+    printf '%s' "0.0.0"
+  elif is_client_version "$v"; then
+    printf '%s' "$v"
+  else
+    return 1
+  fi
+}
+
+is_host_port() {
+  local hp="${1:-}" host port
+  [[ "$hp" == *:* && "$hp" != *" "* ]] || return 1
+  host="${hp%:*}"
+  port="${hp##*:}"
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  (( port >= 1 && port <= 65535 )) || return 1
+  if [[ "$host" == \[*\] ]]; then
+    is_ipv6 "${host:1:${#host}-2}"
+  elif [[ "$host" =~ ^[0-9.]+$ ]]; then
+    is_ipv4 "$host"
+  else
+    is_fqdn "$host"
+  fi
+}
+
+normalize_xhttp_target() {
+  local target="${1:-}" port="${SELF_STEAL_TLS_PORT:-9443}"
+  target="$(printf '%s' "$target" | tr -d '[:space:]')"
+  if [[ -z "$target" ]]; then
+    printf '%s' "www.gstatic.com:443"
+    return 0
+  fi
+  if [[ "$target" == "self" || "$target" == "local" ]]; then
+    printf '127.0.0.1:%s' "$port"
+    return 0
+  fi
+  if ! is_host_port "$target"; then
+    return 1
+  fi
+  printf '%s' "$target"
+}
+
+is_xhttp_target_local() {
+  case "${XHTTP_TARGET:-}" in
+    127.0.0.1:* | localhost:* | "[::1]:"*) return 0 ;;
+  esac
+  return 1
+}
+
+acme_method_supported() {
+  case "${1:-}" in auto|dns|http) return 0 ;; esac
+  return 1
+}
+
+acme_method_resolved() {
+  # auto: DNS-01, если есть Cloudflare-токен (он уже проверен и сохранён),
+  # иначе HTTP-01. Явные dns/http не переопределяются.
+  case "${ACME_METHOD:-auto}" in
+    dns) printf 'dns' ;;
+    http) printf 'http' ;;
+    *)
+      if [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]]; then
+        printf 'dns'
+      else
+        printf 'http'
+      fi
+      ;;
+  esac
+}
+
+
 random_hex() {
   local n="${1:-8}" bytes hex
   [[ "$n" =~ ^[1-9][0-9]*$ ]] || return 1
@@ -515,17 +609,12 @@ random_hex() {
   printf '%s' "${hex:0:$n}"
 }
 
-# Случайный API-подобный путь вида <префикс>/<8 hex> для транспортов.
 gen_random_api_path() {
   local prefix="${1:-/api/v3/sync}" suffix
   suffix="$(random_hex 8)" || return 1
   printf '%s/%s' "$prefix" "$suffix"
 }
 
-# Уникальный CDN-поддомен для каждой ноды: cdn-<6 hex>.<базовый домен>.
-# Поддомен первого уровня (*.example.com) покрывается бесплатным Universal SSL
-# Cloudflare (в отличие от <rand>.cdn.example.com, требующего платный ACM) и не
-# конфликтует при размещении нескольких нод на одном базовом домене.
 gen_cdn_host() {
   local base="${1:-${BASE_DOMAIN:-}}" suffix=""
   [[ -n "$base" ]] || return 1
@@ -534,9 +623,6 @@ gen_cdn_host() {
   printf 'cdn-%s.%s' "$suffix" "$base"
 }
 
-# Случайный порт Node API для быстрого режима: диапазон 11000–59999 не
-# пересекается с портами схемы (80/443/9443/9444/10443–10448), а SSH-порт
-# дополнительно исключается, если его удалось определить.
 random_node_port() {
   local idx port guard=0 ssh_port=""
   if declare -F detect_ssh_port >/dev/null 2>&1; then
@@ -554,15 +640,11 @@ random_node_port() {
   return 1
 }
 
-# Приводит короткую ссылку на образ (например, «latest» или «3.1.1», в т. ч.
-# из старых env-файлов) к полному репозиторию remnawave/node:<тег>. Без слэша
-# Docker ищет library/<имя> в Docker Hub и падает с
-# «pull access denied for latest, repository does not exist».
 normalize_node_image() {
   local img="${1:-}"
   img="$(printf '%s' "$img" | tr -d '[:space:]')"
   if [[ -z "$img" ]]; then
-    printf 'remnawave/node:latest'
+    printf 'remnawave/node:3.4.4'
   elif [[ "$img" != */* ]]; then
     if [[ "$img" == @sha256:* ]]; then
       printf 'remnawave/node%s' "$img"
@@ -576,9 +658,31 @@ normalize_node_image() {
   fi
 }
 
-# Домен, как его вводят люди (https://Example.COM/, www.example.com.),
-# приводим к чистому виду example.com: без схемы, www, путей, порта и
-# хвостовой точки. Валидацию не делаем — её выполнит is_fqdn у вызывающего.
+uwuray_core_url() {
+  case "$(uname -m)" in
+    x86_64|amd64)        printf 'https://github.com/MakostaDev/UwURay/releases/latest/download/Xray-linux-64' ;;
+    aarch64|arm64|armv8) printf 'https://github.com/MakostaDev/UwURay/releases/latest/download/Xray-linux-arm64-v8a' ;;
+    *) return 1 ;;
+  esac
+}
+
+normalize_custom_core_url() {
+  local u="${1:-}"
+  u="$(printf '%s' "$u" | tr -d '\r\n')"
+  case "$u" in
+    ""|none|official|off) printf '' ;;
+    uwuray|uwuray-latest) uwuray_core_url ;;
+    https://*)
+      # URL попадает в .env/Node env: без пробелов, кавычек и решётки.
+      if [[ "$u" == *[[:space:]]* || "$u" == *'"'* || "$u" == *"'"* || "$u" == *#* ]]; then
+        return 1
+      fi
+      printf '%s' "$u"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 normalize_domain_input() {
   local d="${1:-}"
   d="$(printf '%s' "$d" | tr -d '[:space:]')"
@@ -592,17 +696,16 @@ normalize_domain_input() {
   printf '%s' "$d"
 }
 
-# URL панели приводим к виду https://panel.example.com: схему добавляем,
-# если её нет (панель почти всегда за HTTPS), хвостовой слэш срезаем.
-# Возврат 1 — из ввода нельзя получить осмысленный URL.
 normalize_panel_url() {
-  local u="${1:-}" rest host
+  local u="${1:-}" rest host port scheme has_port=0
   u="$(printf '%s' "$u" | tr -d '[:space:]')"
   [[ -n "$u" ]] || return 1
-  case "$u" in
-    http://*|https://*) ;;
+  # Схему сравниваем без учёта регистра и нормализуем обратно в нижний.
+  case "${u,,}" in
+    http://*)  scheme=http;  u="http://${u#*://}" ;;
+    https://*) scheme=https; u="https://${u#*://}" ;;
     *://*) return 1 ;;
-    *) u="https://$u" ;;
+    *) scheme=https; u="https://$u" ;;
   esac
   u="${u%/}"
   rest="${u#*://}"
@@ -612,30 +715,33 @@ normalize_panel_url() {
     host="${rest%%]*}"
     host="${host#\[}"
     is_ipv6 "$host" || return 1
+    local after="${rest#*]}"
+    if [[ -n "$after" ]]; then
+      [[ "$after" == :* ]] || return 1
+      port="${after#:}"
+      has_port=1
+    fi
   else
     host="${rest%%/*}"
-    host="${host%%:*}"
-    { is_fqdn "$host" || is_ipv4 "$host"; } || return 1
+    if [[ "$host" == *:* ]]; then
+      port="${host#*:}"
+      host="${host%%:*}"
+      has_port=1
+    fi
+    { is_fqdn "$host" || is_ipv4 "$host" || [[ "$host" == "localhost" ]]; } || return 1
+  fi
+  if (( has_port )); then
+    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || return 1
+  fi
+  # HTTP допустим только до локальной/приватной панели: иначе Bearer-токен
+  # уйдёт по открытой сети. Для публичного адреса — только HTTPS.
+  if [[ "$scheme" == http ]] \
+      && ! { is_private_ipv4 "$host" || is_private_ipv6 "$host" || [[ "$host" == "localhost" ]]; }; then
+    return 1
   fi
   printf '%s' "$u"
 }
 
-# Хост из URL панели (без схемы, порта и пути) — чтобы определить IP панели.
-panel_url_host() {
-  local rest="${1:-}" host
-  rest="${rest#*://}"
-  if [[ "$rest" == \[* ]]; then
-    host="${rest%%]*}"
-    printf '%s' "${host#\[}"
-    return 0
-  fi
-  host="${rest%%/*}"
-  host="${host%%:*}"
-  printf '%s' "$host"
-}
-
-# Первый IPv4 хоста по DNS (сам IPv4 возвращается как есть): дефолт для
-# PANEL_IP, чтобы пользователь не вводил адрес панели второй раз.
 resolve_ipv4_host() {
   local host="${1:-}" ip
   [[ -n "$host" ]] || return 1
@@ -650,9 +756,501 @@ resolve_ipv4_host() {
   printf '%s' "$ip"
 }
 
-# Два непохожих хоста «прилагательное-существительное.BASE_DOMAIN»:
-# прилагательные и существительные не повторяются, поэтому хосты различаются
-# в обеих частях. В stdout — ровно две строки.
+apt_wait() {
+  local -i waited=0
+  # fuser приходит из пакета psmisc: он есть в списке базовых утилит шага 0, но
+  # первый apt-get (update) идёт до их установки. Без fuser все проверки
+  # блокировки молча ничего не делают (вывод перенаправлен в /dev/null), поэтому
+  # ставим psmisc сами — напрямую apt-get, без apt_get, чтобы не уйти в рекурсию.
+  # Если поставить не удалось (например, dpkg-lock держит другой процесс), просто
+  # продолжаем: apt-get ниже сам подождёт освобождения блокировки.
+  if ! have fuser; then
+    if have apt-get; then
+      DEBIAN_FRONTEND=noninteractive apt-get install -y psmisc >/dev/null 2>&1 || true
+    fi
+    have fuser || return 0
+  fi
+  while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+     || fuser /var/lib/dpkg/lock          >/dev/null 2>&1 \
+     || fuser /var/lib/apt/lists/lock     >/dev/null 2>&1; do
+    if (( waited % 60 == 0 )); then
+      warn "Ожидаю освобождения apt/dpkg lock (прошло ${waited}s)..."
+    fi
+    sleep 5
+    waited=$((waited + 5))
+  done
+}
+
+apt_get() { apt_wait; DEBIAN_FRONTEND=noninteractive apt-get "$@"; }
+
+ask() {
+  local __var="$1" __prompt="$2" __default="${3:-}" __input
+  if [[ "$NONINTERACTIVE" == 1 ]]; then
+    [[ -n "$__default" ]] || die "--non-interactive: нет значения для «$__prompt» (задайте через env)."
+    printf -v "$__var" '%s' "$__default"
+    note "(auto) $__prompt = $__default"
+    return
+  fi
+  has_tty || die "Нет /dev/tty для вопроса «$__prompt». Запустите с --non-interactive и переменными окружения."
+  if [[ -n "$__default" ]]; then
+    printf ' %s?%s %s %s[%s]%s: ' "${C_MAG:-}${C_B:-}" "${C_RST:-}" "$__prompt" "${C_DIM:-}${C_GRY:-}" "$__default" "${C_RST:-}" > /dev/tty
+    IFS= read -r __input < /dev/tty || true
+    __input="${__input:-$__default}"
+  else
+    __input=""
+    while [[ -z "$__input" ]]; do
+      printf ' %s?%s %s: ' "${C_MAG:-}${C_B:-}" "${C_RST:-}" "$__prompt" > /dev/tty
+      IFS= read -r __input < /dev/tty || true
+    done
+  fi
+  printf -v "$__var" '%s' "$__input"
+}
+
+ask_secret() {
+  local __var="$1" __prompt="$2" __default="${3:-}" __input=""
+  if [[ "$NONINTERACTIVE" == 1 ]]; then
+    [[ -n "$__default" ]] || die "--non-interactive: нет значения для «$__prompt» (задайте через env)."
+    printf -v "$__var" '%s' "$__default"
+    note "(auto) $__prompt = <скрыто, символов: ${#__default}>"
+    return
+  fi
+  has_tty || die "Нет /dev/tty для ввода «$__prompt». Запустите с --non-interactive и переменными окружения."
+  while [[ -z "$__input" ]]; do
+    printf ' %s?%s %s (ввод скрыт): ' "${C_MAG:-}${C_B:-}" "${C_RST:-}" "$__prompt" > /dev/tty
+    IFS= read -rs __input < /dev/tty || true
+    printf '\n' > /dev/tty
+  done
+  printf -v "$__var" '%s' "$__input"
+}
+
+parse_bool() {
+  local val="${1:-}" def="${2:-0}"
+  case "${val,,}" in
+    1|y|yes|true|on)  printf '1' ;;
+    0|n|no|false|off) printf '0' ;;
+    *)                printf '%s' "$def" ;;
+  esac
+}
+
+bool_yn() {
+  if [[ "${1:-0}" == 1 ]]; then
+    printf 'y'
+  else
+    printf 'n'
+  fi
+}
+
+ask_bool() {
+  local __var="$1" __prompt="$2" __default __val __tries=0
+  __default="$(parse_bool "${3:-n}" 0)"
+  while :; do
+    ask "$__var" "$__prompt (y/n)" "$(bool_yn "$__default")"
+    __val="${!__var}"
+    case "${__val,,}" in
+      1|y|yes|true|on|0|n|no|false|off)
+        printf -v "$__var" '%s' "$(parse_bool "$__val" "$__default")"
+        return 0
+        ;;
+    esac
+    __tries=$((__tries + 1))
+    (( __tries < 5 )) || die "Не понял ответ «$__val» на вопрос «$__prompt»: нужен y или n."
+    warn "Ответ «$__val» не похож на y/n — введите y или n."
+  done
+}
+
+confirm() {
+  local __prompt="$1" __default="${2:-n}" __ans
+  if [[ "$ASSUME_YES" == 1 ]]; then
+    note "(auto-yes) $__prompt"
+    return 0
+  fi
+  # Ответ нормализуется тем же ask_bool: «1», «yes» и «y» здесь равнозначны, а
+  # непонятный ответ переспрашивается, а не читается как «нет».
+  ask_bool __ans "$__prompt" "$__default"
+  [[ "$__ans" == 1 ]]
+}
+
+ask_choice() {
+  local __var="$1" __prompt="$2" __default="$3"
+  shift 3
+  local -a __opts=("$@")
+  local __i __input __choice __key
+  if [[ "$NONINTERACTIVE" == 1 ]]; then
+    [[ -n "$__default" ]] || die "--non-interactive: нет значения для «$__prompt» (задайте через env)."
+    # В авто-режиме __default — номер варианта, берём ключ по номеру
+    if [[ "$__default" =~ ^[0-9]+$ ]] && (( __default >= 1 && __default <= ${#__opts[@]} )); then
+      __key="${__opts[$((__default-1))]%%:*}"
+      printf -v "$__var" '%s' "$__key"
+    else
+      printf -v "$__var" '%s' "$__default"
+    fi
+    note "(auto) $__prompt = ${!__var}"
+    return
+  fi
+  has_tty || die "Нет /dev/tty для вопроса «$__prompt». Запустите с --non-interactive и переменными окружения."
+  {
+    printf '\n'
+    printf ' %s%s%s\n' "${C_B:-}${C_CYN:-}" "$__prompt" "${C_RST:-}"
+    printf ' %s%s%s\n' "${C_DIM:-}${C_GRY:-}" "$RULE" "${C_RST:-}"
+    for __i in "${!__opts[@]}"; do
+      __key="${__opts[$__i]%%:*}"
+      __choice="${__opts[$__i]#*:}"
+      if [[ "$__key" == "${__opts[$__i]}" ]]; then __choice="$__key"; fi
+      if (( __i + 1 == __default )); then
+        printf '   %s%s %d)%s %s %s[по умолчанию]%s\n' "${C_B:-}${C_GRN:-}" "${C_RST:-}" "$((__i+1))" "${C_B:-}" "$__choice" "${C_DIM:-}${C_GRY:-}" "${C_RST:-}"
+      else
+        printf '   %s %d)%s %s\n' "${C_GRY:-}" "$((__i+1))" "${C_RST:-}" "$__choice"
+      fi
+    done
+    printf ' %s%s%s\n' "${C_DIM:-}${C_GRY:-}" "$RULE" "${C_RST:-}"
+  } > /dev/tty
+  while :; do
+    printf ' %s?%s Выберите номер [%s]: ' "${C_MAG:-}${C_B:-}" "${C_RST:-}" "$__default" > /dev/tty
+    IFS= read -r __input < /dev/tty || true
+    __input="${__input:-$__default}"
+    if [[ "$__input" =~ ^[0-9]+$ ]] && (( __input >= 1 && __input <= ${#__opts[@]} )); then
+      __key="${__opts[$((__input-1))]%%:*}"
+      printf -v "$__var" '%s' "$__key"
+      return
+    fi
+    warn "Введите число от 1 до ${#__opts[@]}." > /dev/tty
+  done
+}
+
+detect_ssh_port() {
+  local port=""
+  if have sshd; then
+    port="$(sshd -T 2>/dev/null | awk 'tolower($1)=="port"{print $2; exit}' || true)"
+  fi
+  if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+    port="$(awk 'tolower($1)=="port" && $2 ~ /^[0-9]+$/ {print $2; exit}' \
+            /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null || true)"
+  fi
+  if [[ ! "$port" =~ ^[0-9]+$ && -n "${SSH_CONNECTION:-}" ]]; then
+    port="$(awk '{print $4}' <<<"$SSH_CONNECTION" 2>/dev/null || true)"
+  fi
+  [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || port=22
+  printf '%s' "$port"
+}
+
+on_err() {
+  local ec=$? line=$1 cmd=$2
+  printf '\n %s✖ НЕПРЕДВИДЕННЫЙ СБОЙ%s код=%s строка=%s\n   %s%s%s\n' \
+    "$C_RED$C_B" "${C_RST:-}" "$ec" "$line" "${C_DIM:-}${C_GRY:-}" "$cmd" "${C_RST:-}" >&2
+  printf '   Полный лог: %s\n' "$LOG_FILE" >&2
+  exit "$ec"
+}
+
+on_exit() {
+  local ec=$?
+  trap - EXIT
+  if [[ -n "${GO_INSTALL_TMP:-}" && -d "$GO_INSTALL_TMP" ]]; then
+    rm -rf -- "$GO_INSTALL_TMP"
+  fi
+  if [[ -n "${GO_ARCHIVE_TMP:-}" && -f "$GO_ARCHIVE_TMP" ]]; then
+    rm -f -- "$GO_ARCHIVE_TMP"
+  fi
+  if [[ -n "${DOCKER_INSTALL_TMP:-}" && -f "$DOCKER_INSTALL_TMP" ]]; then
+    rm -f -- "$DOCKER_INSTALL_TMP"
+  fi
+  if [[ -n "${ACME_INSTALL_DIR:-}" && -d "$ACME_INSTALL_DIR" ]]; then
+    rm -rf -- "$ACME_INSTALL_DIR"
+  elif [[ -n "${ACME_INSTALL_TMP:-}" && -f "$ACME_INSTALL_TMP" ]]; then
+    rm -f -- "$ACME_INSTALL_TMP"
+  fi
+  if [[ -n "${CF_CURL_CFG:-}" && -f "$CF_CURL_CFG" ]]; then
+    rm -f -- "$CF_CURL_CFG"
+  fi
+  if [[ -n "${PANEL_CURL_CFG:-}" && -f "$PANEL_CURL_CFG" ]]; then
+    rm -f -- "$PANEL_CURL_CFG"
+  fi
+  if [[ -n "${PANEL_STATE_DIR:-}" && -d "$PANEL_STATE_DIR" ]]; then
+    rm -rf -- "$PANEL_STATE_DIR"
+  fi
+  # При сбое сборка не доходит до штатной очистки: убираем тулчейн и кэши здесь,
+  # чтобы неудачная попытка не оставляла сотни МБ на диске. Пакеты apt не трогаем.
+  remove_build_leftovers >/dev/null 2>&1 || true
+  if [[ "${CADDY_RESTORE_NEEDED:-0}" -eq 1 ]]; then
+    if systemctl start caddy >/dev/null 2>&1; then
+      CADDY_RESTORE_NEEDED=0
+      warn "Caddy восстановлен после прерванной операции."
+    else
+      printf ' Не удалось восстановить Caddy после ACME; проверьте systemctl status caddy.\n' >&2
+    fi
+  fi
+  exit "$ec"
+}
+
+resolve_server_ip() {
+# SERVER_IP нужен для A-записей Cloudflare и для сверки DNS. Значение из env (в
+# том числе из сохранённого env-файла) приоритетнее автодетекта: за NAT внешние
+# сервисы могут быть недоступны, а README и текст ошибки обещают возможность
+# задать адрес вручную. Приватный адрес для A-записей не годится — его заменяет
+# автодетект с предупреждением.
+if is_ipv4 "${SERVER_IP:-}"; then
+  if is_private_ipv4 "$SERVER_IP"; then
+    warn "SERVER_IP=$SERVER_IP выглядит приватным — для A-записей нужен публичный IPv4, определяю автоматически."
+    SERVER_IP=""
+  else
+    ok "Публичный IPv4 (SERVER_IP из env): $SERVER_IP"
+  fi
+elif [[ -n "${SERVER_IP:-}" ]]; then
+  # Опечатка/IPv6 в env: не тащим мусор в env-файл и DNS-сравнение.
+  warn "SERVER_IP=$SERVER_IP не является IPv4 — игнорирую и определяю автоматически."
+  SERVER_IP=""
+fi
+if [[ -z "${SERVER_IP:-}" ]]; then
+  SERVER_IP=""
+  if have curl; then
+    SERVER_IP="$(curl -4 -sS --max-time 10 https://ifconfig.me 2>/dev/null || true)"
+    [[ -n "$SERVER_IP" ]] || SERVER_IP="$(curl -4 -sS --max-time 10 https://api.ipify.org 2>/dev/null || true)"
+  fi
+  if is_ipv4 "$SERVER_IP"; then
+    ok "Публичный IPv4: $SERVER_IP"
+    if is_private_ipv4 "$SERVER_IP"; then
+      warn "Определённый адрес $SERVER_IP выглядит приватным — вероятно, сервер за NAT. Сравнение A-записей с ним будет непоказательным; сверяйте DNS вручную или продолжайте с --force-dns."
+    fi
+  else
+    SERVER_IP=""
+    warn "Не удалось определить IP (проверка DNS будет мягкой). Задайте SERVER_IP через env."
+  fi
+fi
+}
+
+is_reserved_node_port() {
+  case "$1" in
+    80|443|9443|10443|10444|"$CDN_TLS_PORT"|"$CDN_WS_PORT"|"$CDN_XHTTP_PORT"|"$CDN_GRPC_PORT") return 0 ;;
+  esac
+  return 1
+}
+
+# --- интерактивные вопросы и запись env-файла ---
+# Вынесено из main, чтобы тесты вызывали функции напрямую, а не извлекали
+# блоки кода sed/awk.
+prompt_flags() {
+# === flags block start ===
+# Быстрый режим (QUICK_SETUP=1): XHTTP и CDN включены без вопросов; SNI —
+# проверенный дефолт, пути на свежей установке — случайные, CDN-домен —
+# уникальный cdn-<hex>.<базовый домен> (поддомен 1-го уровня для бесплатного
+# Cloudflare Universal SSL, без коллизии между несколькими нодами на домене).
+# Значения из env/сохранённого env-файла не затираются.
+if [[ "${QUICK_SETUP:-0}" == 1 ]]; then
+  ENABLE_XHTTP=1
+else
+  ask_bool ENABLE_XHTTP "Включить XHTTP (рекомендуется: да)?" "${ENABLE_XHTTP:-y}"
+fi
+if (( ENABLE_XHTTP )); then
+  if [[ "${QUICK_SETUP:-0}" == 1 ]]; then
+    XHTTP_SNI="${XHTTP_SNI:-www.gstatic.com}"
+    if [[ -z "${XHTTP_PATH:-}" ]]; then
+      XHTTP_PATH="$(gen_random_api_path /api/v3/sync 2>/dev/null || printf '/api/v3/sync/r1')"
+    fi
+    note "XHTTP: включён автоматически (SNI $XHTTP_SNI, путь $XHTTP_PATH)"
+  else
+    ask XHTTP_SNI  "Маскировочный SNI для XHTTP (сайт для REALITY-handshake)" "${XHTTP_SNI:-www.gstatic.com}"
+    ask XHTTP_PATH "Путь XHTTP (случайный URL-путь)" "${XHTTP_PATH:-/api/v3/sync/r1}"
+  fi
+  # Target REALITY для XHTTP. external — проверенный внешний сайт; local —
+  # локальный self-steal сайт (экспериментально, нужен стенд). Явно заданный
+  # нестандартный host:port не перезаписываем — это ручная настройка.
+  if [[ -n "${XHTTP_TARGET:-}" && "$XHTTP_TARGET" != "www.gstatic.com:443" ]] \
+      && ! is_xhttp_target_local; then
+    note "XHTTP target из env сохранён: $XHTTP_TARGET"
+  else
+    __target_mode="external"
+    if is_xhttp_target_local; then __target_mode="local"; fi
+    __target_default=1
+    if [[ "$__target_mode" == "local" ]]; then __target_default=2; fi
+    ask_choice __target_mode "XHTTP target для REALITY" "$__target_default" \
+      "external: Внешний www.gstatic.com:443 — проверенный вариант (рекомендуется)" \
+      "local: Локальный self-steal 127.0.0.1:$SELF_STEAL_TLS_PORT — экспериментально, нужен стенд"
+    if [[ "$__target_mode" == "local" ]]; then
+      XHTTP_TARGET="self"
+    else
+      XHTTP_TARGET="www.gstatic.com:443"
+    fi
+    unset __target_mode __target_default
+  fi
+else
+  warn "XHTTP отключён — будет использован только Vision (Reality)."
+  XHTTP_SNI=""
+  XHTTP_PATH=""
+fi
+if [[ "${QUICK_SETUP:-0}" == 1 ]]; then
+  ENABLE_CDN=1
+else
+  ask_bool ENABLE_CDN "Добавить VLESS за CDN (прячет IP ноды)?" "${ENABLE_CDN:-n}"
+fi
+if (( ENABLE_CDN )); then
+  note "CDN прячет origin: клиент идёт на CDN-домен по 443, CDN — на :443 ноды."
+  note "Публичный TLS терминирует CDN, между CDN и нодой — сертификат origin (DNS-01 через Cloudflare)."
+  note "Проксируемую A-запись для CDN-домена установщик создаст сам в Cloudflare (оранжевое облако) —"
+  note "вручную её создавать не нужно. Исключение — запуск с --no-cloudflare: тогда запись делаете вы."
+  if [[ -z "${CDN_HOST:-}" ]]; then
+    if declare -F gen_cdn_host >/dev/null 2>&1; then
+      __cdn_default="$(gen_cdn_host "${BASE_DOMAIN:-}" 2>/dev/null || printf 'cdn.%s' "${BASE_DOMAIN:-}")"
+    else
+      __cdn_default="cdn-$(od -An -N3 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n').${BASE_DOMAIN:-}"
+    fi
+  else
+    __cdn_default="$CDN_HOST"
+  fi
+  if [[ "${QUICK_SETUP:-0}" == 1 ]]; then
+    CDN_HOST="$__cdn_default"
+    # В быстром режиме транспорт раньше молча фиксировался на ws. Теперь это
+    # такой же выбираемый пункт, как шаблон подписки; сохранённый выбор — дефолт.
+    case "${CDN_TRANSPORT,,}" in
+      xhttp) __cdn_num=2 ;;
+      grpc)  __cdn_num=3 ;;
+      both)  __cdn_num=4 ;;
+      all)   __cdn_num=5 ;;
+      *)     __cdn_num=1 ;;
+    esac
+    ask_choice CDN_TRANSPORT "Транспорт VLESS за CDN" "$__cdn_num" \
+      "ws: WebSocket — максимальная совместимость (по умолчанию)" \
+      "xhttp: XHTTP — современный транспорт" \
+      "grpc: gRPC (h2c) — для Cloudflare" \
+      "both: ws + xhttp" \
+      "all: ws + xhttp + grpc"
+    unset __cdn_num
+    note "CDN: включён (домен $CDN_HOST, транспорт ${CDN_TRANSPORT,,})"
+  else
+    ask CDN_HOST "Домен, проксируемый CDN (A-запись под оранжевым облаком)" "$__cdn_default"
+    ask CDN_TRANSPORT "Транспорт CDN: ws, xhttp, grpc, both (ws+xhttp) или all" "${CDN_TRANSPORT:-ws}"
+  fi
+  unset __cdn_default
+  CDN_TRANSPORT="${CDN_TRANSPORT,,}"
+  case "$CDN_TRANSPORT" in
+    ws|xhttp|grpc|both|all) ;;
+    *) die "CDN_TRANSPORT должен быть ws, xhttp, grpc, both или all (получено: $CDN_TRANSPORT)." ;;
+  esac
+  if cdn_transport_enabled ws; then
+    CDN_WS_ENABLED=1
+    if [[ "${QUICK_SETUP:-0}" == 1 ]]; then
+      # На свежей установке дефолтный путь заменяем случайным; сохранённый
+      # (повторный запуск, ENV_STORE_LOADED=1) не трогаем.
+      if [[ "${ENV_STORE_LOADED:-0}" != 1 && "${CDN_WS_PATH:-}" == "/api/v1/stream" ]]; then
+        CDN_WS_PATH="$(gen_random_api_path /api/v1 2>/dev/null || printf '/api/v1/stream')"
+      fi
+    else
+      ask CDN_WS_PATH "Путь WebSocket для CDN" "${CDN_WS_PATH:-/api/v1/stream}"
+    fi
+  fi
+  if cdn_transport_enabled xhttp; then
+    CDN_XHTTP_ENABLED=1
+    if [[ "${QUICK_SETUP:-0}" == 1 ]]; then
+      if [[ "${ENV_STORE_LOADED:-0}" != 1 && "${CDN_XHTTP_PATH:-}" == "/api/v3/sync/c1" ]]; then
+        CDN_XHTTP_PATH="$(gen_random_api_path /api/v3/sync 2>/dev/null || printf '/api/v3/sync/c1')"
+      fi
+    else
+      ask CDN_XHTTP_PATH "Путь XHTTP для CDN" "${CDN_XHTTP_PATH:-/api/v3/sync/c1}"
+    fi
+  fi
+  if cdn_transport_enabled grpc; then
+    CDN_GRPC_ENABLED=1
+    if [[ "${QUICK_SETUP:-0}" == 1 ]]; then
+      if [[ "${ENV_STORE_LOADED:-0}" != 1 && "${CDN_GRPC_PATH:-}" == "/api/v4/stream" ]]; then
+        CDN_GRPC_PATH="$(gen_random_api_path /api/v4 2>/dev/null || printf '/api/v4/stream')"
+      fi
+    else
+      ask CDN_GRPC_PATH "serviceName gRPC для CDN" "${CDN_GRPC_PATH:-/api/v4/stream}"
+    fi
+  fi
+  if [[ -z "${CLOUDFLARE_API_TOKEN:-}" ]]; then
+    note "Для CDN нужен Cloudflare Token с Zone:Read + DNS:Edit: им установщик создаст проксируемую"
+    note "A-запись CDN-домена и выпустит сертификат origin по DNS-01."
+    ask_secret CLOUDFLARE_API_TOKEN \
+      "Cloudflare API Token (для A-записи и DNS-01 сертификата CDN)" ""
+  fi
+fi
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# БЛОК 4/4: Панель Remnawave
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+if [[ "${QUICK_SETUP:-0}" == 1 ]]; then
+  if has_tty; then printf '\n %s%s━━━ Быстрая автоустановка: панель Remnawave ━━━%s\n' "${C_B:-}" "${C_CYN:-}" "${C_RST:-}" > /dev/tty 2>/dev/null || true; fi
+else
+  if has_tty; then printf '\n %s%s━━━ Блок 4/4: Панель Remnawave ━━━%s\n' "${C_B:-}" "${C_CYN:-}" "${C_RST:-}" > /dev/tty 2>/dev/null || true; fi
+fi
+note "Панель управляет нодами, пользователями и подписками."
+# === flags block end ===
+}
+
+write_env_store() {
+( umask 077
+  {
+    printf 'export SERVER_IP=%q\n' "$SERVER_IP"
+    printf 'export BASE_DOMAIN=%q\n' "$BASE_DOMAIN"
+    printf 'export PREFIX=%q\n' "$PREFIX"
+    printf 'export VLESS_HOST=%q\n' "$VLESS_HOST"
+    printf 'export HY_HOST=%q\n' "$HY_HOST"
+    printf 'export ACME_EMAIL=%q\n' "$ACME_EMAIL"
+    printf 'export SELF_STEAL_HOST=%q\n' "$SELF_STEAL_HOST"
+    printf 'export VISION_SNI=%q\n' "$VISION_SNI"
+    # Оба решения (и «да», и «нет») сохраняются в читаемом виде y/n: иначе
+    # ответ «n» терялся бы и повторный запуск включал функцию обратно по дефолту.
+    printf 'export ENABLE_XHTTP=%s\n' "$(bool_yn "$ENABLE_XHTTP")"
+    if (( ENABLE_XHTTP )); then
+      printf 'export XHTTP_SNI=%q\n' "$XHTTP_SNI"
+      printf 'export XHTTP_PATH=%q\n' "$XHTTP_PATH"
+    fi
+    printf 'export REALITY_MIN_CLIENT_VER=%q\n' "${REALITY_MIN_CLIENT_VER:-0.0.0}"
+    printf 'export XHTTP_TARGET=%q\n' "${XHTTP_TARGET:-www.gstatic.com:443}"
+    printf 'export ACME_METHOD=%q\n' "${ACME_METHOD:-auto}"
+    printf 'export XRAY_LOG_DIR=%q\n' "${XRAY_LOG_DIR:-/var/log/remnanode/xray}"
+    printf 'export ENABLE_CDN=%s\n' "$(bool_yn "$ENABLE_CDN")"
+    if (( ENABLE_CDN )); then
+      printf 'export CDN_HOST=%q\n' "$CDN_HOST"
+      printf 'export CDN_TRANSPORT=%q\n' "$CDN_TRANSPORT"
+      printf 'export CDN_WS_PATH=%q\n' "$CDN_WS_PATH"
+      printf 'export CDN_XHTTP_PATH=%q\n' "$CDN_XHTTP_PATH"
+      printf 'export CDN_GRPC_PATH=%q\n' "$CDN_GRPC_PATH"
+    fi
+    printf 'export PANEL_IP=%q\n' "${PANEL_IP:-}"
+    printf 'export NODE_API_PORT=%q\n' "${NODE_API_PORT:-2222}"
+    # Образ тоже сохраняем: иначе повторный запуск без --node-image вернёт latest.
+    printf 'export NODE_IMAGE=%q\n' "${NODE_IMAGE:-remnawave/node:3.4.4}"
+    if [[ -n "${CUSTOM_CORE_URL:-}" ]]; then
+      printf 'export CUSTOM_CORE_URL=%q\n' "$CUSTOM_CORE_URL"
+    fi
+    # Новые интерактивные ответы — сохраняем для идемпотентного повторного запуска
+    printf 'export NODE_TAG=%q\n' "$(panel_node_tag)"
+    printf 'export SELF_STEAL_TEMPLATE=%q\n' "${SELF_STEAL_TEMPLATE:-vaultdrop}"
+    if [[ -n "${SELF_STEAL_TEMPLATE_URL:-}" ]]; then
+      printf 'export SELF_STEAL_TEMPLATE_URL=%q\n' "$SELF_STEAL_TEMPLATE_URL"
+    fi
+    printf 'export XRAY_TEMPLATE_CHOICE=%q\n' "${XRAY_TEMPLATE_CHOICE:-standard}"
+    printf 'export CF_MODE=%s\n' "$(bool_yn "${CF_MODE:-0}")"
+    printf 'export QUICK_SETUP=%s\n' "$(bool_yn "${QUICK_SETUP:-0}")"
+    if [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]]; then
+      printf 'export CLOUDFLARE_API_TOKEN=%q\n' "$CLOUDFLARE_API_TOKEN"
+    fi
+    if [[ -n "${CLOUDFLARE_ZONE:-}" ]]; then
+      printf 'export CLOUDFLARE_ZONE=%q\n' "$CLOUDFLARE_ZONE"
+    fi
+    printf 'export REMNAWAVE_AUTO_SETUP=%s\n' "$(bool_yn "${REMNAWAVE_AUTO_SETUP:-0}")"
+    if [[ -n "${REMNAWAVE_PANEL_URL:-}" ]]; then
+      printf 'export REMNAWAVE_PANEL_URL=%q\n' "$REMNAWAVE_PANEL_URL"
+    fi
+    if [[ -n "${REMNAWAVE_API_TOKEN:-}" ]]; then
+      printf 'export REMNAWAVE_API_TOKEN=%q\n' "$REMNAWAVE_API_TOKEN"
+    fi
+  } > "$ENV_STORE"
+)
+# Redirection не меняет права уже существующего файла: если ENV_STORE когда-то
+# создан с 0644, токены остались бы читаемыми. Приводим к 0600 явно.
+chmod 600 "$ENV_STORE"
+}
+
+# --- Cloudflare DNS ---
+cf_rand_index() {
+  local n="${1:-}" raw
+  [[ "$n" =~ ^[1-9][0-9]*$ ]] || return 1
+  raw="$(od -An -N4 -tu4 </dev/urandom 2>/dev/null | tr -d '[:space:]')"
+  [[ "$raw" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' $(( raw % n ))
+}
+
 cf_make_hosts() {
   local base="${1:-}" a1 a2 n1 n2 guard=0
   [[ -n "$base" ]] || return 1
@@ -670,16 +1268,12 @@ cf_make_hosts() {
     "${CF_HOST_ADJ[$a2]}" "${CF_HOST_NOUN[$n2]}" "$base"
 }
 
-# Сохранённый в прошлый раз хост переиспользуем, только если он валиден и лежит
-# в текущем BASE_DOMAIN: при смене базового домена старые имена бессмысленны.
 cf_valid_saved_host() {
   local host="${1:-}" base="${2:-}"
   [[ -n "$host" && -n "$base" ]] || return 1
   is_fqdn "$host" && [[ "$host" == *".$base" ]]
 }
 
-# cf_api METHOD PATH [JSON-ТЕЛО] → JSON в stdout. Токен уходит не в argv, а
-# через файл конфигурации curl (-K), поэтому его не видно в ps и в логе.
 cf_api() {
   local method="$1" path="$2" body="${3:-}"
   local -a args=(-sS --max-time 20 -X "$method" -K "$CF_CURL_CFG" -H "Content-Type: application/json")
@@ -690,21 +1284,22 @@ cf_api() {
 cf_json_success() {
   jq -e '.success == true' >/dev/null 2>&1 <<<"$1"
 }
+
 cf_json_error() {
   local msg
   msg="$(jq -r '.errors[0].message // empty' <<<"$1" 2>/dev/null)"
   printf '%s' "${msg:-неизвестная ошибка Cloudflare API}"
 }
 
-# Токен не должен попадать ни в argv curl (видно в ps), ни в лог: он живёт
-# во временном файле 0600, который curl читает через -K.
 cf_curl_cfg_init() {
+  local token
+  # Токен — base64/hex без пробелов и кавычек; вычищаем их, чтобы curl-config
+  # не сломался и нельзя было добавить лишние директивы через перевод строки.
+  token="$(printf '%s' "${CLOUDFLARE_API_TOKEN:-}" | tr -d '[:space:]"')"
   CF_CURL_CFG="$(mktemp)"
-  ( umask 077; printf 'header = "Authorization: Bearer %s"\n' "$CLOUDFLARE_API_TOKEN" > "$CF_CURL_CFG" )
+  ( umask 077; printf 'header = "Authorization: Bearer %s"\n' "$token" > "$CF_CURL_CFG" )
 }
 
-# Проверяет, что Cloudflare API принимает токен и видит зону BASE_DOMAIN.
-# Возвращает 0 при успехе, 1 при ошибке API/токена и 2 если зона не найдена.
 cf_check_token_zone() {
   local resp zone_id
   cf_curl_cfg_init
@@ -717,11 +1312,6 @@ cf_check_token_zone() {
   [[ -n "$zone_id" ]] || return 2
 }
 
-# cf_upsert_a ZONE_ID HOST [proxied] — создать A-запись или обновить
-# существующую на текущий SERVER_IP. По умолчанию запись DNS-only
-# (proxied=false): оранжевое облако ломает и REALITY, и прямой Hysteria2
-# (см. README, Cloudflare и DNS-only записи). Исключение — CDN-хост: там
-# проксирование и есть весь смысл, поэтому для него передаётся «proxied».
 cf_upsert_a() {
   local zone="$1" host="$2" mode="${3:-dns-only}" resp id
   local body
@@ -749,7 +1339,6 @@ cf_upsert_a() {
   fi
 }
 
-# cf_a_exists ZONE_ID HOST → 0, если A-запись уже есть (иначе 1; die при ошибке API).
 cf_a_exists() {
   local resp
   resp="$(cf_api GET "/zones/$1/dns_records?type=A&name=$2")" \
@@ -758,9 +1347,6 @@ cf_a_exists() {
   [[ -n "$(jq -r '.result[0].id // empty' <<<"$resp")" ]]
 }
 
-# Точка входа CF-режима: токен → зона → либо переиспользуем сохранённые хосты
-# (идемпотентный повторный запуск), либо генерируем свободные случайные —
-# и только потом создаём/обновляем обе A-записи и ждём их в DNS.
 cf_setup_hosts() {
   have jq || die "Для режима Cloudflare нужен jq — он не установился на шаге 0."
   have curl || die "Для режима Cloudflare нужен curl."
@@ -843,11 +1429,6 @@ cf_setup_hosts() {
   CF_CURL_CFG=""
 }
 
-# cf_zone_id_for_host HOST → id зоны в stdout (пустая строка и возврат 1,
-# если токен не видит ни одной подходящей зоны или API недоступен). Зону
-# ищем суффиксами хоста от длинного к короткому: для cdn.sub.example.com
-# спрашиваем sub.example.com, затем example.com. Явный CLOUDFLARE_ZONE,
-# накрывающий хост, спрашиваем первым.
 cf_zone_id_for_host() {
   local host="${1:-}" zone resp id
   host="${host%.}"
@@ -873,15 +1454,6 @@ cf_zone_id_for_host() {
   return 1
 }
 
-# Точка входа для CDN-хоста: проксируемая A-запись (оранжевое облако)
-# через Cloudflare API. Намеренно НЕ зависит от CF_MODE: режим авто-ДНС
-# блока 1 отвечает только за случайные хосты VLESS/Hysteria2, а CDN
-# включается позже (блок 3) и токен там спрашивают отдельно. Раньше
-# создание записи гейтилось на CF_MODE, поэтому при ответе «n» в блоке 1
-# CDN-домен молча не создавался вообще, хотя токен для DNS-01 был введён.
-# Исходы без создания (--no-cloudflare, нет токена, токен не видит зону)
-# не останавливают установку, но обязаны быть громкими: CDN_DNS_MANAGED
-# остаётся "manual" и показывается в сводке как действие для пользователя.
 cf_setup_cdn_host() {
   CDN_DNS_MANAGED="manual"
   if [[ "${CF_MODE_SETTING:-}" == "0" ]]; then
@@ -918,11 +1490,11 @@ cf_setup_cdn_host() {
   CDN_DNS_MANAGED="cloudflare"
 }
 
-# ——— self-steal: темы фасада ———
-# Имя темы → URL шаблона в репозитории. Пустая тема означает, что пользователь
-# задал SELF_STEAL_TEMPLATE_URL явно: свой фасад всегда важнее темы.
-# Возвращает 1 на неизвестной теме — вызывающая сторона сама решает, как
-# сообщить об этом (важно показать список доступных тем).
+CF_HOST_ADJ=(quiet brisk amber coral golden vivid mellow crisp gentle lofty lucid nimble placid rugged serene slender sturdy tranquil azure bright clever frosty misty silken snowy sober solid sunny tidy wavy warm wild windy zesty merry prime rapid calm jolly mild)
+CF_HOST_NOUN=(otter lantern drift fern ridge cove beacon birch cinder clover dune ember falcon fjord flare forest garnet glade granite grove hazel heron iris jade jetty juniper kelp lagoon laurel lilac linen lotus maple mesa moss nectar nickel olive onyx orbit pebble pewter pine prairie quartz quarry raven reef rivet ruby sage shale shore sienna spruce stone thistle tide timber topaz valley velvet willow zenith zephyr)
+CF_API_BASE="https://api.cloudflare.com/client/v4"
+
+# --- Config Profile, XRAY_JSON и темы фасада ---
 self_steal_template_url() {
   local theme="$1" known
   if [[ -z "$theme" ]]; then
@@ -938,17 +1510,10 @@ self_steal_template_url() {
   return 1
 }
 
-# Доступные темы — для подсказки об опечатке и для тестов (чтобы они не
-# зависели от внутреннего массива с темами).
 self_steal_template_list() {
   printf '%s\n' "${SELF_STEAL_TEMPLATES[@]}"
 }
 
-# CDN_TRANSPORT → включённые транспорты CDN. "both" (ws + xhttp) оставлен для
-# совместимости со старыми env-файлами, "all" — все три транспорта. Функцию
-# используют и промпты, и фильтр профиля, поэтому она вынесена отдельно.
-# Вызывается как cdn_transport_enabled ws|xhttp|grpc; комментарий не пишется
-# в строку с `{`: юнит-тест извлекает функцию по шаблону "скобка в конце строки".
 cdn_transport_enabled() {
   case "$CDN_TRANSPORT:$1" in
     ws:ws | xhttp:xhttp | grpc:grpc | both:ws | both:xhttp | all:ws | all:xhttp | all:grpc)
@@ -958,15 +1523,6 @@ cdn_transport_enabled() {
   return 1
 }
 
-# ——— Config Profile (Multiselect.json) ———
-# Панель отдаёт ноде серверный конфиг Xray из Config Profile, поэтому установщик
-# сохраняет готовый файл: с подставленными хостами и без inbound'а XHTTP, когда
-# XHTTP в selfsteal выключен. Иначе профиль разошёлся бы с Caddyfile и нода
-# слушала бы порт 10444, к которому ничего не маршрутизируется.
-#
-# multiselect_filter — чистый фильтр: JSON шаблона на stdin, адаптированный JSON
-# в stdout. Значения берутся из переменных установщика, поэтому функцию целиком
-# покрывает tests/installer-funcs-checks.sh (на шаблоне из репозитория).
 multiselect_filter() {
   # Набор включённых транспортов в виде JSON-массива для jq.
   local transports="" t
@@ -984,6 +1540,8 @@ multiselect_filter() {
      --arg xhpath "$CDN_XHTTP_PATH" \
      --arg grpcpath "$CDN_GRPC_PATH" \
      --arg certdir "$CERT_DIR" \
+     --arg minver "$REALITY_MIN_CLIENT_VER" \
+     --arg xtarget "$XHTTP_TARGET" \
      --argjson transports "$transports" \
      --argjson xhttp "$ENABLE_XHTTP" \
      --argjson cdn "$ENABLE_CDN" '
@@ -1015,9 +1573,11 @@ multiselect_filter() {
       | map(
           if .tag == "REALITY_VISION" then
             .streamSettings.realitySettings.serverNames = [$vision]
+            | .streamSettings.realitySettings.minClientVer = $minver
           elif .tag == "REALITY_XHTTP" then
             .streamSettings.realitySettings.serverNames = [$xsni]
-            | .streamSettings.realitySettings.target = ($xsni + ":443")
+            | .streamSettings.realitySettings.minClientVer = $minver
+            | .streamSettings.realitySettings.target = $xtarget
             | .streamSettings.xhttpSettings.path = $xpath
           elif .tag == "HYSTERIA2" then
             .streamSettings.tlsSettings.serverName = $hy
@@ -1036,7 +1596,7 @@ multiselect_filter() {
 }
 
 write_config_profile() {
-  local src="" tmp="" out="$NODE_DIR/Multiselect.json"
+  local src="" tmp="" out="$NODE_DIR/Multiselect.json" out_tmp="" out_tmp2=""
   if ! have jq; then
     warn "jq недоступен — Config Profile не сохранён: возьмите Multiselect.json из репозитория вручную."
     return 0
@@ -1056,6 +1616,10 @@ write_config_profile() {
     fi
   fi
   mkdir -p "$NODE_DIR"
+  # Временные файлы с приватными ключами создаём через mktemp: 0600, а не
+  # 0644 от обычного umask. Итоговый профиль тоже должен быть 0600.
+  out_tmp="$(mktemp "$NODE_DIR/.Multiselect.XXXXXX")"
+  out_tmp2="$(mktemp "$NODE_DIR/.Multiselect.XXXXXX")"
   # Сохраняем уже сгенерированные ключи REALITY при повторном запуске, чтобы не
   # ломать выданные подписки; для пустых privateKey/shortIds генерируем X25519
   # ключ (совместимый с Xray REALITY и resolveInboundAndPublicKey в Remnawave).
@@ -1075,7 +1639,7 @@ write_config_profile() {
     ' "$out" 2>/dev/null || echo '{}')"
   fi
   # Пишем через временный файл: jq не должен оставить обрезанный профиль.
-  if multiselect_filter < "$src" > "$out.tmp" && [[ -s "$out.tmp" ]]; then
+  if multiselect_filter < "$src" > "$out_tmp" && [[ -s "$out_tmp" ]]; then
     if jq --argjson saved "$existing_reality" '
       .inbounds |= map(
         if (.streamSettings.realitySettings? != null) and (($saved[.tag] // null) != null) then
@@ -1085,10 +1649,10 @@ write_config_profile() {
             else . end
         else . end
       )
-    ' "$out.tmp" > "$out.tmp2" && [[ -s "$out.tmp2" ]]; then
-      mv -f "$out.tmp2" "$out.tmp"
+    ' "$out_tmp" > "$out_tmp2" && [[ -s "$out_tmp2" ]]; then
+      mv -f "$out_tmp2" "$out_tmp"
     else
-      rm -f "$out.tmp2"
+      rm -f "$out_tmp2"
     fi
     if have openssl; then
       local rtag rpriv rsid
@@ -1106,16 +1670,18 @@ write_config_profile() {
                   else . end
               else . end
             )
-          ' "$out.tmp" > "$out.tmp2" && [[ -s "$out.tmp2" ]]; then
-            mv -f "$out.tmp2" "$out.tmp"
+          ' "$out_tmp" > "$out_tmp2" && [[ -s "$out_tmp2" ]]; then
+            mv -f "$out_tmp2" "$out_tmp"
           else
-            rm -f "$out.tmp2"
+            rm -f "$out_tmp2"
           fi
         fi
-      done < <(jq -r '.inbounds[]? | select(.streamSettings.realitySettings? != null) | select((.streamSettings.realitySettings.privateKey // "") == "") | .tag' "$out.tmp" 2>/dev/null || true)
+      done < <(jq -r '.inbounds[]? | select(.streamSettings.realitySettings? != null) | select((.streamSettings.realitySettings.privateKey // "") == "") | .tag' "$out_tmp" 2>/dev/null || true)
+    else
+      warn "openssl не найден — REALITY privateKey/shortIds в $out останутся пустыми. Установите openssl и перезапустите установщик."
     fi
-    install -m 644 "$out.tmp" "$out"
-    rm -f "$out.tmp" "$tmp"
+    install -m 600 "$out_tmp" "$out"
+    rm -f "$out_tmp" "$out_tmp2" "$tmp"
     local profile_inbounds="Vision/Reality + Hysteria2"
     if (( ENABLE_XHTTP )); then
       profile_inbounds="Vision/Reality + XHTTP + Hysteria2"
@@ -1125,7 +1691,7 @@ write_config_profile() {
     fi
     ok "Config Profile сохранён: $out ($profile_inbounds)"
   else
-    rm -f "$out.tmp" "$tmp"
+    rm -f "$out_tmp" "$out_tmp2" "$tmp"
     warn "Не удалось адаптировать шаблон Config Profile — используйте Multiselect.json из репозитория."
   fi
   return 0
@@ -1199,8 +1765,77 @@ write_xray_template() {
   return 0
 }
 
-# ——— Авто-настройка панели через API (если выбран REMNAWAVE_AUTO_SETUP) ———
-# Короткий детерминированный идентификатор текущей ноды (из VLESS_HOST или PREFIX).
+json5_to_json() {
+  awk '
+    {
+      line=$0; out=""; instr=0; esc=0;
+      for (i=1; i<=length(line); i++) {
+        c=substr(line,i,1);
+        if (instr) {
+          out=out c;
+          if (esc) esc=0;
+          else if (c=="\\") esc=1;
+          else if (c=="\"") instr=0;
+        } else if (c=="\"") {
+          instr=1; out=out c;
+        } else if (c=="/" && substr(line,i,2)=="//") {
+          break;
+        } else {
+          out=out c;
+        }
+      }
+      buf=buf out "\n";
+    }
+    END {
+      res="";
+      while (match(buf, /,[ \t\r\n]*[}\]]/)) {
+        m=substr(buf,RSTART,RLENGTH);
+        sub(/^,[ \t\r\n]*/,"",m);
+        res=res substr(buf,1,RSTART-1) m;
+        buf=substr(buf,RSTART+RLENGTH);
+      }
+      ORS="";
+      print res;
+      print buf;
+    }
+  '
+}
+
+resolve_self_steal_template() {
+  # Тема фасада → URL шаблона. Явный SELF_STEAL_TEMPLATE_URL имеет приоритет
+  # и отключает подстановку по теме (иначе пользователь не мог бы задать свой
+  # фасад, не переименовывая тему).
+  if [[ -n "$SELF_STEAL_TEMPLATE_URL" ]]; then
+    [[ "$SELF_STEAL_TEMPLATE_URL" == https://* ]] \
+      || die "SELF_STEAL_TEMPLATE_URL должен начинаться с https://"
+    return 0
+  fi
+  if [[ "$SELF_STEAL_TEMPLATE" == "$SELF_STEAL_TEMPLATE_NONE" ]]; then
+    # Свой сайт: шаблон не скачивается, SELF_STEAL_ROOT не трогаем. Проверка
+    # непустого index.html — на шаге 7, когда каталог уже создан.
+    SELF_STEAL_TEMPLATE_URL=""
+    SELF_STEAL_THEME_USED=0
+    return 0
+  fi
+  SELF_STEAL_TEMPLATE_URL="$(self_steal_template_url "$SELF_STEAL_TEMPLATE")" \
+    || die "Неизвестная тема self-steal: $SELF_STEAL_TEMPLATE. Доступны: $(self_steal_template_list | tr '\n' ' '), none."
+  SELF_STEAL_THEME_USED=1
+}
+
+# --- Remnawave Panel API и авто-настройка ---
+panel_url_host() {
+  local rest="${1:-}" host
+  rest="${rest#*://}"
+  if [[ "$rest" == \[* ]]; then
+    host="${rest%%]*}"
+    printf '%s' "${host#\[}"
+    return 0
+  fi
+  host="${rest%%/*}"
+  host="${host%%:*}"
+  printf '%s' "$host"
+}
+
 panel_node_slug() {
   local raw=""
   if [[ -n "${VLESS_HOST:-}" ]]; then
@@ -1214,26 +1849,40 @@ panel_node_slug() {
   printf '%s' "$raw"
 }
 
-# Уникальный тег балансировки скрытых хостов этой ноды (формат Remnawave 3.x:
-# ^[A-Z0-9_:]{1,36}$). У каждой ноды свой тег и свой XRAY_JSON шаблон, чтобы
-# подписка не смешивала хосты разных нод под общим тегом «USA».
+panel_node_tag_suffix() {
+  # Стабильный короткий суффикс из адреса ноды: два сервера с одинаковым
+  # PREFIX (например, оба usa) не получают одинаковый тег и не смешивают
+  # injectHosts в панели. Суффикс не зависит от времени, поэтому повторный
+  # запуск на той же ноде даёт тот же тег.
+  local seed="${SERVER_IP:-${VLESS_HOST:-}}" sum
+  [[ -n "$seed" ]] || return 0
+  sum="$(printf '%s' "$seed" | sha256sum | awk '{print $1}' | cut -c1-4 | tr 'a-f' 'A-F')"
+  [[ -n "$sum" ]] && printf '_%s' "$sum"
+}
+
 panel_node_tag() {
-  local raw="${NODE_TAG:-}"
-  if [[ -z "$raw" ]]; then
+  local raw="${NODE_TAG:-}" suffix=""
+  if [[ -n "$raw" ]]; then
+    # Явно заданный тег — решение пользователя, не переписываем.
+    :
+  else
     raw="$(panel_node_slug)"
+    suffix="$(panel_node_tag_suffix)"
   fi
   raw="$(printf '%s' "$raw" | tr 'a-z-' 'A-Z_' | tr -cd 'A-Z0-9_:')"
   while [[ "$raw" == _* ]]; do raw="${raw#_}"; done
   while [[ "$raw" == *_ ]]; do raw="${raw%_}"; done
+  # 32 — предел тега; суффикс должен уместиться целиком.
+  if [[ -n "$suffix" ]]; then
+    raw="${raw:0:27}"
+    while [[ "$raw" == *_ ]]; do raw="${raw%_}"; done
+    raw="${raw}${suffix}"
+  fi
   raw="${raw:0:32}"
   [[ -n "$raw" ]] || raw="NODE"
   printf '%s' "$raw"
 }
 
-# Имя Config Profile: API разрешает только буквы, цифры, пробелы, «_» и «-»
-# (точки из домена запрещены), длина 2–30 символов. Без штампа даты: повторный
-# запуск в другой день обязан находить и обновлять профиль этой же ноды, а не
-# плодить дубликаты и натыкаться на уникальность тегов inbound'ов в БД панели.
 panel_profile_name() {
   local base="${BASE_DOMAIN:-auto}" host_part="" name
   base="${base//[^A-Za-z0-9_-]/-}"
@@ -1250,7 +1899,6 @@ panel_profile_name() {
   printf '%s' "$name"
 }
 
-# Имя ноды в панели (3–30 символов, уникально в таблице nodes).
 panel_node_name() {
   local name
   if [[ -n "${VLESS_HOST:-}" ]]; then
@@ -1264,8 +1912,6 @@ panel_node_name() {
   printf '%s' "$name"
 }
 
-# Возвращает каноническое базовое имя тега inbound'а независимо от суффикса ноды
-# (например, REALITY_VISION_QUIET_OTTER → REALITY_VISION).
 panel_canonical_inbound_tag() {
   local tag="${1:-}" base
   for base in REALITY_VISION REALITY_XHTTP HYSTERIA2 VLESS_CDN_WS VLESS_CDN_XHTTP VLESS_CDN_GRPC; do
@@ -1277,18 +1923,10 @@ panel_canonical_inbound_tag() {
   printf '%s' "$tag"
 }
 
-# Подготавливает JSON Config Profile для отправки в Panel API:
-#  1) переиспользует существующие REALITY privateKey/shortIds и теги этой же ноды;
-#  2) гарантирует непустой X25519 privateKey + shortIds у всех REALITY inbound'ов
-#     (панель Remnawave не генерирует ключи на сервере — с пустым privateKey Xray
-#     не поднимает слушатели и подписка не выдаёт pbk);
-#  3) обходит глобальный @@unique([tag]) в таблице config_profile_inbounds: если
-#     базовый тег уже занят другим профилем в панели (вторая нода или старый
-#     профиль), добавляет к тегам детерминированный суффикс текущей ноды.
 panel_prepare_profile_for_api() {
   local profile_name="$1" profile_json="$2"
   local resp work_json saved_map='{}' other_tags='[]' slug suffix try_suffix n
-  resp="$(panel_api GET "/config-profiles" 2>/dev/null || true)"
+  resp="$(panel_api_retry GET "/config-profiles" 2>/dev/null || true)"
 
   saved_map="$(jq -c --arg n "$profile_name" '
     ((.response // .data // .)
@@ -1405,19 +2043,12 @@ panel_prepare_profile_for_api() {
   printf '%s' "$work_json"
 }
 
-# Результат функции, которая печатает диагностику (ok/warn) и лишь последней
-# строкой — значение. Подоболочка $(...) смешивает их, поэтому значение берём
-# ТОЛЬКО при успешном коде возврата: иначе текст предупреждения
-# («▲ Не удалось создать…») стал бы uuid профиля и ушёл в URL запросов.
 panel_result_uuid() {
   local out="${1:-}" rc="${2:-1}"
   (( rc == 0 )) || return 0
   printf '%s' "$out" | tail -1 | tr -d '[:space:]'
 }
 
-# panel_fetch_node_secret — получить SECRET_KEY ноды через Remnawave Panel API (GET /keygen).
-# В Remnawave 3.x поле называется secretKey, в старых 2.x — pubKey.
-# Возвращает чистый base64 ключ или пустую строку при ошибке.
 panel_fetch_node_secret() {
   local resp key
   resp="$(panel_api_retry GET "/keygen" 2>/dev/null || true)"
@@ -1432,9 +2063,6 @@ panel_fetch_node_secret() {
   return 1
 }
 
-# Обёртка для panel_upsert_host: в успешном случае молчим (функция печатает
-# uuid в stdout — в консоли он не нужен), при ошибке показываем диагностику
-# целиком и возвращаем ненулевой код, чтобы вызывающий её посчитал.
 panel_try_host() {
   local out="" rc=0
   out="$(panel_upsert_host "$@" 2>/dev/null)" || rc=$?
@@ -1446,7 +2074,7 @@ panel_try_host() {
 
 panel_find_profile_by_name() {
   local name="$1" resp uuid
-  resp="$(panel_api GET "/config-profiles" 2>/dev/null || true)"
+  resp="$(panel_api_retry GET "/config-profiles" 2>/dev/null || true)"
   # Remnawave 3.x: {response:{total, configProfiles:[...]}}; старые версии — массив
   uuid="$(jq -r --arg n "$name" '
     (.response // .data // .)
@@ -1457,47 +2085,70 @@ panel_find_profile_by_name() {
   printf '%s' "$uuid"
 }
 
+panel_profile_node_uuids() {
+  local name="$1" resp
+  resp="$(panel_api_retry GET "/config-profiles" 2>/dev/null || true)"
+  jq -r --arg n "$name" '
+    (.response // .data // .)
+    | if type=="object" and has("configProfiles") then .configProfiles
+      elif type=="array" then .
+      else [] end
+    | .[] | select(.name==$n) | .nodes[]?.uuid // empty
+  ' <<<"$resp" 2>/dev/null | paste -sd, - || true
+}
+
 panel_get_inbounds() {
   local profile_uuid="$1" resp
-  resp="$(panel_api GET "/config-profiles/$profile_uuid/inbounds" 2>/dev/null || true)"
+  resp="$(panel_api_retry GET "/config-profiles/$profile_uuid/inbounds" 2>/dev/null || true)"
   # Иногда панель отдаёт inbounds в /config-profiles/{uuid}, фолбэк
   if ! jq -e '.. | objects | has("uuid") and has("tag")' >/dev/null 2>&1 <<<"$resp"; then
-    resp="$(panel_api GET "/config-profiles/$profile_uuid" 2>/dev/null || true)"
+    resp="$(panel_api_retry GET "/config-profiles/$profile_uuid" 2>/dev/null || true)"
   fi
   # Выводим строки uuid|tag
   jq -r '.. | objects | select(has("uuid") and has("tag")) | "\(.uuid)|\(.tag)"' <<<"$resp" 2>/dev/null | sort -u
 }
 
-# Ищет существующую ноду в панели. В БД Remnawave уникален сам address (IP), а не
-# пара (address, port), плюс уникально имя name — поэтому при смене порта ноды
-# поиск по старому (address && port) не находил запись и POST /nodes падал с 409.
 panel_find_node_by_address() {
-  local addr="$1" port="${2:-}" expected_name="${3:-}" resp uuid
-  resp="$(panel_api GET "/nodes" 2>/dev/null || true)"
-  uuid="$(jq -r --arg a "$addr" --arg p "$port" --arg n "$expected_name" '
+  # Дополнительные аргументы (port/name) оставлены для совместимости вызовов.
+  local addr="$1" resp uuid
+  resp="$(panel_api_retry GET "/nodes" 2>/dev/null || true)"
+  uuid="$(jq -r --arg a "$addr" '
     ((.response // .data // .)
       | if type=="object" and has("nodes") then .nodes
         elif type=="array" then .
-        else [] end) as $nodes
-    | (
-        [ $nodes[]? | select(.address == $a) | .uuid // empty ]
-        + (if $n != "" then [ $nodes[]? | select(.name == $n) | .uuid // empty ] else [] end)
-      )
+        else [] end)
+    | [ .[]? | select(.address == $a) | .uuid // empty ]
+    | map(select(length > 0))[0] // empty
+  ' <<<"$resp" 2>/dev/null | head -1 || true)"
+  printf '%s' "$uuid"
+}
+
+panel_find_node_by_name() {
+  local name="$1" resp uuid
+  resp="$(panel_api_retry GET "/nodes" 2>/dev/null || true)"
+  uuid="$(jq -r --arg n "$name" '
+    ((.response // .data // .)
+      | if type=="object" and has("nodes") then .nodes
+        elif type=="array" then .
+        else [] end)
+    | [ .[]? | select(.name == $n) | .uuid // empty ]
     | map(select(length > 0))[0] // empty
   ' <<<"$resp" 2>/dev/null | head -1 || true)"
   printf '%s' "$uuid"
 }
 
 panel_find_host_by_remark() {
-  local remark="$1" resp uuid
-  resp="$(panel_api GET "/hosts" 2>/dev/null || true)"
-  uuid="$(jq -r --arg r "$remark" '
+  local remark="$1" resp row
+  resp="$(panel_api_retry GET "/hosts" 2>/dev/null || true)"
+  row="$(jq -r --arg r "$remark" '
     (.response // .data // .)
     | if type=="object" and has("hosts") then .hosts
       elif type=="array" then .
       else [] end
-    | .[] | select(.remark==$r) | .uuid // empty' <<<"$resp" 2>/dev/null | head -1 || true)"
-  printf '%s' "$uuid"
+    | .[] | select(.remark==$r)
+    | "\(.uuid)|\(.inbound.configProfileUuid // "")|\(.inbound.configProfileInboundUuid // "")|\((.tags // []) | join(","))"
+  ' <<<"$resp" 2>/dev/null | head -1 || true)"
+  printf '%s' "$row"
 }
 
 panel_upsert_config_profile() {
@@ -1511,6 +2162,16 @@ panel_upsert_config_profile() {
     return 1
   fi
   if [[ -n "$existing_uuid" ]]; then
+    # Профиль с тем же именем мог быть создан другой нодой (одинаковый PREFIX).
+    # Если у профиля уже есть ноды, а на этом SERVER_IP ноды ещё нет — не PATCH,
+    # иначе мы заменим чужой конфиг и сломаем его подписки.
+    local profile_nodes current_node
+    profile_nodes="$(panel_profile_node_uuids "$profile_name" || true)"
+    current_node="$(panel_find_node_by_address "$SERVER_IP" "$NODE_API_PORT" "$(panel_node_name)" || true)"
+    if [[ -n "$profile_nodes" && -z "$current_node" ]]; then
+      warn "Config Profile «$profile_name» уже назначен другой ноде ($profile_nodes), а на $SERVER_IP ноды ещё нет. Не перезаписываю; задайте другой PREFIX/NODE_TAG или удалите старый профиль."
+      return 2
+    fi
     # PATCH — полный replace, нужен uuid + config + name.
     # В актуальном API маршрут коллекционный: PATCH /config-profiles, uuid в теле.
     local patch_payload
@@ -1560,8 +2221,15 @@ panel_upsert_node() {
   local profile_uuid="$1" profile_inbounds_csv="$2" # comma-separated uuids
   local node_name
   node_name="$(panel_node_name)"
-  local existing_uuid resp result_uuid
+  local existing_uuid resp result_uuid name_uuid
   existing_uuid="$(panel_find_node_by_address "$SERVER_IP" "$NODE_API_PORT" "$node_name" || true)"
+  if [[ -z "$existing_uuid" ]]; then
+    name_uuid="$(panel_find_node_by_name "$node_name" || true)"
+    if [[ -n "$name_uuid" ]]; then
+      warn "В панели уже есть нода «$node_name» с другим address. Не перезаписываю её; задайте другой PREFIX/NODE_TAG."
+      return 2
+    fi
+  fi
   # Собираем activeInbounds как массив UUID
   local inbounds_json
   inbounds_json="$(printf '%s' "$profile_inbounds_csv" | jq -R 'split(",") | map(select(length>0))' 2>/dev/null || echo '[]')"
@@ -1596,6 +2264,15 @@ panel_upsert_node() {
       if [[ -z "$result_uuid" ]]; then result_uuid="(created)"; fi
       ok "Нода создана: $node_name ($result_uuid) → профиль $profile_uuid"
     else
+      if grep -qi "already exists\|duplicate\|conflict" <<<"$(panel_api_error "$resp")"; then
+        existing_uuid="$(panel_find_node_by_address "$SERVER_IP" "$NODE_API_PORT" "$node_name" || true)"
+        [[ -n "$existing_uuid" ]] || existing_uuid="$(panel_find_node_by_name "$node_name" || true)"
+        if [[ -n "$existing_uuid" ]]; then
+          warn "Нода уже существует в панели ($existing_uuid), но создать/обновить её этим запуском не удалось: $(panel_api_error "$resp")"
+          note "Проверьте ноду в панели или повторите запуск установщика."
+          return 1
+        fi
+      fi
       warn "Не удалось создать ноду: $(panel_api_error "$resp")"
       note "Создайте вручную: Nodes → Management → + (IP $SERVER_IP, порт $NODE_API_PORT, профиль $profile_uuid)"
       return 1
@@ -1604,11 +2281,8 @@ panel_upsert_node() {
   printf '%s' "$result_uuid"
 }
 
-# Инициирует немедленный запуск/синхронизацию Xray на ноде после старта контейнера
-# remnanode (POST /nodes/{uuid}/actions/restart с {"forceRestart":false}), чтобы
-# панель сразу отправила конфиг Xray и подняла слушатели к шагу 10.
 panel_trigger_node_start() {
-  local node_uuid="${1:-}" resp
+  local node_uuid="${1:-}"
   [[ -n "$node_uuid" && "$node_uuid" != "(created)" ]] || return 0
   if [[ -z "${REMNAWAVE_PANEL_URL:-}" || -z "${REMNAWAVE_API_TOKEN:-}" ]]; then
     return 0
@@ -1619,8 +2293,11 @@ panel_trigger_node_start() {
   if [[ -z "${PANEL_STATE_DIR:-}" ]]; then
     panel_state_init
   fi
-  resp="$(panel_api_retry POST "/nodes/$node_uuid/actions/restart" '{"forceRestart":false}' 2>/dev/null || true)"
-  if panel_api_success "$resp"; then
+  # Remnawave 3.x отвечает на этот action 202 Accepted без JSON-тела, поэтому
+  # panel_api_success здесь неприменим, а panel_api_retry повторял бы POST три
+  # раза (три restart-события). Достаточно одного запроса и проверки 2xx.
+  panel_api POST "/nodes/$node_uuid/actions/restart" '{"forceRestart":false}' >/dev/null 2>&1 || true
+  if [[ "$(panel_api_code)" =~ ^2[0-9]{2}$ ]]; then
     ok "Панель запустила синхронизацию Xray с нодой ($node_uuid)"
   fi
   return 0
@@ -1628,8 +2305,22 @@ panel_trigger_node_start() {
 
 panel_upsert_host() {
   local profile_uuid="$1" inbound_uuid="$2" remark="$3" address="$4" port="$5" extra_json="${6:-}"
-  local existing_uuid resp payload result_uuid
-  existing_uuid="$(panel_find_host_by_remark "$remark" || true)"
+  local existing_row existing_uuid existing_profile existing_inbound existing_tags resp payload result_uuid node_tag
+  existing_row="$(panel_find_host_by_remark "$remark" || true)"
+  IFS='|' read -r existing_uuid existing_profile existing_inbound existing_tags <<<"$existing_row"
+  node_tag="$(panel_node_tag)"
+  if [[ -n "$existing_uuid" ]]; then
+    # Тот же remark, но другой профиль/инбаунд: если у хоста тот же NODE_TAG,
+    # это та же нода после смены хоста/профиля — обновляем. Если тег другой —
+    # не перезаписываем чужой хост.
+    if [[ -n "$existing_profile" \
+          && ( "$existing_profile" != "$profile_uuid" || "$existing_inbound" != "$inbound_uuid" ) \
+          && -n "$existing_tags" \
+          && ",${existing_tags}," != *",${node_tag},"* ]]; then
+      warn "Хост «$remark» уже принадлежит другому профилю/инбаунду (вероятно, другой ноде) — не перезаписываю."
+      return 1
+    fi
+  fi
   # Базовый payload
   payload="$(jq -n --arg r "$remark" --arg a "$address" --argjson p "$port" --arg pu "$profile_uuid" --arg iu "$inbound_uuid" '{remark: $r, address: $a, port: $p, inbound: {configProfileUuid: $pu, configProfileInboundUuid: $iu}}' 2>/dev/null || true)"
   # Добавляем extra (securityLayer, sni, path, tag и т.п.) если переданы
@@ -1662,7 +2353,8 @@ panel_upsert_host() {
     else
       # Дубликат remark — пробуем найти снова
       if grep -qi "already exists\|duplicate\|conflict" <<<"$(panel_api_error "$resp")"; then
-        existing_uuid="$(panel_find_host_by_remark "$remark" || true)"
+        existing_row="$(panel_find_host_by_remark "$remark" || true)"
+        existing_uuid="${existing_row%%|*}"
         if [[ -n "$existing_uuid" ]]; then
           ok "Хост найден после дубликата: $remark ($existing_uuid)"
           result_uuid="$existing_uuid"
@@ -1682,15 +2374,17 @@ panel_upsert_host() {
 panel_upsert_internal_squad() {
   local -a inbounds=("$@")
   local resp squad_uuid existing_json inbounds_json merged_json payload create_payload
-  resp="$(panel_api GET "/internal-squads" 2>/dev/null || true)"
+  resp="$(panel_api_retry GET "/internal-squads" 2>/dev/null || true)"
   inbounds_json="$(printf '%s\n' "${inbounds[@]}" | jq -R . | jq -s 'map(select(length>0))' 2>/dev/null || echo '[]')"
-  # Remnawave 3.x: {response:{total, internalSquads:[...]}}; старые версии — массив
+  # Remnawave 3.x: {response:{total, internalSquads:[...]}}; старые версии — массив.
+  # Берём именно Default-Squad, а не первый попавшийся: иначе inbound'ы ноды
+  # попадут в чужой/платный отряд.
   squad_uuid="$(jq -r '
     (.response // .data // .)
     | if type=="object" and has("internalSquads") then .internalSquads
       elif type=="array" then .
       else [] end
-    | .[0].uuid // empty' <<<"$resp" 2>/dev/null || true)"
+    | ([ .[] | select(.name == "Default-Squad") ][0].uuid) // empty' <<<"$resp" 2>/dev/null || true)"
   if [[ -z "$squad_uuid" ]]; then
     create_payload="$(jq -n --argjson inbounds "$inbounds_json" '{name: "Default-Squad", inbounds: $inbounds}' 2>/dev/null || true)"
     if [[ -n "$create_payload" ]]; then
@@ -1711,7 +2405,9 @@ panel_upsert_internal_squad() {
     | if type=="object" and has("internalSquads") then .internalSquads
       elif type=="array" then .
       else [] end
-    | [ .[0].inbounds[]? | if type=="object" then (.uuid // empty) else . end | select(length > 0) ]
+    | [ ([ .[] | select(.name == "Default-Squad") ][0].inbounds[]?
+          | if type=="object" then (.uuid // empty) else . end
+          | select(length > 0)) ]
   ' <<<"$resp" 2>/dev/null || echo '[]')"
   merged_json="$(jq -n -c --argjson a "$existing_json" --argjson b "$inbounds_json" '($a + $b) | unique' 2>/dev/null || printf '%s' "$inbounds_json")"
   payload="$(jq -n --arg uuid "$squad_uuid" --argjson inbounds "$merged_json" '{uuid: $uuid, inbounds: $inbounds}' 2>/dev/null || true)"
@@ -1728,52 +2424,12 @@ panel_upsert_internal_squad() {
   fi
 }
 
-# Шаблоны в репозитории комментированы (JSON5), а Panel API принимает только
-# строгий JSON. Убираем //-комментарии вне строк и висячие запятые перед }/].
-# Важно: используем print с пустым ORS вместо printf "%s%s" — в mawk на
-# Debian/Ubuntu буфер sprintf ограничен 8192 байтами и обнуляет Xray_template_split.json.
-json5_to_json() {
-  awk '
-    {
-      line=$0; out=""; instr=0; esc=0;
-      for (i=1; i<=length(line); i++) {
-        c=substr(line,i,1);
-        if (instr) {
-          out=out c;
-          if (esc) esc=0;
-          else if (c=="\\") esc=1;
-          else if (c=="\"") instr=0;
-        } else if (c=="\"") {
-          instr=1; out=out c;
-        } else if (c=="/" && substr(line,i,2)=="//") {
-          break;
-        } else {
-          out=out c;
-        }
-      }
-      buf=buf out "\n";
-    }
-    END {
-      res="";
-      while (match(buf, /,[ \t\r\n]*[}\]]/)) {
-        m=substr(buf,RSTART,RLENGTH);
-        sub(/^,[ \t\r\n]*/,"",m);
-        res=res substr(buf,1,RSTART-1) m;
-        buf=substr(buf,RSTART+RLENGTH);
-      }
-      ORS="";
-      print res;
-      print buf;
-    }
-  '
-}
-
 panel_find_subscription_template_uuid() {
   local tname="$1" resp code
-  resp="$(panel_api GET "/subscription-templates" 2>/dev/null || true)"
+  resp="$(panel_api_retry GET "/subscription-templates" 2>/dev/null || true)"
   code="$(panel_api_code)"
   if ! panel_api_success "$resp" && [[ "$code" == "404" ]]; then
-    resp="$(panel_api GET "/templates" 2>/dev/null || true)"
+    resp="$(panel_api_retry GET "/templates" 2>/dev/null || true)"
   fi
   jq -r --arg n "$tname" '
     (.response // .data // .)
@@ -1924,6 +2580,9 @@ panel_auto_setup() {
   if (( profile_rc != 0 )) && [[ -n "$profile_out" ]]; then
     printf '%s\n' "$profile_out"
   fi
+  if (( profile_rc == 2 )); then
+    return 1
+  fi
   # "(created)" — профиль создан, но API не вернул uuid: ищем по имени.
   if [[ -z "$profile_uuid" || "$profile_uuid" == "(created)" ]]; then
     profile_uuid="$(panel_find_profile_by_name "$profile_name" || true)"
@@ -1947,11 +2606,11 @@ panel_auto_setup() {
   done <<<"$inbounds_raw"
 
   if (( ${#INBOUND_UUID_BY_TAG[@]} == 0 )); then
-    warn "Не удалось получить inbound'ы профиля $profile_uuid — нода/хосты будут созданы без привязки"
+    warn "Не удалось получить inbound'ы профиля $profile_uuid — без них нода не заработает."
     note "Проверьте панель: Config Profiles → $profile_name → inbounds"
-  else
-    ok "Профиль содержит inbound'ы: ${!INBOUND_UUID_BY_TAG[*]}"
+    return 1
   fi
+  ok "Профиль содержит inbound'ы: ${!INBOUND_UUID_BY_TAG[*]}"
 
   # 3) Нода — собираем все inbound uuid для activeInbounds
   local inbounds_csv=""
@@ -1966,6 +2625,9 @@ panel_auto_setup() {
     node_uuid="$(panel_result_uuid "$node_out" "$node_rc")"
     if (( node_rc != 0 )) && [[ -n "$node_out" ]]; then
       printf '%s\n' "$node_out"
+    fi
+    if (( node_rc == 2 )); then
+      return 1
     fi
     if [[ "$node_uuid" == "(created)" ]]; then
       node_uuid="$(panel_find_node_by_address "$SERVER_IP" "$NODE_API_PORT" "$(panel_node_name)" || true)"
@@ -1987,14 +2649,11 @@ panel_auto_setup() {
   # 5) Хосты — скрытые рабочие (tags=[<node_tag>], isHidden=true для балансировщика
   # Xray_template.json этой ноды) + видимая оболочка подписки. В Remnawave 3.x допустимы
   # только securityLayer: DEFAULT | TLS | NONE («REALITY» вызывает HTTP 400).
-  local host_count=0 host_failed=0 host_label="$PREFIX" node_tag extra
+  local host_count=0 host_failed=0 node_tag extra
   node_tag="$(panel_node_tag)"
-  if (( CF_MODE )) && [[ -n "${VLESS_HOST:-}" ]]; then
-    host_label="${VLESS_HOST%%.*}"
-  fi
   if [[ -n "${INBOUND_UUID_BY_TAG[REALITY_VISION]:-}" ]]; then
     extra="$(jq -n -c --arg sni "$SELF_STEAL_HOST" --arg tag "$node_tag" '{securityLayer:"DEFAULT", sni:$sni, fingerprint:"chrome", tags:[$tag], isHidden:true}')"
-    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[REALITY_VISION]}" "VLESS Vision $host_label" "$VLESS_HOST" "443" "$extra"; then
+    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[REALITY_VISION]}" "VLESS Vision $node_tag" "$VLESS_HOST" "443" "$extra"; then
       host_count=$((host_count+1))
     else
       host_failed=$((host_failed+1))
@@ -2002,7 +2661,7 @@ panel_auto_setup() {
   fi
   if [[ -n "${INBOUND_UUID_BY_TAG[REALITY_XHTTP]:-}" && -n "$XHTTP_SNI" ]]; then
     extra="$(jq -n -c --arg sni "$XHTTP_SNI" --arg path "$XHTTP_PATH" --arg tag "$node_tag" '{securityLayer:"DEFAULT", sni:$sni, path:$path, fingerprint:"chrome", tags:[$tag], isHidden:true}')"
-    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[REALITY_XHTTP]}" "VLESS XHTTP $host_label" "$VLESS_HOST" "443" "$extra"; then
+    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[REALITY_XHTTP]}" "VLESS XHTTP $node_tag" "$VLESS_HOST" "443" "$extra"; then
       host_count=$((host_count+1))
     else
       host_failed=$((host_failed+1))
@@ -2010,7 +2669,7 @@ panel_auto_setup() {
   fi
   if [[ -n "${INBOUND_UUID_BY_TAG[HYSTERIA2]:-}" ]]; then
     extra="$(jq -n -c --arg sni "$HY_HOST" --arg tag "$node_tag" '{securityLayer:"DEFAULT", sni:$sni, alpn:"h3", tags:[$tag], isHidden:true}')"
-    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[HYSTERIA2]}" "Hysteria2 $host_label" "$HY_HOST" "443" "$extra"; then
+    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[HYSTERIA2]}" "Hysteria2 $node_tag" "$HY_HOST" "443" "$extra"; then
       host_count=$((host_count+1))
     else
       host_failed=$((host_failed+1))
@@ -2019,7 +2678,7 @@ panel_auto_setup() {
   # CDN хосты (внешний TLS терминирует CDN → securityLayer="TLS")
   if [[ -n "${INBOUND_UUID_BY_TAG[VLESS_CDN_WS]:-}" ]]; then
     extra="$(jq -n -c --arg host "$CDN_HOST" --arg path "${CDN_WS_PATH:-/api/v1/stream}" --arg tag "$node_tag" '{securityLayer:"TLS", sni:$host, host:$host, path:$path, fingerprint:"chrome", tags:[$tag], isHidden:true}')"
-    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[VLESS_CDN_WS]}" "VLESS CDN WS $host_label" "$CDN_HOST" "443" "$extra"; then
+    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[VLESS_CDN_WS]}" "VLESS CDN WS $node_tag" "$CDN_HOST" "443" "$extra"; then
       host_count=$((host_count+1))
     else
       host_failed=$((host_failed+1))
@@ -2027,7 +2686,7 @@ panel_auto_setup() {
   fi
   if [[ -n "${INBOUND_UUID_BY_TAG[VLESS_CDN_XHTTP]:-}" ]]; then
     extra="$(jq -n -c --arg host "$CDN_HOST" --arg path "${CDN_XHTTP_PATH:-/api/v3/sync/c1}" --arg tag "$node_tag" '{securityLayer:"TLS", sni:$host, host:$host, path:$path, fingerprint:"chrome", tags:[$tag], isHidden:true}')"
-    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[VLESS_CDN_XHTTP]}" "VLESS CDN XHTTP $host_label" "$CDN_HOST" "443" "$extra"; then
+    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[VLESS_CDN_XHTTP]}" "VLESS CDN XHTTP $node_tag" "$CDN_HOST" "443" "$extra"; then
       host_count=$((host_count+1))
     else
       host_failed=$((host_failed+1))
@@ -2035,7 +2694,7 @@ panel_auto_setup() {
   fi
   if [[ -n "${INBOUND_UUID_BY_TAG[VLESS_CDN_GRPC]:-}" ]]; then
     extra="$(jq -n -c --arg host "$CDN_HOST" --arg path "${CDN_GRPC_PATH:-/api/v4/stream}" --arg tag "$node_tag" '{securityLayer:"TLS", sni:$host, alpn:"h2", path:$path, fingerprint:"chrome", tags:[$tag], isHidden:true}')"
-    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[VLESS_CDN_GRPC]}" "VLESS CDN gRPC $host_label" "$CDN_HOST" "443" "$extra"; then
+    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[VLESS_CDN_GRPC]}" "VLESS CDN gRPC $node_tag" "$CDN_HOST" "443" "$extra"; then
       host_count=$((host_count+1))
     else
       host_failed=$((host_failed+1))
@@ -2048,7 +2707,7 @@ panel_auto_setup() {
     else
       extra="$(jq -n -c --arg sni "$SELF_STEAL_HOST" '{securityLayer:"DEFAULT", sni:$sni, fingerprint:"chrome", tags:[], isHidden:false}')"
     fi
-    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[REALITY_VISION]}" "VPN $host_label" "$VLESS_HOST" "443" "$extra"; then
+    if panel_try_host "$profile_uuid" "${INBOUND_UUID_BY_TAG[REALITY_VISION]}" "VPN $node_tag" "$VLESS_HOST" "443" "$extra"; then
       host_count=$((host_count+1))
     else
       host_failed=$((host_failed+1))
@@ -2077,190 +2736,6 @@ panel_auto_setup() {
   return 0
 }
 
-apt_wait() {
-  local -i waited=0
-  # fuser приходит из пакета psmisc: он есть в списке базовых утилит шага 0, но
-  # первый apt-get (update) идёт до их установки. Без fuser все проверки
-  # блокировки молча ничего не делают (вывод перенаправлен в /dev/null), поэтому
-  # ставим psmisc сами — напрямую apt-get, без apt_get, чтобы не уйти в рекурсию.
-  # Если поставить не удалось (например, dpkg-lock держит другой процесс), просто
-  # продолжаем: apt-get ниже сам подождёт освобождения блокировки.
-  if ! have fuser; then
-    if have apt-get; then
-      DEBIAN_FRONTEND=noninteractive apt-get install -y psmisc >/dev/null 2>&1 || true
-    fi
-    have fuser || return 0
-  fi
-  while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
-     || fuser /var/lib/dpkg/lock          >/dev/null 2>&1 \
-     || fuser /var/lib/apt/lists/lock     >/dev/null 2>&1; do
-    if (( waited % 60 == 0 )); then
-      warn "Ожидаю освобождения apt/dpkg lock (прошло ${waited}s)..."
-    fi
-    sleep 5
-    waited=$((waited + 5))
-  done
-}
-apt_get() { apt_wait; DEBIAN_FRONTEND=noninteractive apt-get "$@"; }
-
-ask() {
-  local __var="$1" __prompt="$2" __default="${3:-}" __input
-  if [[ "$NONINTERACTIVE" == 1 ]]; then
-    [[ -n "$__default" ]] || die "--non-interactive: нет значения для «$__prompt» (задайте через env)."
-    printf -v "$__var" '%s' "$__default"
-    note "(auto) $__prompt = $__default"
-    return
-  fi
-  has_tty || die "Нет /dev/tty для вопроса «$__prompt». Запустите с --non-interactive и переменными окружения."
-  if [[ -n "$__default" ]]; then
-    printf ' %s?%s %s %s[%s]%s: ' "${C_MAG:-}${C_B:-}" "${C_RST:-}" "$__prompt" "${C_DIM:-}${C_GRY:-}" "$__default" "${C_RST:-}" > /dev/tty
-    IFS= read -r __input < /dev/tty || true
-    __input="${__input:-$__default}"
-  else
-    __input=""
-    while [[ -z "$__input" ]]; do
-      printf ' %s?%s %s: ' "${C_MAG:-}${C_B:-}" "${C_RST:-}" "$__prompt" > /dev/tty
-      IFS= read -r __input < /dev/tty || true
-    done
-  fi
-  printf -v "$__var" '%s' "$__input"
-}
-
-# ask_secret — как ask, но значение не печатается никогда: секреты не попадают
-# ни на экран, ни в установочный лог (например SECRET_KEY ноды).
-ask_secret() {
-  local __var="$1" __prompt="$2" __default="${3:-}" __input=""
-  if [[ "$NONINTERACTIVE" == 1 ]]; then
-    [[ -n "$__default" ]] || die "--non-interactive: нет значения для «$__prompt» (задайте через env)."
-    printf -v "$__var" '%s' "$__default"
-    note "(auto) $__prompt = <скрыто, символов: ${#__default}>"
-    return
-  fi
-  has_tty || die "Нет /dev/tty для ввода «$__prompt». Запустите с --non-interactive и переменными окружения."
-  while [[ -z "$__input" ]]; do
-    printf ' %s?%s %s (ввод скрыт): ' "${C_MAG:-}${C_B:-}" "${C_RST:-}" "$__prompt" > /dev/tty
-    IFS= read -rs __input < /dev/tty || true
-    printf '\n' > /dev/tty
-  done
-  printf -v "$__var" '%s' "$__input"
-}
-
-# parse_bool [значение] [дефолт] → 0|1 в stdout. Логические переменные приходят
-# из трёх источников: интерактивного ответа, переменных окружения и сохранённого
-# /root/remnanode.env (установщик прежних версий писал туда «1»), поэтому все
-# распространённые написания должны пониматься одинаково, а мусор — не выключать
-# функцию молча: вызывающий сам решает, что делать (см. ask_bool).
-parse_bool() {
-  local val="${1:-}" def="${2:-0}"
-  case "${val,,}" in
-    1|y|yes|true|on)  printf '1' ;;
-    0|n|no|false|off) printf '0' ;;
-    *)                printf '%s' "$def" ;;
-  esac
-}
-
-# bool_yn 0|1 → y|n: так флаги записываются в /root/remnanode.env, чтобы файл
-# читался человеком и одинаково понимался любым парсером (y* → включено).
-bool_yn() {
-  if [[ "${1:-0}" == 1 ]]; then
-    printf 'y'
-  else
-    printf 'n'
-  fi
-}
-
-# ask_bool VAR PROMPT DEFAULT(y/n) — вопрос с нормализацией ответа к 0/1.
-# Непонятный ответ переспрашивается (или останавливает установку в
-# --non-interactive), а не трактуется как «нет»: иначе опечатка тихо выключала бы
-# CDN или XHTTP.
-ask_bool() {
-  local __var="$1" __prompt="$2" __default __val __tries=0
-  __default="$(parse_bool "${3:-n}" 0)"
-  while :; do
-    ask "$__var" "$__prompt (y/n)" "$(bool_yn "$__default")"
-    __val="${!__var}"
-    case "${__val,,}" in
-      1|y|yes|true|on|0|n|no|false|off)
-        printf -v "$__var" '%s' "$(parse_bool "$__val" "$__default")"
-        return 0
-        ;;
-    esac
-    __tries=$((__tries + 1))
-    (( __tries < 5 )) || die "Не понял ответ «$__val» на вопрос «$__prompt»: нужен y или n."
-    warn "Ответ «$__val» не похож на y/n — введите y или n."
-  done
-}
-
-# Флаги авто-режимов приходят и из env (например, ASSUME_YES=y в CI): приводим их
-# к 0/1 тем же разбором, что и остальные логические переменные. Флаг командной
-# строки главнее: -y/--yes уже выставил 1 выше, и нормализация это не отменит.
-ASSUME_YES="$(parse_bool "${ASSUME_YES:-0}" 0)"
-NONINTERACTIVE="$(parse_bool "${NONINTERACTIVE:-0}" 0)"
-KEEP_BUILD_TOOLS="$(parse_bool "${KEEP_BUILD_TOOLS:-0}" 0)"
-
-# confirm "вопрос" "дефолт(y/n)" -> 0 если да, 1 если нет; уважает --yes/--non-interactive
-confirm() {
-  local __prompt="$1" __default="${2:-n}" __ans
-  if [[ "$ASSUME_YES" == 1 ]]; then
-    note "(auto-yes) $__prompt"
-    return 0
-  fi
-  # Ответ нормализуется тем же ask_bool: «1», «yes» и «y» здесь равнозначны, а
-  # непонятный ответ переспрашивается, а не читается как «нет».
-  ask_bool __ans "$__prompt" "$__default"
-  [[ "$__ans" == 1 ]]
-}
-
-# ask_choice VAR PROMPT DEFAULT_NUM "вариант1: описание" "вариант2: описание" ...
-# Понятный выбор из списка для обычного пользователя — нумерованное меню.
-ask_choice() {
-  local __var="$1" __prompt="$2" __default="$3"
-  shift 3
-  local -a __opts=("$@")
-  local __i __input __choice __key
-  if [[ "$NONINTERACTIVE" == 1 ]]; then
-    [[ -n "$__default" ]] || die "--non-interactive: нет значения для «$__prompt» (задайте через env)."
-    # В авто-режиме __default — номер варианта, берём ключ по номеру
-    if [[ "$__default" =~ ^[0-9]+$ ]] && (( __default >= 1 && __default <= ${#__opts[@]} )); then
-      __key="${__opts[$((__default-1))]%%:*}"
-      printf -v "$__var" '%s' "$__key"
-    else
-      printf -v "$__var" '%s' "$__default"
-    fi
-    note "(auto) $__prompt = ${!__var}"
-    return
-  fi
-  has_tty || die "Нет /dev/tty для вопроса «$__prompt». Запустите с --non-interactive и переменными окружения."
-  {
-    printf '\n'
-    printf ' %s%s%s\n' "${C_B:-}${C_CYN:-}" "$__prompt" "${C_RST:-}"
-    printf ' %s%s%s\n' "${C_DIM:-}${C_GRY:-}" "$RULE" "${C_RST:-}"
-    for __i in "${!__opts[@]}"; do
-      __key="${__opts[$__i]%%:*}"
-      __choice="${__opts[$__i]#*:}"
-      if [[ "$__key" == "${__opts[$__i]}" ]]; then __choice="$__key"; fi
-      if (( __i + 1 == __default )); then
-        printf '   %s%s %d)%s %s %s[по умолчанию]%s\n' "${C_B:-}${C_GRN:-}" "${C_RST:-}" "$((__i+1))" "${C_B:-}" "$__choice" "${C_DIM:-}${C_GRY:-}" "${C_RST:-}"
-      else
-        printf '   %s %d)%s %s\n' "${C_GRY:-}" "$((__i+1))" "${C_RST:-}" "$__choice"
-      fi
-    done
-    printf ' %s%s%s\n' "${C_DIM:-}${C_GRY:-}" "$RULE" "${C_RST:-}"
-  } > /dev/tty
-  while :; do
-    printf ' %s?%s Выберите номер [%s]: ' "${C_MAG:-}${C_B:-}" "${C_RST:-}" "$__default" > /dev/tty
-    IFS= read -r __input < /dev/tty || true
-    __input="${__input:-$__default}"
-    if [[ "$__input" =~ ^[0-9]+$ ]] && (( __input >= 1 && __input <= ${#__opts[@]} )); then
-      __key="${__opts[$((__input-1))]%%:*}"
-      printf -v "$__var" '%s' "$__key"
-      return
-    fi
-    warn "Введите число от 1 до ${#__opts[@]}." > /dev/tty
-  done
-}
-
-# ——— Remnawave Panel API: автоматическая настройка ———
 panel_curl_cfg_init() {
   local token
   # Токен — JWT/base64url без пробелов; случайно вставленный пробел или
@@ -2275,17 +2750,6 @@ panel_curl_cfg_init() {
   panel_state_init
 }
 
-# panel_api вызывают из $(...), а переменные, выставленные в подоболочке, до
-# вызывающего не доходят. Поэтому HTTP-код и ошибку curl храним в файлах:
-# иначе panel_api_success всегда видел пустой код и ЛЮБОЙ ответ панели считал
-# ошибкой — даже 200 с валидным токеном («не удалось подключиться»).
-PANEL_HTTP_BODY=""
-PANEL_HTTP_CODE_FILE=""
-PANEL_HTTP_ERROR_FILE=""
-
-# Пути берутся из приватного каталога PANEL_STATE_DIR: его создаёт
-# родительская оболочка, а подоболочки $(...) наследуют путь. Поэтому HTTP-код,
-# записанный внутри panel_api, читается вызывающим.
 panel_http_code_file() {
   if [[ -n "${PANEL_HTTP_CODE_FILE:-}" ]]; then
     printf '%s' "$PANEL_HTTP_CODE_FILE"
@@ -2325,8 +2789,6 @@ panel_api_code() {
   printf '%s' "$code"
 }
 
-# Тело ответа — в stdout, HTTP-код — в PANEL_HTTP_CODE_FILE,
-# ошибка транспорта curl — в PANEL_HTTP_ERROR_FILE.
 panel_api() {
   local method="$1" path="$2" body="${3:-}"
   local url="${REMNAWAVE_PANEL_URL%/}/api$path"
@@ -2368,7 +2830,9 @@ panel_api_success() {
   local body="${1:-$PANEL_HTTP_BODY}"
   if jq -e '.success == false' >/dev/null 2>&1 <<<"$body"; then return 1; fi
   if jq -e '.errors and (.errors|length>0)' >/dev/null 2>&1 <<<"$body"; then return 1; fi
-  jq -e '.response != null or .success == true or .data != null or has("response") or has("data")' >/dev/null 2>&1 <<<"$body"
+  # has("response")/has("data") здесь намеренно НЕ используются: 200 с
+  # {"response":null,"message":"Forbidden"} — это ошибка, а не успех.
+  jq -e '.response != null or .success == true or .data != null' >/dev/null 2>&1 <<<"$body"
 }
 
 panel_api_error() {
@@ -2405,11 +2869,6 @@ panel_api_error() {
     printf 'неизвестная ошибка Panel API (HTTP %s)' "$code"
   fi
 }
-
-# Причина неудачной проверки — для понятной подсказки в мастере.
-PANEL_CONN_REASON=""
-PANEL_CONN_DETAIL=""
-PANEL_CONN_CODE=""
 
 panel_check_connection() {
   local resource resp code denied=""
@@ -2455,8 +2914,6 @@ panel_check_connection() {
   return 0
 }
 
-# Человеческое объяснение к PANEL_CONN_REASON: 401 — токен, 403 — права,
-# 404 — адрес, 000 — сеть, 2xx без JSON — Cloudflare/страница входа.
 panel_connection_hint() {
   local reason="${PANEL_CONN_REASON:-}" detail="${PANEL_CONN_DETAIL:-}"
   case "$reason" in
@@ -2481,13 +2938,18 @@ panel_connection_hint() {
   esac
 }
 
-# Повтор с бэкофом для сетевых сбоев панели (000/5xx/429)
 panel_api_retry() {
   local tries=3 delay=5 n=1 resp code
   while :; do
     resp="$(panel_api "$@" || true)"
     code="$(panel_api_code)"
     if panel_api_success "$resp"; then
+      printf '%s' "$resp"
+      return 0
+    fi
+    # 202/204 — принято, тела может не быть вовсе. Ретраить такой запрос
+    # (например restart ноды) нельзя: повтор создаст второе действие.
+    if [[ "$code" == "202" || "$code" == "204" ]]; then
       printf '%s' "$resp"
       return 0
     fi
@@ -2509,21 +2971,1143 @@ panel_api_retry() {
   done
 }
 
-detect_ssh_port() {
-  local port=""
-  if have sshd; then
-    port="$(sshd -T 2>/dev/null | awk 'tolower($1)=="port"{print $2; exit}' || true)"
-  fi
-  if [[ ! "$port" =~ ^[0-9]+$ ]]; then
-    port="$(awk 'tolower($1)=="port" && $2 ~ /^[0-9]+$/ {print $2; exit}' \
-            /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null || true)"
-  fi
-  if [[ ! "$port" =~ ^[0-9]+$ && -n "${SSH_CONNECTION:-}" ]]; then
-    port="$(awk '{print $4}' <<<"$SSH_CONNECTION" 2>/dev/null || true)"
-  fi
-  [[ "$port" =~ ^[0-9]+$ ]] || port=22
-  printf '%s' "$port"
+PANEL_HTTP_BODY=""
+PANEL_HTTP_CODE_FILE=""
+PANEL_HTTP_ERROR_FILE=""
+PANEL_CONN_REASON=""
+PANEL_CONN_DETAIL=""
+PANEL_CONN_CODE=""
+
+# --- Caddyfile, L4 и проверки ---
+caddy_build_matches() {
+  have caddy \
+    && [[ "$(caddy version 2>/dev/null | awk '{print $1}')" == "$CADDY_VERSION" ]] \
+    && caddy list-modules 2>/dev/null | grep -qE 'layer4' \
+    && caddy build-info 2>/dev/null | tr '\t' ' ' \
+      | grep -Fq "github.com/mholt/caddy-l4 $CADDY_L4_VERSION"
 }
+
+assert_port443_free() {
+  local line holder
+  have ss || return 0
+  line="$(ss -H -lntp 'sport = :443' 2>/dev/null | grep -vi caddy | head -1 || true)"
+  [[ -n "$line" ]] || return 0
+  holder="$(sed -n 's/.*users:(("\([^"]*\)".*/\1/p' <<<"$line")"
+  holder="${holder:-неизвестный процесс}"
+  die "Порт 443/tcp занят процессом «$holder»: остановите его (systemctl stop <сервис>), иначе Caddy не сможет слушать 443."
+}
+
+has_tcp_listener() {
+  ss -H -lnt "sport = :$1" 2>/dev/null | grep -q .
+}
+
+has_tcp_listener_at() {
+  local address="$1" port="$2"
+  ss -H -lnt "sport = :$port" 2>/dev/null | awk '{print $4}' | grep -Fqx "$address:$port"
+}
+
+has_udp_listener() {
+  ss -H -lnu "sport = :$1" 2>/dev/null | grep -q .
+}
+
+all_protocol_listeners_ready() {
+  local xhttp_ready=1 cdn_ready=1
+  # 10444 слушает только включённый XHTTP: с выключенным профилем его нет.
+  if (( ENABLE_XHTTP )); then
+    has_tcp_listener_at 127.0.0.1 10444 || xhttp_ready=0
+  fi
+  # CDN-сайт Caddy слушает всегда, когда включён CDN, а инбаунды — только если
+  # они есть в назначенном панелью профиле (то есть включены на карточке ноды).
+  if (( ENABLE_CDN )); then
+    has_tcp_listener_at 127.0.0.1 "$CDN_TLS_PORT" || cdn_ready=0
+    if (( CDN_WS_ENABLED )); then
+      has_tcp_listener_at 127.0.0.1 "$CDN_WS_PORT" || cdn_ready=0
+    fi
+    if (( CDN_XHTTP_ENABLED )); then
+      has_tcp_listener_at 127.0.0.1 "$CDN_XHTTP_PORT" || cdn_ready=0
+    fi
+    if (( CDN_GRPC_ENABLED )); then
+      has_tcp_listener_at 127.0.0.1 "$CDN_GRPC_PORT" || cdn_ready=0
+    fi
+  fi
+  (( xhttp_ready == 1 && cdn_ready == 1 )) \
+    && has_tcp_listener 443 \
+    && has_tcp_listener_at 127.0.0.1 9443 \
+    && has_tcp_listener_at 127.0.0.1 10443 \
+    && has_tcp_listener "$NODE_API_PORT" \
+    && has_udp_listener 443
+}
+
+check_tls_route() {
+  local name="$1" sni="$2" output
+  printf '   %s%s%s (%s)%s\n' "${C_B:-}" "${C_MAG:-}" "$name" "$sni" "${C_RST:-}"
+  if output="$(timeout 12 openssl s_client -connect 127.0.0.1:443 -servername "$sni" \
+      -verify_hostname "$sni" -verify_return_error -brief </dev/null 2>&1)" \
+      && grep -Eq 'CONNECTION ESTABLISHED|Protocol version:' <<<"$output"; then
+    printf '%s\n' "$output" | head -8 | sed 's/^/     /'
+    return 0
+  fi
+  printf '%s\n' "$output" | head -8 | sed 's/^/     /'
+  warn "$name: TLS-маршрут для SNI $sni не прошёл проверку."
+  return 1
+}
+
+verify_http_layer() {
+  local tmp
+  tmp="$(mktemp)"
+  if curl -sS -o /dev/null -D "$tmp" --max-time 10 \
+      --resolve "$SELF_STEAL_HOST:80:127.0.0.1" \
+      "http://$SELF_STEAL_HOST/probe/path?probe=1" 2>/dev/null \
+      && head -1 "$tmp" | grep -q ' 301' \
+      && grep -qi "^location: https://$SELF_STEAL_HOST/probe/path?probe=1" "$tmp"; then
+    ok "Порт 80 отдаёт постоянный 301 с сохранением пути и query"
+  else
+    sed 's/^/     /' "$tmp" | head -8
+    rm -f "$tmp"
+    die "Порт 80 не отдаёт 301 на HTTPS с сохранением URI (см. вывод выше)."
+  fi
+  if curl -sS -o /dev/null -D "$tmp" --max-time 10 \
+      --resolve "$SELF_STEAL_HOST:9443:127.0.0.1" \
+      "https://$SELF_STEAL_HOST:9443/" 2>/dev/null \
+      && grep -qi '^strict-transport-security: max-age=31536000' "$tmp"; then
+    ok "Локальный TLS-сайт: сертификат валиден и отдаёт HSTS max-age=31536000"
+  else
+    sed 's/^/     /' "$tmp" | head -8
+    rm -f "$tmp"
+    die "Self-steal сайт не отдал HSTS или сертификат не прошёл проверку."
+  fi
+  rm -f "$tmp"
+  local tls_ver
+  for tls_ver in tls1_2 tls1_3; do
+    echo | timeout 10 openssl s_client -connect 127.0.0.1:9443 \
+      -servername "$SELF_STEAL_HOST" -"$tls_ver" -brief >/dev/null 2>&1 \
+      || die "Локальный TLS-сайт не принимает $tls_ver — проверьте tls protocols в Caddyfile."
+  done
+  ok "Локальный TLS-сайт принимает TLS 1.2 и TLS 1.3"
+}
+
+xhttp_l4_block() {
+  if (( ENABLE_XHTTP )); then
+    printf '      @xhttp tls sni %s\n      route @xhttp {\n        proxy 127.0.0.1:10444\n      }' "$XHTTP_SNI"
+  fi
+}
+
+cdn_l4_block() {
+  if (( ENABLE_CDN )); then
+    printf '      @cdn tls sni %s\n      route @cdn {\n        proxy 127.0.0.1:%s\n      }' "$CDN_HOST" "$CDN_TLS_PORT"
+  fi
+}
+
+cdn_routes_block() {
+  if (( CDN_WS_ENABLED )); then
+    printf '\n  @ws path %s*\n  reverse_proxy @ws 127.0.0.1:%s' "$CDN_WS_PATH" "$CDN_WS_PORT"
+  fi
+  if (( CDN_XHTTP_ENABLED )); then
+    printf '\n  @xhttpcdn path %s*\n  reverse_proxy @xhttpcdn 127.0.0.1:%s' "$CDN_XHTTP_PATH" "$CDN_XHTTP_PORT"
+  fi
+  if (( CDN_GRPC_ENABLED )); then
+    printf '\n  @grpccdn path %s/*\n  reverse_proxy @grpccdn h2c://127.0.0.1:%s {\n    flush_interval -1\n  }' "$CDN_GRPC_PATH" "$CDN_GRPC_PORT"
+  fi
+}
+
+render_caddyfile() {
+  # Генерирует Caddyfile в $CADDYFILE_PATH. Вынесено из main, чтобы
+  # интеграционный тест вызывал функцию, а не извлекал heredoc sed/awk.
+# Маршрут XHTTP вырезается целиком, когда XHTTP выключен: иначе Caddy уводил бы
+# SNI XHTTP в 127.0.0.1:10444, где после отключения inbound'а никто не слушает.
+XHTTP_L4_BLOCK="$(xhttp_l4_block)"
+CDN_L4_BLOCK="$(cdn_l4_block)"
+cat > "$CADDYFILE_PATH" <<EOF
+{
+  admin off
+  auto_https disable_redirects
+  layer4 {
+    :443 {
+      @vision tls sni $SELF_STEAL_HOST
+      route @vision {
+        proxy 127.0.0.1:10443
+      }
+$XHTTP_L4_BLOCK
+$CDN_L4_BLOCK
+      route {
+        proxy 127.0.0.1:$SELF_STEAL_TLS_PORT
+      }
+    }
+  }
+}
+
+# Постоянный 301 на HTTPS с сохранением пути и query string.
+# Домен берётся из конфигурации, а не из заголовка Host, поэтому open redirect невозможен.
+http://$SELF_STEAL_HOST${SELF_STEAL_HTTP_PORT:+:$SELF_STEAL_HTTP_PORT} {
+  redir https://$SELF_STEAL_HOST{uri} permanent
+}
+
+https://$SELF_STEAL_HOST:$SELF_STEAL_TLS_PORT {
+  bind 127.0.0.1
+  tls "$CERT_DIR/$SELF_STEAL_HOST/fullchain.pem" "$CERT_DIR/$SELF_STEAL_HOST/key.pem" {
+    protocols tls1.2 tls1.3
+  }
+  root * $SELF_STEAL_ROOT
+  header {
+    -Server
+    Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:; form-action 'none'; base-uri 'none'; frame-ancestors 'none'"
+    X-Content-Type-Options nosniff
+    Referrer-Policy no-referrer
+    Permissions-Policy "camera=(), microphone=(), geolocation=()"
+    Strict-Transport-Security "max-age=31536000"
+  }
+  file_server
+}
+EOF
+
+if (( ENABLE_XHTTP )) && is_xhttp_target_local && [[ "$XHTTP_SNI" != "$SELF_STEAL_HOST" ]]; then
+  # XHTTP REALITY с локальным target: REALITY-сервер форвардит неаутентифи-
+  # цированный handshake на 127.0.0.1:9443 с SNI XHTTP_SNI. Публичный сайт для
+  # этого SNI не нужен — Caddy отвечает только на loopback, поэтому используем
+  # внутренний сертификат (`tls internal`): REALITY-клиент не проверяет цепочку
+  # target, ему важен только согласованный TLS-handshake. Отдельный блок нужен,
+  # потому что сертификат self-steal домена не подходит для чужого SNI.
+  cat >> "$CADDYFILE_PATH" <<EOF
+
+https://$XHTTP_SNI:$SELF_STEAL_TLS_PORT {
+  bind 127.0.0.1
+  tls internal
+  root * $SELF_STEAL_ROOT
+  header {
+    -Server
+    Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:; form-action 'none'; base-uri 'none'; frame-ancestors 'none'"
+    X-Content-Type-Options nosniff
+    Referrer-Policy no-referrer
+    Permissions-Policy "camera=(), microphone=(), geolocation=()"
+    Strict-Transport-Security "max-age=31536000"
+  }
+  file_server
+}
+EOF
+fi
+
+if (( ENABLE_CDN )); then
+  # Отдельный блок для CDN-хоста. Публичный TLS терминирует CDN, а к нам на :443
+  # приходит уже его SNI — отсюда маршрут @cdn в layer4. Здесь мы терминируем
+  # TLS сертификатом CDN-хоста и отдаём: пути инбаундов — в Xray (loopback),
+  # всё остальное — тот же фасад, что и на self-steal сайте. Сторонний сканер
+  # по CDN-хосту видит обычный веб-сайт. Xray при этом не смотрит наружу.
+  CDN_ROUTES_BLOCK="$(cdn_routes_block)"
+  cat >> "$CADDYFILE_PATH" <<EOF
+
+https://$CDN_HOST:$CDN_TLS_PORT {
+  bind 127.0.0.1
+  tls "$CERT_DIR/$CDN_HOST/fullchain.pem" "$CERT_DIR/$CDN_HOST/key.pem" {
+    protocols tls1.2 tls1.3
+  }
+$CDN_ROUTES_BLOCK
+  root * $SELF_STEAL_ROOT
+  header {
+    -Server
+    Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:; form-action 'none'; base-uri 'none'; frame-ancestors 'none'"
+    X-Content-Type-Options nosniff
+    Referrer-Policy no-referrer
+    Permissions-Policy "camera=(), microphone=(), geolocation=()"
+    Strict-Transport-Security "max-age=31536000"
+  }
+  file_server
+}
+EOF
+fi
+}
+
+# --- acme.sh и сертификаты ---
+acme_cert_days_left() {
+  local d="$1" home="${ACME_HOME:-/root/.acme.sh}" crt end end_epoch
+  # Установщик всегда выпускает ec-256 и потом делает --install-cert --ecc.
+  # RSA-сертификат старой версии считаем отсутствующим и перевыпускаем, иначе
+  # install-cert --ecc упадёт после «пропускаю issue».
+  crt="$home/${d}_ecc/${d}.crt"
+  [[ -s "$crt" ]] || return 1
+  end="$(openssl x509 -in "$crt" -noout -enddate 2>/dev/null | cut -d= -f2-)" || return 1
+  [[ -n "$end" ]] || return 1
+  end_epoch="$(LC_ALL=C date -d "$end" +%s 2>/dev/null)" || return 1
+  printf '%s' $((( end_epoch - $(date +%s) ) / 86400 ))
+}
+
+issue_cert() {
+  local d="$1" listed=0 days
+  local -a issue_args=(--issue --standalone -d "$d" --keylength ec-256 \
+                        --pre-hook "$ACME_PRE_HOOK" --post-hook "$ACME_POST_HOOK")
+  if "$ACME" --list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$d"; then
+    listed=1
+  fi
+  if (( listed )); then
+    if days="$(acme_cert_days_left "$d")" && (( days > 7 )); then
+      ok "Сертификат для $d уже выпущен (осталось ${days} дн.) — пропускаю issue"
+      return 0
+    fi
+    warn "Сертификат для $d отсутствует, нечитаем или истекает менее чем через 7 дней — перевыпускаю."
+    issue_args+=(--force)
+  fi
+  if systemctl is-active --quiet caddy; then
+    systemctl stop caddy || die "Не удалось освободить порт 80 для ACME."
+    CADDY_RESTORE_NEEDED=1
+    note "Caddy временно остановлен для ACME standalone challenge."
+  fi
+  if ss -H -lnt 'sport = :80' 2>/dev/null | grep -q .; then
+    ss -H -lntp 'sport = :80' 2>/dev/null | sed 's/^/   /' || true
+    die "Порт 80 занят другим процессом — ACME standalone challenge невозможен."
+  fi
+  if ! "$ACME" "${issue_args[@]}"; then
+    warn "Не удалось выпустить сертификат для $d (проверьте DNS/порт 80)."
+    return 1
+  fi
+}
+
+issue_cert_dns() {
+  local d="$1" listed=0 days token_hash token_marker token_changed=0
+  local -a issue_args=(--issue --dns dns_cf -d "$d" --keylength ec-256)
+  [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]] \
+    || { warn "Для DNS-01 сертификата $d нужен CLOUDFLARE_API_TOKEN."; return 1; }
+  # acme.sh хранит CF_Token в своём конфиге и использует его при продлении.
+  # Если токен сменился, валидный сертификат нельзя просто пропускать: cron
+  # продолжит ходить старым токеном. Хэш маркера позволяет перевыпустить один
+  # раз после ротации, не дожидаясь истечения.
+  token_marker="${ACME%/*}/.remnanode-cf-token.sha256"
+  token_hash="$(printf '%s' "$CLOUDFLARE_API_TOKEN" | sha256sum | awk '{print $1}')"
+  if [[ -f "$token_marker" ]]; then
+    [[ "$(cat "$token_marker" 2>/dev/null || true)" == "$token_hash" ]] || token_changed=1
+  else
+    token_changed=1
+  fi
+  if "$ACME" --list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$d"; then
+    listed=1
+  fi
+  if (( listed )); then
+    if (( ! token_changed )) && days="$(acme_cert_days_left "$d")" && (( days > 7 )); then
+      ok "Сертификат для $d уже выпущен (осталось ${days} дн.) — пропускаю issue"
+      return 0
+    fi
+    if (( token_changed )); then
+      warn "Cloudflare-токен изменился — перевыпускаю сертификат $d, чтобы acme.sh сохранил новые креды."
+    else
+      warn "Сертификат для $d отсутствует, нечитаем или истекает — перевыпускаю через DNS-01."
+    fi
+    issue_args+=(--force)
+  fi
+  # dns_cf читает CF_Token; CF_Zone_ID избавляет от повторного поиска зоны.
+  # Но он относится к конкретной зоне: для домена из другой зоны (CDN-домен
+  # может жить отдельно от доменов ноды) его подставлять нельзя. Запуск в
+  # подоболочке не даёт временным CF_* протечь в следующие вызовы.
+  if ! (
+    export CF_Token="$CLOUDFLARE_API_TOKEN"
+    if [[ -n "${CF_ZONE_ID:-}" && -n "${CF_ZONE_NAME:-}" ]] \
+        && { [[ "$d" == "$CF_ZONE_NAME" || "$d" == *."$CF_ZONE_NAME" ]]; }; then
+      export CF_Zone_ID="$CF_ZONE_ID"
+    fi
+    "$ACME" "${issue_args[@]}"
+  ); then
+    warn "Не удалось выпустить сертификат для $d через DNS-01: проверьте права токена (Zone:Read + DNS:Edit) и CLOUDFLARE_ZONE."
+    return 1
+  fi
+  ( umask 077; printf '%s\n' "$token_hash" > "$token_marker" )
+}
+
+ACME_PRE_HOOK='systemctl stop caddy >/dev/null 2>&1 || true'
+ACME_POST_HOOK='systemctl start caddy >/dev/null 2>&1 || true'
+
+issue_cert_selected() {
+  # Единая точка выбора ACME-метода для self-steal и Hysteria2. DNS-01 не
+  # останавливает Caddy и не рвёт активные 443/tcp-соединения; HTTP-01 —
+  # вынужденный fallback без Cloudflare-токена.
+  local d="$1" method
+  method="$(acme_method_resolved)"
+  case "$method" in
+    dns)
+      if [[ -z "${CLOUDFLARE_API_TOKEN:-}" ]]; then
+        warn "ACME_METHOD=$ACME_METHOD, но CLOUDFLARE_API_TOKEN пуст — DNS-01 невозможен."
+        return 1
+      fi
+      note "ACME для $d: DNS-01 (Caddy не останавливается, 443/tcp не рвётся)"
+      if issue_cert_dns "$d"; then
+        return 0
+      fi
+      # auto — это «DNS при возможности»: токен может видеть только зону CDN,
+      # а домены ноды жить в другой зоне. Явный dns не откатывается.
+      if [[ "$ACME_METHOD" == "dns" ]]; then
+        return 1
+      fi
+      warn "DNS-01 для $d не удался (токен не видит зону?) — откатываюсь на HTTP-01."
+      issue_cert "$d"
+      ;;
+    http)
+      warn "ACME для $d: HTTP-01 — Caddy будет кратко остановлен, 443/tcp может прерваться."
+      issue_cert "$d"
+      ;;
+  esac
+}
+
+
+# --- --uninstall/--dry-run ---
+remove_ufw_comment_rules() {
+  local comment="$1" rule_no
+  local -a rule_numbers=()
+  mapfile -t rule_numbers < <(
+    ufw status numbered 2>/dev/null \
+      | sed -n "/${comment}/s/^[[:space:]]*\[[[:space:]]*\([0-9]\+\)\].*/\1/p" \
+      | sort -rn
+  )
+  for rule_no in "${rule_numbers[@]}"; do
+    run_cmd ufw --force delete "$rule_no" || warn "Не удалось удалить ufw-правило №$rule_no ($comment)."
+  done
+}
+
+is_safe_remove_path() {
+  local p="${1:-}"
+  [[ "$p" == /* && "$p" != "/" && "$p" != "/root" && "$p" != "/etc" \
+      && "$p" != "/usr" && "$p" != "/var" && "$p" != "/opt" \
+      && "$p" != "/home" && "$p" != *"/../"* && "$p" != *"/.." ]]
+}
+
+run_cmd() {
+  if (( DRY_RUN )); then
+    printf '   [dry-run] %s\n' "$*"
+    return 0
+  fi
+  "$@"
+}
+
+uninstall_node() {
+  local bashrc_tmp=""
+  is_safe_remove_path "$NODE_DIR" || die "Отказ: небезопасный NODE_DIR для удаления: $NODE_DIR"
+  is_safe_remove_path "$CERT_DIR" || die "Отказ: небезопасный CERT_DIR для удаления: $CERT_DIR"
+  is_safe_remove_path "$ENV_STORE" || die "Отказ: небезопасный ENV_STORE для удаления: $ENV_STORE"
+  is_safe_remove_path "$SELF_STEAL_ROOT" || die "Отказ: небезопасный SELF_STEAL_ROOT для удаления: $SELF_STEAL_ROOT"
+  is_safe_remove_path "$XRAY_LOG_DIR" || die "Отказ: небезопасный XRAY_LOG_DIR для удаления: $XRAY_LOG_DIR"
+  [[ "$(basename "$ENV_STORE")" == *remnanode* || "$(basename "$ENV_STORE")" == *.env ]] \
+    || die "Отказ: ENV_STORE не похож на файл установщика: $ENV_STORE"
+  if (( ! DRY_RUN )); then
+    confirm "Удалить управляемые компоненты (нода remnanode, Caddyfile, сертификаты, UFW-правила, env-файл)?" "n" \
+      || die "Отменено."
+  fi
+  note "План удаления: $NODE_DIR, $CERT_DIR, $SELF_STEAL_ROOT, $XRAY_LOG_DIR, $ENV_STORE, Caddyfile, UFW-правила."
+  note "Пакеты Docker/Caddy/acme.sh/ufw и их данные не удаляются."
+
+  if have docker && docker info >/dev/null 2>&1; then
+    if [[ -f "$NODE_DIR/docker-compose.yml" ]]; then
+      run_cmd docker compose -f "$NODE_DIR/docker-compose.yml" --project-directory "$NODE_DIR" down --remove-orphans \
+        || warn "docker compose down завершился с ошибкой."
+    else
+      run_cmd docker rm -f remnanode || true
+    fi
+  else
+    warn "Docker недоступен — контейнер remnanode не остановлен."
+  fi
+
+  if have ufw && ufw status 2>/dev/null | grep -q 'Status: active'; then
+    if (( DRY_RUN )); then
+      note "[dry-run] удалить managed-правила UFW (панель → нода, 80/443)"
+    else
+      remove_managed_ufw_rules || true
+    fi
+    remove_ufw_comment_rules 'VLESS via Caddy L4'
+    remove_ufw_comment_rules 'Hysteria2 QUIC'
+    remove_ufw_comment_rules 'acme.sh standalone'
+  else
+    warn "UFW не активен — правила не трогаю."
+  fi
+
+  if have systemctl; then
+    run_cmd systemctl stop caddy || true
+    run_cmd systemctl disable caddy || true
+  fi
+  if have apt-mark; then
+    run_cmd apt-mark unhold caddy || true
+  fi
+  run_cmd rm -f /etc/caddy/Caddyfile
+  if [[ -d /etc/caddy ]]; then
+    run_cmd find /etc/caddy -maxdepth 1 -type f -name 'Caddyfile.backup-*' -delete
+  fi
+  run_cmd rm -rf -- "$NODE_DIR" "$CERT_DIR" "$SELF_STEAL_ROOT" "$XRAY_LOG_DIR"
+  run_cmd rm -f /etc/sysctl.d/99-remnanode.conf /etc/modules-load.d/bbr.conf /etc/security/limits.d/99-remnanode.conf
+  run_cmd rm -f /etc/logrotate.d/remnanode-xray
+  run_cmd rm -f /var/log/remnanode-setup-*.log
+
+  if [[ -f "$ENV_STORE" ]]; then
+    if (( DRY_RUN )); then
+      printf '   [dry-run] rm -f %s\n' "$ENV_STORE"
+      printf '   [dry-run] убрать source %s из /root/.bashrc\n' "$ENV_STORE"
+    else
+      rm -f -- "$ENV_STORE"
+      if [[ -f /root/.bashrc ]]; then
+        bashrc_tmp="$(mktemp /root/.bashrc.XXXXXX)"
+        if ( umask 077; grep -vF "source $ENV_STORE" /root/.bashrc > "$bashrc_tmp" ); then
+          cat "$bashrc_tmp" > /root/.bashrc
+        else
+          warn "Не удалось обновить /root/.bashrc — уберите source $ENV_STORE вручную."
+        fi
+        rm -f "$bashrc_tmp"
+      fi
+    fi
+  fi
+
+  if have sysctl; then
+    run_cmd sysctl --system || true
+  fi
+  ok "Удаление завершено. Caddy/acme.sh/Docker/ufw-пакеты оставлены; при необходимости удалите их вручную."
+}
+
+# --- Интерактивное изменение настроек после установки (--reconfigure) ---
+
+reconfigure_print_summary() {
+  hr
+  kv "SERVER_IP"        "${SERVER_IP:-}"
+  kv "VLESS"            "${VLESS_HOST:-}"
+  kv "HYSTERIA2"        "${HY_HOST:-}"
+  kv "SELF_STEAL"       "${SELF_STEAL_HOST:-}"
+  kv "Фасад"            "${SELF_STEAL_TEMPLATE:-vaultdrop}"
+  if (( ${ENABLE_XHTTP:-0} )); then
+    kv "XHTTP"          "SNI ${XHTTP_SNI:-}, path ${XHTTP_PATH:-}, target ${XHTTP_TARGET:-}"
+  else
+    kv "XHTTP"          "(выключен)"
+  fi
+  if (( ${ENABLE_CDN:-0} )); then
+    kv "CDN"            "${CDN_HOST:-} (${CDN_TRANSPORT:-ws})"
+  else
+    kv "CDN"            "(выключен)"
+  fi
+  kv "minClientVer"     "${REALITY_MIN_CLIENT_VER:-0.0.0}"
+  kv "ACME"             "${ACME_METHOD:-auto} (для новых сертификатов)"
+  kv "Авто-панель"      "$([[ "${REMNAWAVE_AUTO_SETUP:-0}" == 1 ]] && echo да || echo нет)"
+  hr
+}
+
+reconfigure_choose_theme() {
+  local current="${SELF_STEAL_TEMPLATE:-vaultdrop}" default=1 i choice__
+  if [[ -n "${SELF_STEAL_TEMPLATE_URL:-}" ]]; then
+    default=7
+  elif [[ "$current" == "$SELF_STEAL_TEMPLATE_NONE" ]]; then
+    default=6
+  else
+    for i in "${!SELF_STEAL_TEMPLATES[@]}"; do
+      if [[ "${SELF_STEAL_TEMPLATES[$i]}" == "$current" ]]; then
+        default=$((i + 1))
+        break
+      fi
+    done
+  fi
+  ask_choice choice__ "Фасад self-steal" "$default" \
+    "vaultdrop: Файлообменник" \
+    "mail: Почта" \
+    "cloud: Облако" \
+    "admin: Админ-панель" \
+    "docs: Документация" \
+    "none: Свой сайт (ничего не устанавливать)" \
+    "custom: Свой URL с готовым index.html"
+  case "$choice__" in
+    custom)
+      ask SELF_STEAL_TEMPLATE_URL "URL готового index.html (https://...)" "${SELF_STEAL_TEMPLATE_URL:-}"
+      [[ "$SELF_STEAL_TEMPLATE_URL" == https://* ]] \
+        || die "SELF_STEAL_TEMPLATE_URL должен начинаться с https://"
+      ;;
+    none)
+      SELF_STEAL_TEMPLATE="$SELF_STEAL_TEMPLATE_NONE"
+      SELF_STEAL_TEMPLATE_URL=""
+      SELF_STEAL_TEMPLATE_EXPLICIT=1
+      ;;
+    *)
+      SELF_STEAL_TEMPLATE="$choice__"
+      SELF_STEAL_TEMPLATE_URL=""
+      SELF_STEAL_TEMPLATE_EXPLICIT=1
+      ;;
+  esac
+  unset choice__
+  note "Фасад: ${SELF_STEAL_TEMPLATE}${SELF_STEAL_TEMPLATE_URL:+ ($SELF_STEAL_TEMPLATE_URL)}"
+}
+
+reconfigure_apply_theme() {
+  local tmp
+  if [[ "$SELF_STEAL_TEMPLATE" == "$SELF_STEAL_TEMPLATE_NONE" && -z "${SELF_STEAL_TEMPLATE_URL:-}" ]]; then
+    mkdir -p "$SELF_STEAL_ROOT"
+    if [[ -s "$SELF_STEAL_ROOT/index.html" ]]; then
+      ok "Свой сайт сохранён: $SELF_STEAL_ROOT/index.html"
+    else
+      warn "SELF_STEAL_TEMPLATE=none, но $SELF_STEAL_ROOT/index.html отсутствует — self-steal будет отдавать 404."
+    fi
+    return 0
+  fi
+  resolve_self_steal_template
+  mkdir -p "$SELF_STEAL_ROOT"
+  tmp="$(mktemp)"
+  if retry 3 3 curl -fsSL "$SELF_STEAL_TEMPLATE_URL" -o "$tmp"; then
+    install -m 644 "$tmp" "$SELF_STEAL_ROOT/index.html"
+    chmod -R a=rX "$SELF_STEAL_ROOT"
+    ok "Фасад обновлён: $SELF_STEAL_TEMPLATE_URL"
+  else
+    rm -f "$tmp"
+    die "Не удалось скачать фасад $SELF_STEAL_TEMPLATE_URL"
+  fi
+  rm -f "$tmp"
+}
+
+reconfigure_apply_protocols() {
+  # prompt_flags спрашивает XHTTP/CDN; QUICK_SETUP=1 заставил бы его включить
+  # всё без вопросов, поэтому на время выбора принудительно расширенный режим.
+  local saved_quick="${QUICK_SETUP:-0}"
+  QUICK_SETUP=0
+  prompt_flags
+  QUICK_SETUP="$saved_quick"
+  unset saved_quick
+
+  if (( ENABLE_XHTTP )); then
+    while ! is_fqdn "${XHTTP_SNI:-}"; do
+      ask XHTTP_SNI "Корректный SNI для XHTTP (домен)" "${XHTTP_SNI:-www.gstatic.com}"
+    done
+    while ! is_safe_xhttp_path "${XHTTP_PATH:-}"; do
+      ask XHTTP_PATH "Корректный путь XHTTP (начинается с /)" "${XHTTP_PATH:-/api/v3/sync/r1}"
+    done
+  fi
+  if (( ENABLE_CDN )); then
+    while ! is_fqdn "${CDN_HOST:-}"; do
+      ask CDN_HOST "Корректный CDN-домен" "${CDN_HOST:-cdn.${BASE_DOMAIN:-example.com}}"
+    done
+  fi
+}
+
+reconfigure_ensure_cdn_cert() {
+  local acme="${ACME:-/root/.acme.sh/acme.sh}"
+  (( ENABLE_CDN )) || return 0
+  [[ -n "${CDN_HOST:-}" ]] || die "CDN включён, но CDN_HOST пуст."
+  if [[ -s "$CERT_DIR/$CDN_HOST/fullchain.pem" && -s "$CERT_DIR/$CDN_HOST/key.pem" ]]; then
+    return 0
+  fi
+  [[ -x "$acme" ]] || die "acme.sh не найден: $acme"
+  [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]] \
+    || die "Для CDN-сертификата нужен CLOUDFLARE_API_TOKEN (DNS-01)."
+  issue_cert_dns "$CDN_HOST" || die "Не удалось выпустить CDN-сертификат для $CDN_HOST."
+  mkdir -p "$CERT_DIR/$CDN_HOST"
+  "$acme" --install-cert -d "$CDN_HOST" --ecc \
+    --key-file       "$CERT_DIR/$CDN_HOST/key.pem" \
+    --fullchain-file "$CERT_DIR/$CDN_HOST/fullchain.pem" \
+    --reloadcmd "systemctl restart caddy >/dev/null 2>&1 || true" \
+    || die "Не удалось установить CDN-сертификат для $CDN_HOST."
+  chown root:caddy "$CERT_DIR/$CDN_HOST/key.pem" "$CERT_DIR/$CDN_HOST/fullchain.pem" 2>/dev/null || true
+  chmod 640 "$CERT_DIR/$CDN_HOST/key.pem" 2>/dev/null || true
+  ok "CDN-сертификат установлен для $CDN_HOST"
+}
+
+reconfigure_apply() {
+  (( ENABLE_XHTTP )) && ENABLE_XHTTP=1 || ENABLE_XHTTP=0
+  (( ENABLE_CDN )) && ENABLE_CDN=1 || ENABLE_CDN=0
+
+  if ! REALITY_MIN_CLIENT_VER="$(normalize_client_version "${REALITY_MIN_CLIENT_VER:-0.0.0}")"; then
+    die "REALITY_MIN_CLIENT_VER: нужен вид 0.0.0."
+  fi
+  if ! XHTTP_TARGET="$(normalize_xhttp_target "${XHTTP_TARGET:-}")"; then
+    die "XHTTP_TARGET: нужен host:port, self или local."
+  fi
+  acme_method_supported "$ACME_METHOD" \
+    || die "ACME_METHOD: допустимо auto, dns или http."
+  if [[ "$ACME_METHOD" == "dns" && -z "${CLOUDFLARE_API_TOKEN:-}" ]]; then
+    die "ACME_METHOD=dns требует CLOUDFLARE_API_TOKEN — иначе новые сертификаты не выпустятся."
+  fi
+  if ! is_safe_path "$SELF_STEAL_ROOT" || ! is_safe_remove_path "$SELF_STEAL_ROOT"; then
+    die "Некорректный SELF_STEAL_ROOT: $SELF_STEAL_ROOT"
+  fi
+
+  # Флаги транспортов CDN вычисляются из CDN_TRANSPORT, иначе render_caddyfile
+  # не добавит маршруты после смены транспорта.
+  CDN_WS_ENABLED=0; CDN_XHTTP_ENABLED=0; CDN_GRPC_ENABLED=0
+  if (( ENABLE_CDN )); then
+    cdn_transport_enabled ws && CDN_WS_ENABLED=1
+    cdn_transport_enabled xhttp && CDN_XHTTP_ENABLED=1
+    cdn_transport_enabled grpc && CDN_GRPC_ENABLED=1
+  fi
+
+  resolve_self_steal_template
+
+  if [[ "${RECONFIGURE_THEME_DIRTY:-0}" == 1 ]]; then
+    reconfigure_apply_theme
+  fi
+  reconfigure_ensure_cdn_cert
+
+  write_env_store
+  ok "Настройки сохранены в $ENV_STORE"
+
+  write_config_profile
+  write_xray_template
+
+  have caddy || die "caddy не установлен — изменить Caddyfile нельзя."
+  render_caddyfile
+  caddy fmt --overwrite "$CADDYFILE_PATH" || warn "caddy fmt завершился с ошибкой — продолжаю."
+  caddy validate --config "$CADDYFILE_PATH" || die "Caddyfile невалиден после изменений."
+  systemctl restart caddy || die "Не удалось перезапустить Caddy."
+  sleep 1
+  systemctl is-active --quiet caddy || die "Caddy не поднялся после изменений."
+  ok "Caddy перезапущен"
+
+  if (( REMNAWAVE_AUTO_SETUP )) && [[ -n "${REMNAWAVE_API_TOKEN:-}" ]]; then
+    note "Обновляю Config Profile, ноду и хосты в панели..."
+    panel_auto_setup || warn "Авто-обновление панели завершилось с ошибкой — проверьте панель вручную."
+  else
+    warn "Авто-панель выключена: загрузите $NODE_DIR/Multiselect.json в Config Profiles и обновите хосты вручную."
+    warn "Выключенные XHTTP/CDN-хосты сами не удаляются — удалите их в панели, если они больше не нужны."
+  fi
+  ok "Изменения применены."
+}
+
+run_reconfigure() {
+  [[ -f "$ENV_STORE" ]] || die "Нет $ENV_STORE: сначала выполните установку."
+  has_tty || die "--reconfigure требует интерактивный терминал."
+  # shellcheck disable=SC1090
+  source "$ENV_STORE"
+  ENV_STORE_LOADED=1
+
+  ENABLE_XHTTP="$(parse_bool "${ENABLE_XHTTP:-y}" 0)"
+  ENABLE_CDN="$(parse_bool "${ENABLE_CDN:-n}" 0)"
+  REMNAWAVE_AUTO_SETUP="$(parse_bool "${REMNAWAVE_AUTO_SETUP:-n}" 0)"
+  REALITY_MIN_CLIENT_VER="${REALITY_MIN_CLIENT_VER:-0.0.0}"
+  XHTTP_TARGET="${XHTTP_TARGET:-www.gstatic.com:443}"
+  ACME_METHOD="${ACME_METHOD:-auto}"
+  SELF_STEAL_ROOT="${SELF_STEAL_ROOT:-/var/www/remnanode-self-steal}"
+  XRAY_LOG_DIR="${XRAY_LOG_DIR:-/var/log/remnanode/xray}"
+  : "${CDN_TRANSPORT:=ws}" "${CDN_HOST:=}" "${CDN_WS_PATH:=/api/v1/stream}"
+  : "${CDN_XHTTP_PATH:=/api/v3/sync/c1}" "${CDN_GRPC_PATH:=/api/v4/stream}"
+  RECONFIGURE_THEME_DIRTY=0
+
+  banner
+  printf '\n %s%s%s\n' "${C_B:-}${C_CYN:-}" "Изменение настроек без переустановки" "${C_RST:-}"
+  note "Меняются только выбранные параметры. Домены, NODE_TAG, NODE_IMAGE и CUSTOM_CORE_URL здесь не меняются:"
+  note "для смены домена/тега/image запустите установщик заново (или задайте env и перезапустите)."
+
+  local choice__
+  while :; do
+    reconfigure_print_summary
+    printf '\n %sЧто изменить?%s\n' "${C_B:-}" "${C_RST:-}" > /dev/tty
+    printf '   1) Тема self-steal\n' > /dev/tty
+    printf '   2) XHTTP / CDN (SNI, путь, target, CDN-домен, транспорт)\n' > /dev/tty
+    printf '   3) minClientVer REALITY\n' > /dev/tty
+    printf '   4) ACME method (для новых сертификатов)\n' > /dev/tty
+    printf '   0) Сохранить и применить\n' > /dev/tty
+    printf '   q) Выйти без изменений\n' > /dev/tty
+    ask choice__ "Выберите пункт" "0"
+    case "${choice__,,}" in
+      1)
+        reconfigure_choose_theme
+        RECONFIGURE_THEME_DIRTY=1
+        ;;
+      2)
+        reconfigure_apply_protocols
+        ;;
+      3)
+        ask REALITY_MIN_CLIENT_VER "Минимальная версия клиента REALITY (0.0.0 — совместимо с Mihomo)" "${REALITY_MIN_CLIENT_VER:-0.0.0}"
+        while ! is_client_version "$REALITY_MIN_CLIENT_VER"; do
+          warn "Нужен вид x.y.z (например 0.0.0 или 26.3.27)."
+          ask REALITY_MIN_CLIENT_VER "Минимальная версия клиента REALITY" "0.0.0"
+        done
+        if [[ "$REALITY_MIN_CLIENT_VER" != "0.0.0" ]]; then
+          warn "Значения выше 1.8.2 могут отсечь Mihomo (он представляется 1.8.2)."
+        fi
+        ;;
+      4)
+        __acme_default=1
+        if [[ "$ACME_METHOD" == "dns" ]]; then __acme_default=2; fi
+        if [[ "$ACME_METHOD" == "http" ]]; then __acme_default=3; fi
+        ask_choice ACME_METHOD "ACME method" "$__acme_default" \
+          "auto: DNS-01 при наличии Cloudflare-токена, иначе HTTP-01" \
+          "dns: только DNS-01 (без остановки Caddy)" \
+          "http: только HTTP-01 (краткий простой 443/tcp)"
+        unset __acme_default
+        warn "Уже выпущенные сертификаты продолжат продлеваться прежним способом; новое значение — для новых выпусков/перевыпуска."
+        ;;
+      0)
+        reconfigure_apply
+        exit 0
+        ;;
+      q|quit|exit)
+        note "Выход без изменений."
+        exit 0
+        ;;
+      *)
+        warn "Введите 0, 1, 2, 3, 4 или q."
+        ;;
+    esac
+  done
+}
+
+# --- main ---
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-compose)  BUILD_COMPOSE=0 ;;
+    --no-firewall) MANAGE_FIREWALL=0 ;;
+    --reset-firewall) RESET_FIREWALL=1 ;;
+    --no-reset-firewall) RESET_FIREWALL=0 ;; # совместимость со старыми командами
+    --force-dns)   FORCE_DNS=1 ;;
+    --keep-build-tools) KEEP_BUILD_TOOLS=1 ;;
+    -y|--yes)      ASSUME_YES=1 ;;
+    --non-interactive) NONINTERACTIVE=1; ASSUME_YES=1 ;;
+    --ssh-port)
+      SSH_PORT_OVERRIDE="${2:-}"
+      if ! [[ "$SSH_PORT_OVERRIDE" =~ ^[0-9]+$ ]] \
+          || ! (( SSH_PORT_OVERRIDE >= 1 && SSH_PORT_OVERRIDE <= 65535 )); then
+        echo "--ssh-port требует число 1–65535" >&2
+        exit 2
+      fi
+      shift ;;
+    --node-image)
+      NODE_IMAGE="${2:-}"
+      [[ -n "$NODE_IMAGE" ]] || { echo "--node-image требует значение" >&2; exit 2; }
+      shift ;;
+    --custom-core-url)
+      CUSTOM_CORE_URL="${2:-}"
+      [[ -n "$CUSTOM_CORE_URL" ]] || { echo "--custom-core-url требует uwuray или https:// URL" >&2; exit 2; }
+      shift ;;
+    --node-tag)
+      NODE_TAG="${2:-}"
+      [[ -n "$NODE_TAG" ]] || { echo "--node-tag требует значение (например NL1)" >&2; exit 2; }
+      shift ;;
+    --self-steal-template)
+      SELF_STEAL_TEMPLATE_EXPLICIT=1
+      SELF_STEAL_TEMPLATE="${2:-}"
+      [[ -n "$SELF_STEAL_TEMPLATE" ]] || { echo "--self-steal-template требует значение (тема фасада)" >&2; exit 2; }
+      shift ;;
+    --min-client-ver)
+      REALITY_MIN_CLIENT_VER="${2:-}"
+      [[ -n "$REALITY_MIN_CLIENT_VER" ]] || { echo "--min-client-ver требует значение вида 0.0.0" >&2; exit 2; }
+      shift ;;
+    --xhttp-target)
+      XHTTP_TARGET="${2:-}"
+      [[ -n "$XHTTP_TARGET" ]] || { echo "--xhttp-target требует host:port или self" >&2; exit 2; }
+      shift ;;
+    --acme-method)
+      ACME_METHOD="${2:-}"
+      acme_method_supported "$ACME_METHOD" \
+        || { echo "--acme-method принимает auto, dns или http" >&2; exit 2; }
+      shift ;;
+    --xray-template)
+      XRAY_TEMPLATE_CHOICE="${2:-}"
+      [[ -n "$XRAY_TEMPLATE_CHOICE" ]] || { echo "--xray-template требует значение (standard или split)" >&2; exit 2; }
+      shift ;;
+    --panel-url)
+      REMNAWAVE_PANEL_URL="${2:-}"
+      [[ -n "$REMNAWAVE_PANEL_URL" ]] || { echo "--panel-url требует значение" >&2; exit 2; }
+      shift ;;
+    --api-token)
+      echo "Флаг --api-token удалён: токен виден в ps и истории. Задайте REMNAWAVE_API_TOKEN в окружении." >&2
+      exit 2 ;;
+    --cloudflare)    CF_MODE_SETTING=1 ;;
+    --no-cloudflare) CF_MODE_SETTING=0 ;;
+    --quick)         QUICK_SETUP_SETTING=1 ;;
+    --advanced)      QUICK_SETUP_SETTING=0 ;;
+    --uninstall)     UNINSTALL=1 ;;
+    --reconfigure)   RECONFIGURE=1 ;;
+    --dry-run)       DRY_RUN=1 ;;
+    --version)
+      if [[ -r "$SCRIPT_DIR/VERSION" ]]; then
+        printf 'multi-protocol %s\n' "$(tr -d '[:space:]' < "$SCRIPT_DIR/VERSION")"
+      elif command -v git >/dev/null 2>&1 \
+          && git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+        printf 'multi-protocol %s\n' "$(git -C "$SCRIPT_DIR" describe --tags --always --dirty 2>/dev/null || echo unknown)"
+      else
+        printf 'multi-protocol %s\n' "$SCRIPT_VERSION"
+      fi
+      exit 0 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Неизвестный аргумент: $1" >&2; usage; exit 2 ;;
+  esac
+  shift
+done
+
+if [[ "$CF_MODE_SETTING" == 1 ]]; then
+  CF_MODE=1
+elif [[ "$CF_MODE_SETTING" == 0 ]]; then
+  CF_MODE=0
+elif [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]]; then
+  CF_MODE=1
+fi
+
+
+
+
+
+
+
+
+
+# Удаляет правила ufw с нашим комментарием (80/443 и т.п.), не трогая SSH.
+
+# Защита от `--uninstall` с NODE_DIR=/ или /etc: удаляем только конкретные
+# managed-каталоги/файлы, не корень и не системные каталоги.
+
+# run_cmd — единственная точка выполнения деструктивных команд в --uninstall.
+
+# Безопасное удаление только того, что создал установщик. Пакеты (Docker, Caddy,
+# acme.sh, ufw) и чужие данные не удаляются — только managed-артефакты.
+
+
+
+# Чистка за собой. На малых VPS диск ценен, а после сборки Caddy остаются
+# инструменты, которые ноде не нужны: Go-тулчейн (сотни МБ), кэш сборки и
+# модулей Go, xcaddy, копия собранного бинарника и build-essential с зависимостями.
+# Если Caddy понадобится пересобрать, установщик скачает всё заново.
+# Функция идемпотентна и безопасна при сбое: отсутствующие пути пропускаются.
+
+# build-essential ставится только для сборки. Удаляем его, лишь если он появился
+# при установке: пакет, который был в системе до нас, не трогаем.
+
+# Финальная уборка: архивы .deb и индексы apt, неиспользуемые (dangling) образы
+# Docker от прежних версий образа ноды. Работающие образы и установленные пакеты
+# не затрагиваются. Индексы apt восстанавливаются через apt-get update.
+
+# has_tty: есть ли управляющий терминал для интерактивных вопросов
+
+
+
+
+
+
+
+# Путь, который можно подставлять в Caddyfile: абсолютный, без переводов строк,
+# кавычек, фигурных скобок и обратных слэшей. Пробелы допустимы — путь в
+# Caddyfile заключается в кавычки.
+
+# ——— Cloudflare: автоматические A-записи с осмысленными случайными именами ———
+# Поддомены собираются из двух словарей как «прилагательное-существительное»:
+# в отличие от usa1/usa3 нумерация не выдаёт связь между записями, а четыре
+# разных слова делают два хоста визуально непохожими друг на друга.
+
+# Индекс [0, n) из криптографически случайных байтов (не $RANDOM).
+
+# N случайных hex-символов из /dev/urandom — суффиксы случайных путей
+# транспортов в быстром режиме (путь не должен быть одинаковым у всех нод).
+
+# Случайный API-подобный путь вида <префикс>/<8 hex> для транспортов.
+
+# Уникальный CDN-поддомен для каждой ноды: cdn-<6 hex>.<базовый домен>.
+# Поддомен первого уровня (*.example.com) покрывается бесплатным Universal SSL
+# Cloudflare (в отличие от <rand>.cdn.example.com, требующего платный ACM) и не
+# конфликтует при размещении нескольких нод на одном базовом домене.
+
+# Случайный порт Node API для быстрого режима: диапазон 11000–59999 не
+# пересекается с портами схемы (80/443/9443/9444/10443–10448), а SSH-порт
+# дополнительно исключается, если его удалось определить.
+
+# Приводит короткую ссылку на образ (например, «latest» или «3.1.1», в т. ч.
+# из старых env-файлов) к полному репозиторию remnawave/node:<тег>. Без слэша
+# Docker ищет library/<имя> в Docker Hub и падает с
+# «pull access denied for latest, repository does not exist».
+
+# Домен, как его вводят люди (https://Example.COM/, www.example.com.),
+# приводим к чистому виду example.com: без схемы, www, путей, порта и
+# хвостовой точки. Валидацию не делаем — её выполнит is_fqdn у вызывающего.
+
+# URL панели приводим к виду https://panel.example.com: схему добавляем,
+# если её нет (панель почти всегда за HTTPS), хвостовой слэш срезаем.
+# Возврат 1 — из ввода нельзя получить осмысленный URL.
+
+# Хост из URL панели (без схемы, порта и пути) — чтобы определить IP панели.
+
+# Первый IPv4 хоста по DNS (сам IPv4 возвращается как есть): дефолт для
+# PANEL_IP, чтобы пользователь не вводил адрес панели второй раз.
+
+# Два непохожих хоста «прилагательное-существительное.BASE_DOMAIN»:
+# прилагательные и существительные не повторяются, поэтому хосты различаются
+# в обеих частях. В stdout — ровно две строки.
+
+# Сохранённый в прошлый раз хост переиспользуем, только если он валиден и лежит
+# в текущем BASE_DOMAIN: при смене базового домена старые имена бессмысленны.
+
+# cf_api METHOD PATH [JSON-ТЕЛО] → JSON в stdout. Токен уходит не в argv, а
+# через файл конфигурации curl (-K), поэтому его не видно в ps и в логе.
+
+
+# Токен не должен попадать ни в argv curl (видно в ps), ни в лог: он живёт
+# во временном файле 0600, который curl читает через -K.
+
+# Проверяет, что Cloudflare API принимает токен и видит зону BASE_DOMAIN.
+# Возвращает 0 при успехе, 1 при ошибке API/токена и 2 если зона не найдена.
+
+# cf_upsert_a ZONE_ID HOST [proxied] — создать A-запись или обновить
+# существующую на текущий SERVER_IP. По умолчанию запись DNS-only
+# (proxied=false): оранжевое облако ломает и REALITY, и прямой Hysteria2
+# (см. README, Cloudflare и DNS-only записи). Исключение — CDN-хост: там
+# проксирование и есть весь смысл, поэтому для него передаётся «proxied».
+
+# cf_a_exists ZONE_ID HOST → 0, если A-запись уже есть (иначе 1; die при ошибке API).
+
+# Точка входа CF-режима: токен → зона → либо переиспользуем сохранённые хосты
+# (идемпотентный повторный запуск), либо генерируем свободные случайные —
+# и только потом создаём/обновляем обе A-записи и ждём их в DNS.
+
+# cf_zone_id_for_host HOST → id зоны в stdout (пустая строка и возврат 1,
+# если токен не видит ни одной подходящей зоны или API недоступен). Зону
+# ищем суффиксами хоста от длинного к короткому: для cdn.sub.example.com
+# спрашиваем sub.example.com, затем example.com. Явный CLOUDFLARE_ZONE,
+# накрывающий хост, спрашиваем первым.
+
+# Точка входа для CDN-хоста: проксируемая A-запись (оранжевое облако)
+# через Cloudflare API. Намеренно НЕ зависит от CF_MODE: режим авто-ДНС
+# блока 1 отвечает только за случайные хосты VLESS/Hysteria2, а CDN
+# включается позже (блок 3) и токен там спрашивают отдельно. Раньше
+# создание записи гейтилось на CF_MODE, поэтому при ответе «n» в блоке 1
+# CDN-домен молча не создавался вообще, хотя токен для DNS-01 был введён.
+# Исходы без создания (--no-cloudflare, нет токена, токен не видит зону)
+# не останавливают установку, но обязаны быть громкими: CDN_DNS_MANAGED
+# остаётся "manual" и показывается в сводке как действие для пользователя.
+
+# ——— self-steal: темы фасада ———
+# Имя темы → URL шаблона в репозитории. Пустая тема означает, что пользователь
+# задал SELF_STEAL_TEMPLATE_URL явно: свой фасад всегда важнее темы.
+# Возвращает 1 на неизвестной теме — вызывающая сторона сама решает, как
+# сообщить об этом (важно показать список доступных тем).
+
+# Доступные темы — для подсказки об опечатке и для тестов (чтобы они не
+# зависели от внутреннего массива с темами).
+
+# CDN_TRANSPORT → включённые транспорты CDN. "both" (ws + xhttp) оставлен для
+# совместимости со старыми env-файлами, "all" — все три транспорта. Функцию
+# используют и промпты, и фильтр профиля, поэтому она вынесена отдельно.
+# Вызывается как cdn_transport_enabled ws|xhttp|grpc; комментарий не пишется
+# в строку с `{`: юнит-тест извлекает функцию по шаблону "скобка в конце строки".
+
+# ——— Config Profile (Multiselect.json) ———
+# Панель отдаёт ноде серверный конфиг Xray из Config Profile, поэтому установщик
+# сохраняет готовый файл: с подставленными хостами и без inbound'а XHTTP, когда
+# XHTTP в selfsteal выключен. Иначе профиль разошёлся бы с Caddyfile и нода
+# слушала бы порт 10444, к которому ничего не маршрутизируется.
+#
+# multiselect_filter — чистый фильтр: JSON шаблона на stdin, адаптированный JSON
+# в stdout. Значения берутся из переменных установщика, поэтому функцию целиком
+# покрывает tests/installer-funcs-checks.sh (на шаблоне из репозитория).
+
+
+
+# ——— Авто-настройка панели через API (если выбран REMNAWAVE_AUTO_SETUP) ———
+# Короткий детерминированный идентификатор текущей ноды (из VLESS_HOST или PREFIX).
+
+# Уникальный тег балансировки скрытых хостов этой ноды (формат Remnawave 3.x:
+# ^[A-Z0-9_:]{1,36}$). У каждой ноды свой тег и свой XRAY_JSON шаблон, чтобы
+# подписка не смешивала хосты разных нод под общим тегом «USA».
+
+# Имя Config Profile: API разрешает только буквы, цифры, пробелы, «_» и «-»
+# (точки из домена запрещены), длина 2–30 символов. Без штампа даты: повторный
+# запуск в другой день обязан находить и обновлять профиль этой же ноды, а не
+# плодить дубликаты и натыкаться на уникальность тегов inbound'ов в БД панели.
+
+# Имя ноды в панели (3–30 символов, уникально в таблице nodes).
+
+# Возвращает каноническое базовое имя тега inbound'а независимо от суффикса ноды
+# (например, REALITY_VISION_QUIET_OTTER → REALITY_VISION).
+
+# Подготавливает JSON Config Profile для отправки в Panel API:
+#  1) переиспользует существующие REALITY privateKey/shortIds и теги этой же ноды;
+#  2) гарантирует непустой X25519 privateKey + shortIds у всех REALITY inbound'ов
+#     (панель Remnawave не генерирует ключи на сервере — с пустым privateKey Xray
+#     не поднимает слушатели и подписка не выдаёт pbk);
+#  3) обходит глобальный @@unique([tag]) в таблице config_profile_inbounds: если
+#     базовый тег уже занят другим профилем в панели (вторая нода или старый
+#     профиль), добавляет к тегам детерминированный суффикс текущей ноды.
+
+# Результат функции, которая печатает диагностику (ok/warn) и лишь последней
+# строкой — значение. Подоболочка $(...) смешивает их, поэтому значение берём
+# ТОЛЬКО при успешном коде возврата: иначе текст предупреждения
+# («▲ Не удалось создать…») стал бы uuid профиля и ушёл в URL запросов.
+
+# panel_fetch_node_secret — получить SECRET_KEY ноды через Remnawave Panel API (GET /keygen).
+# В Remnawave 3.x поле называется secretKey, в старых 2.x — pubKey.
+# Возвращает чистый base64 ключ или пустую строку при ошибке.
+
+# Обёртка для panel_upsert_host: в успешном случае молчим (функция печатает
+# uuid в stdout — в консоли он не нужен), при ошибке показываем диагностику
+# целиком и возвращаем ненулевой код, чтобы вызывающий её посчитал.
+
+
+# UUID нод, уже привязанных к профилю. Нужен, чтобы не перезаписывать профиль,
+# который принадлежит другой ноде (например, при случайно одинаковом PREFIX).
+
+
+# Ищет ноду только по address. Раньше сюда подмешивался поиск по имени: при
+# одинаковом PREFIX у двух нод вторая находила первую и PATCH-ем меняла ей
+# address/port/profile. Имя проверяется отдельно в panel_upsert_node.
+
+
+# Возвращает uuid|profileUuid|inboundUuid — этого достаточно, чтобы отличить
+# «тот же хост, обновляем адрес» от «такой же remark у другой ноды».
+
+
+
+# Инициирует немедленный запуск/синхронизацию Xray на ноде после старта контейнера
+# remnanode (POST /nodes/{uuid}/actions/restart с {"forceRestart":false}), чтобы
+# панель сразу отправила конфиг Xray и подняла слушатели к шагу 10.
+
+
+
+# Шаблоны в репозитории комментированы (JSON5), а Panel API принимает только
+# строгий JSON. Убираем //-комментарии вне строк и висячие запятые перед }/].
+# Важно: используем print с пустым ORS вместо printf "%s%s" — в mawk на
+# Debian/Ubuntu буфер sprintf ограничен 8192 байтами и обнуляет Xray_template_split.json.
+
+
+
+
+
+
+# ask_secret — как ask, но значение не печатается никогда: секреты не попадают
+# ни на экран, ни в установочный лог (например SECRET_KEY ноды).
+
+# parse_bool [значение] [дефолт] → 0|1 в stdout. Логические переменные приходят
+# из трёх источников: интерактивного ответа, переменных окружения и сохранённого
+# /root/remnanode.env (установщик прежних версий писал туда «1»), поэтому все
+# распространённые написания должны пониматься одинаково, а мусор — не выключать
+# функцию молча: вызывающий сам решает, что делать (см. ask_bool).
+
+# bool_yn 0|1 → y|n: так флаги записываются в /root/remnanode.env, чтобы файл
+# читался человеком и одинаково понимался любым парсером (y* → включено).
+
+# ask_bool VAR PROMPT DEFAULT(y/n) — вопрос с нормализацией ответа к 0/1.
+# Непонятный ответ переспрашивается (или останавливает установку в
+# --non-interactive), а не трактуется как «нет»: иначе опечатка тихо выключала бы
+# CDN или XHTTP.
+
+# Флаги авто-режимов приходят и из env (например, ASSUME_YES=y в CI): приводим их
+# к 0/1 тем же разбором, что и остальные логические переменные. Флаг командной
+# строки главнее: -y/--yes уже выставил 1 выше, и нормализация это не отменит.
+ASSUME_YES="$(parse_bool "${ASSUME_YES:-0}" 0)"
+NONINTERACTIVE="$(parse_bool "${NONINTERACTIVE:-0}" 0)"
+KEEP_BUILD_TOOLS="$(parse_bool "${KEEP_BUILD_TOOLS:-0}" 0)"
+DRY_RUN="$(parse_bool "${DRY_RUN:-0}" 0)"
+if (( DRY_RUN )) && (( ! UNINSTALL )); then
+  die "--dry-run сейчас поддерживается только вместе с --uninstall."
+fi
+
+# confirm "вопрос" "дефолт(y/n)" -> 0 если да, 1 если нет; уважает --yes/--non-interactive
+
+# ask_choice VAR PROMPT DEFAULT_NUM "вариант1: описание" "вариант2: описание" ...
+# Понятный выбор из списка для обычного пользователя — нумерованное меню.
+
+# ——— Remnawave Panel API: автоматическая настройка ———
+
+# panel_api вызывают из $(...), а переменные, выставленные в подоболочке, до
+# вызывающего не доходят. Поэтому HTTP-код и ошибку curl храним в файлах:
+# иначе panel_api_success всегда видел пустой код и ЛЮБОЙ ответ панели считал
+# ошибкой — даже 200 с валидным токеном («не удалось подключиться»).
+
+# Пути берутся из приватного каталога PANEL_STATE_DIR: его создаёт
+# родительская оболочка, а подоболочки $(...) наследуют путь. Поэтому HTTP-код,
+# записанный внутри panel_api, читается вызывающим.
+
+
+
+
+# Тело ответа — в stdout, HTTP-код — в PANEL_HTTP_CODE_FILE,
+# ошибка транспорта curl — в PANEL_HTTP_ERROR_FILE.
+
+
+
+# Причина неудачной проверки — для понятной подсказки в мастере.
+
+
+# Человеческое объяснение к PANEL_CONN_REASON: 401 — токен, 403 — права,
+# 404 — адрес, 000 — сеть, 2xx без JSON — Cloudflare/страница входа.
+
+# Повтор с бэкофом для сетевых сбоев панели (000/5xx/429)
+
 
 require_root
 
@@ -2539,47 +4123,20 @@ mkdir -p "$LOG_DIR"
 ( umask 077; : > "$LOG_FILE" )
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-on_err() {
-  local ec=$? line=$1 cmd=$2
-  printf '\n %s✖ НЕПРЕДВИДЕННЫЙ СБОЙ%s код=%s строка=%s\n   %s%s%s\n' \
-    "$C_RED$C_B" "${C_RST:-}" "$ec" "$line" "${C_DIM:-}${C_GRY:-}" "$cmd" "${C_RST:-}" >&2
-  printf '   Полный лог: %s\n' "$LOG_FILE" >&2
-  exit "$ec"
-}
 
-on_exit() {
-  local ec=$?
-  trap - EXIT
-  if [[ -n "${GO_INSTALL_TMP:-}" && -d "$GO_INSTALL_TMP" ]]; then
-    rm -rf -- "$GO_INSTALL_TMP"
-  fi
-  if [[ -n "${GO_ARCHIVE_TMP:-}" && -f "$GO_ARCHIVE_TMP" ]]; then
-    rm -f -- "$GO_ARCHIVE_TMP"
-  fi
-  if [[ -n "${CF_CURL_CFG:-}" && -f "$CF_CURL_CFG" ]]; then
-    rm -f -- "$CF_CURL_CFG"
-  fi
-  if [[ -n "${PANEL_CURL_CFG:-}" && -f "$PANEL_CURL_CFG" ]]; then
-    rm -f -- "$PANEL_CURL_CFG"
-  fi
-  if [[ -n "${PANEL_STATE_DIR:-}" && -d "$PANEL_STATE_DIR" ]]; then
-    rm -rf -- "$PANEL_STATE_DIR"
-  fi
-  # При сбое сборка не доходит до штатной очистки: убираем тулчейн и кэши здесь,
-  # чтобы неудачная попытка не оставляла сотни МБ на диске. Пакеты apt не трогаем.
-  remove_build_leftovers >/dev/null 2>&1 || true
-  if [[ "${CADDY_RESTORE_NEEDED:-0}" -eq 1 ]]; then
-    if systemctl start caddy >/dev/null 2>&1; then
-      CADDY_RESTORE_NEEDED=0
-      warn "Caddy восстановлен после прерванной операции."
-    else
-      printf ' Не удалось восстановить Caddy после ACME; проверьте systemctl status caddy.\n' >&2
-    fi
-  fi
-  exit "$ec"
-}
 trap 'on_err "$LINENO" "$BASH_COMMAND"' ERR
 trap on_exit EXIT
+
+RECONFIGURE="$(parse_bool "${RECONFIGURE:-0}" 0)"
+if (( RECONFIGURE )); then
+  run_reconfigure
+  exit 0
+fi
+
+if (( UNINSTALL )); then
+  uninstall_node
+  exit 0
+fi
 
 echo
 banner
@@ -2640,9 +4197,10 @@ fi
 
 log "Устанавливаю базовые утилиты (curl, ca-certificates, dnsutils, jq, psmisc)"
 retry 3 5 apt_get update -y || warn "apt-get update завершился с ошибкой — продолжаю с текущими списками."
-# psmisc нужен для fuser в apt_wait: без него ожидание apt/dpkg lock не работает.
-retry 3 5 apt_get install -y curl ca-certificates dnsutils jq psmisc \
-  || warn "Не удалось установить базовые утилиты — некоторые проверки будут ограничены."
+# psmisc нужен для fuser в apt_wait; openssl — для X25519-ключей REALITY (шаг 1
+# пишет Config Profile до основного блока пакетов шага 3); iproute2 — для ss.
+retry 3 5 apt_get install -y curl ca-certificates dnsutils jq psmisc openssl iproute2 logrotate \
+  || die "Не удалось установить базовые утилиты (curl, jq, openssl, iproute2, logrotate)."
 
 step 1 "Мастер установки — отвечаем на вопросы"
 
@@ -2666,12 +4224,41 @@ REMNAWAVE_AUTO_SETUP="$(parse_bool "${REMNAWAVE_AUTO_SETUP:-n}" 0)"
 ENABLE_XHTTP="$(parse_bool "${ENABLE_XHTTP:-y}" 0)"
 ENABLE_CDN="$(parse_bool "${ENABLE_CDN:-n}" 0)"
 
+# Новые настройки нормализуются после загрузки ENV_STORE: сохранённое значение
+# должно побеждать дефолт, а явный флаг — сохранённое.
+if ! REALITY_MIN_CLIENT_VER="$(normalize_client_version "${REALITY_MIN_CLIENT_VER:-0.0.0}")"; then
+  die "REALITY_MIN_CLIENT_VER/--min-client-ver: нужен вид 0.0.0 (три числа), получено «${REALITY_MIN_CLIENT_VER:-}»."
+fi
+if ! XHTTP_TARGET="$(normalize_xhttp_target "${XHTTP_TARGET:-}")"; then
+  die "XHTTP_TARGET/--xhttp-target: нужен host:port или self, получено «${XHTTP_TARGET:-}»."
+fi
+if ! CUSTOM_CORE_URL="$(normalize_custom_core_url "${CUSTOM_CORE_URL:-}")"; then
+  die "CUSTOM_CORE_URL/--custom-core-url: нужен uwuray или https:// URL бинарника, получено «${CUSTOM_CORE_URL:-}»."
+fi
+if [[ -n "$CUSTOM_CORE_URL" ]]; then
+  warn "Включён кастомный Xray-core: $CUSTOM_CORE_URL"
+  warn "Это сторонний бинарник, который Remnawave Node скачает при старте. Для продакшена закрепите конкретный release URL."
+fi
+if is_xhttp_target_local; then
+  warn "XHTTP_TARGET=$XHTTP_TARGET (локальный self-steal) — экспериментальный режим:"
+  warn "Caddy добавит loopback-сайт для XHTTP_SNI; проверьте XHTTP на стенде (Xray-core #5923)."
+fi
+if ! is_safe_path "${SELF_STEAL_ROOT:-}" || ! is_safe_remove_path "${SELF_STEAL_ROOT:-}"; then
+  die "SELF_STEAL_ROOT должен быть отдельным абсолютным каталогом (например /var/www/remnanode-self-steal): «${SELF_STEAL_ROOT:-}»."
+fi
+if ! is_safe_path "${XRAY_LOG_DIR:-}" || ! is_safe_remove_path "${XRAY_LOG_DIR:-}"; then
+  die "XRAY_LOG_DIR должен быть отдельным абсолютным каталогом (например /var/log/remnanode/xray): «${XRAY_LOG_DIR:-}»."
+fi
+if ! acme_method_supported "$ACME_METHOD"; then
+  die "ACME_METHOD/--acme-method: допустимо auto, dns или http, получено «$ACME_METHOD»."
+fi
+
 # Короткое объяснение для новичка: что сейчас будет.
 if has_tty; then
 {
   printf '\n'
   printf ' %s%s Добро пожаловать в мастер установки! %s\n' "${C_B:-}${C_CYN:-}" "${C_RST:-}" ""
-  printf ' %sБыстрый режим задаст всего 5 вопросов; расширенный — все настройки по блокам.%s\n' "${C_DIM:-}${C_GRY:-}" "${C_RST:-}"
+  printf ' %sБыстрый режим задаст всего 8 вопросов; расширенный — все настройки по блокам.%s\n' "${C_DIM:-}${C_GRY:-}" "${C_RST:-}"
   printf ' %sЕсли не знаете что ответить — жмите Enter для значения по умолчанию.%s\n' "${C_DIM:-}${C_GRY:-}" "${C_RST:-}"
   printf '\n'
 } > /dev/tty 2>/dev/null || true
@@ -2679,35 +4266,7 @@ fi
 
 # Цвета могут быть не определены в тестах — задаём пустые значения чтобы set -u не падал
 : "${C_B:=}" "${C_CYN:=}" "${C_GRN:=}" "${C_RST:=}" "${C_DIM:=}" "${C_GRY:=}" "${C_MAG:=}" "${C_BLU:=}" "${C_YLW:=}" "${C_RED:=}" "${C_WHT:=}"
-# SERVER_IP нужен для A-записей Cloudflare и для сверки DNS. Значение из env (в
-# том числе из сохранённого env-файла) приоритетнее автодетекта: за NAT внешние
-# сервисы могут быть недоступны, а README и текст ошибки обещают возможность
-# задать адрес вручную. Приватный адрес для A-записей не годится — его заменяет
-# автодетект с предупреждением.
-if is_ipv4 "${SERVER_IP:-}"; then
-  if is_private_ipv4 "$SERVER_IP"; then
-    warn "SERVER_IP=$SERVER_IP выглядит приватным — для A-записей нужен публичный IPv4, определяю автоматически."
-    SERVER_IP=""
-  else
-    ok "Публичный IPv4 (SERVER_IP из env): $SERVER_IP"
-  fi
-fi
-if [[ -z "${SERVER_IP:-}" ]]; then
-  SERVER_IP=""
-  if have curl; then
-    SERVER_IP="$(curl -4 -sS --max-time 10 https://ifconfig.me 2>/dev/null || true)"
-    [[ -n "$SERVER_IP" ]] || SERVER_IP="$(curl -4 -sS --max-time 10 https://api.ipify.org 2>/dev/null || true)"
-  fi
-  if is_ipv4 "$SERVER_IP"; then
-    ok "Публичный IPv4: $SERVER_IP"
-    if is_private_ipv4 "$SERVER_IP"; then
-      warn "Определённый адрес $SERVER_IP выглядит приватным — вероятно, сервер за NAT. Сравнение A-записей с ним будет непоказательным; сверяйте DNS вручную или продолжайте с --force-dns."
-    fi
-  else
-    SERVER_IP=""
-    warn "Не удалось определить IP (проверка DNS будет мягкой). Задайте SERVER_IP через env."
-  fi
-fi
+resolve_server_ip
 
 # Выбор режима мастера. Приоритет: --quick/--advanced → env QUICK_SETUP →
 # сохранённый env-файл → вопрос. В --non-interactive вопрос не задаётся:
@@ -2721,14 +4280,14 @@ elif [[ "$NONINTERACTIVE" == 1 ]] || (( QUICK_SETUP_ENV_PRESENT )) \
 else
   SETUP_MODE="quick"
   ask_choice SETUP_MODE "Режим установки" "1" \
-    "quick: Быстрая автоустановка — всего 5 вопросов (домен, токены, панель), остальное автоматически (рекомендуется)" \
+    "quick: Быстрая автоустановка — всего 8 вопросов (домен, токены, панель, CDN), остальное автоматически (рекомендуется)" \
     "advanced: Расширенная настройка — все вопросы по блокам, полный ручной контроль"
   if [[ "$SETUP_MODE" == "quick" ]]; then QUICK_SETUP=1; else QUICK_SETUP=0; fi
 fi
 if (( QUICK_SETUP )); then
   [[ "$CF_MODE_SETTING" != "0" ]] \
     || die "Быстрый режим требует Cloudflare (поддомены и CDN создаются через API): уберите --no-cloudflare или запустите с --advanced."
-  ok "Режим: быстрая автоустановка — спрошу только домен, токен Cloudflare, домен/IP/токен панели"
+  ok "Режим: быстрая автоустановка — спрошу домен, токен Cloudflare, домен/IP/токен панели, шаблон и транспорт CDN"
   note "Поддомены, CDN-домен, пути транспортов, тема фасада и порт ноды выберутся автоматически"
   note "(случайно, где это уместно) и сохранятся — повторный запуск их не изменит."
 else
@@ -2826,6 +4385,9 @@ else
   ask SELF_STEAL_HOST "Домен self-steal для Vision/Reality (обычно = VLESS домен)" "${SELF_STEAL_HOST:-$VLESS_HOST}"
 fi
 VISION_SNI="$SELF_STEAL_HOST"
+if (( ENABLE_XHTTP )) && is_xhttp_target_local && [[ "${XHTTP_SNI:-}" == "$SELF_STEAL_HOST" ]]; then
+  warn "XHTTP_SNI совпадает с self-steal доменом: Caddy L4 уводит этот SNI в Vision, XHTTP не заработает. Задайте отдельный XHTTP_SNI."
+fi
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # БЛОК 2/4: Шаблоны — маскировочный сайт и шаблон подписки
@@ -2848,8 +4410,12 @@ if [[ -z "${SELF_STEAL_TEMPLATE_URL:-}" ]]; then
     fi
     note "Тема маскировочного сайта: $SELF_STEAL_TEMPLATE (авто)"
   else
-  # Определяем дефолтный номер для меню: vaultdrop=1, mail=2, cloud=3, admin=4, docs=5
+  # Определяем дефолтный номер для меню: vaultdrop=1, mail=2, cloud=3, admin=4,
+  # docs=5, none=6 (свой сайт).
   __default_theme_num=1
+  if [[ "$SELF_STEAL_TEMPLATE" == "$SELF_STEAL_TEMPLATE_NONE" ]]; then
+    __default_theme_num=6
+  fi
   for __i in "${!SELF_STEAL_TEMPLATES[@]}"; do
     if [[ "${SELF_STEAL_TEMPLATES[$__i]}" == "$SELF_STEAL_TEMPLATE" ]]; then
       __default_theme_num=$((__i+1))
@@ -2861,7 +4427,8 @@ if [[ -z "${SELF_STEAL_TEMPLATE_URL:-}" ]]; then
     "mail: Почта — корпоративный почтовый портал" \
     "cloud: Облако — файловое облако с папками" \
     "admin: Админ-панель — панель управления сервером" \
-    "docs: Документация — сайт с документацией"
+    "docs: Документация — сайт с документацией" \
+    "none: Свой сайт — не устанавливать шаблон; положите index.html в $SELF_STEAL_ROOT"
   note "Выбрана тема: $SELF_STEAL_TEMPLATE"
   fi
 else
@@ -2896,116 +4463,42 @@ if (( ! QUICK_SETUP )); then
   note "  • VLESS за CDN — прячет IP ноды за Cloudflare/аналогами (требует отдельный домен)"
 fi
 : "${C_B:=}" "${C_CYN:=}" "${C_RST:=}" "${C_DIM:=}" "${C_GRY:=}" "${C_MAG:=}"
-# === flags block start ===
-# Быстрый режим (QUICK_SETUP=1): XHTTP и CDN включены без вопросов; SNI —
-# проверенный дефолт, пути на свежей установке — случайные, CDN-домен —
-# уникальный cdn-<hex>.<базовый домен> (поддомен 1-го уровня для бесплатного
-# Cloudflare Universal SSL, без коллизии между несколькими нодами на домене).
-# Значения из env/сохранённого env-файла не затираются.
-if [[ "${QUICK_SETUP:-0}" == 1 ]]; then
-  ENABLE_XHTTP=1
-else
-  ask_bool ENABLE_XHTTP "Включить XHTTP (рекомендуется: да)?" "${ENABLE_XHTTP:-y}"
-fi
-if (( ENABLE_XHTTP )); then
-  if [[ "${QUICK_SETUP:-0}" == 1 ]]; then
-    XHTTP_SNI="${XHTTP_SNI:-www.gstatic.com}"
-    if [[ -z "${XHTTP_PATH:-}" ]]; then
-      XHTTP_PATH="$(gen_random_api_path /api/v3/sync 2>/dev/null || printf '/api/v3/sync/r1')"
-    fi
-    note "XHTTP: включён автоматически (SNI $XHTTP_SNI, путь $XHTTP_PATH)"
-  else
-    ask XHTTP_SNI  "Маскировочный SNI для XHTTP (сайт для REALITY-handshake)" "${XHTTP_SNI:-www.gstatic.com}"
-    ask XHTTP_PATH "Путь XHTTP (случайный URL-путь)" "${XHTTP_PATH:-/api/v3/sync/r1}"
-  fi
-else
-  warn "XHTTP отключён — будет использован только Vision (Reality)."
-  XHTTP_SNI=""
-  XHTTP_PATH=""
-fi
-if [[ "${QUICK_SETUP:-0}" == 1 ]]; then
-  ENABLE_CDN=1
-else
-  ask_bool ENABLE_CDN "Добавить VLESS за CDN (прячет IP ноды)?" "${ENABLE_CDN:-n}"
-fi
-if (( ENABLE_CDN )); then
-  note "CDN прячет origin: клиент идёт на CDN-домен по 443, CDN — на :443 ноды."
-  note "Публичный TLS терминирует CDN, между CDN и нодой — сертификат origin (DNS-01 через Cloudflare)."
-  note "Проксируемую A-запись для CDN-домена установщик создаст сам в Cloudflare (оранжевое облако) —"
-  note "вручную её создавать не нужно. Исключение — запуск с --no-cloudflare: тогда запись делаете вы."
-  if [[ -z "${CDN_HOST:-}" ]]; then
-    if declare -F gen_cdn_host >/dev/null 2>&1; then
-      __cdn_default="$(gen_cdn_host "${BASE_DOMAIN:-}" 2>/dev/null || printf 'cdn.%s' "${BASE_DOMAIN:-}")"
-    else
-      __cdn_default="cdn-$(od -An -N3 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n').${BASE_DOMAIN:-}"
-    fi
-  else
-    __cdn_default="$CDN_HOST"
-  fi
-  if [[ "${QUICK_SETUP:-0}" == 1 ]]; then
-    CDN_HOST="$__cdn_default"
-    CDN_TRANSPORT="${CDN_TRANSPORT:-ws}"
-    note "CDN: включён автоматически (домен $CDN_HOST, транспорт ${CDN_TRANSPORT,,})"
-  else
-    ask CDN_HOST "Домен, проксируемый CDN (A-запись под оранжевым облаком)" "$__cdn_default"
-    ask CDN_TRANSPORT "Транспорт CDN: ws, xhttp, grpc, both (ws+xhttp) или all" "${CDN_TRANSPORT:-ws}"
-  fi
-  unset __cdn_default
-  CDN_TRANSPORT="${CDN_TRANSPORT,,}"
-  case "$CDN_TRANSPORT" in
-    ws|xhttp|grpc|both|all) ;;
-    *) die "CDN_TRANSPORT должен быть ws, xhttp, grpc, both или all (получено: $CDN_TRANSPORT)." ;;
-  esac
-  if cdn_transport_enabled ws; then
-    CDN_WS_ENABLED=1
-    if [[ "${QUICK_SETUP:-0}" == 1 ]]; then
-      # На свежей установке дефолтный путь заменяем случайным; сохранённый
-      # (повторный запуск, ENV_STORE_LOADED=1) не трогаем.
-      if [[ "${ENV_STORE_LOADED:-0}" != 1 && "${CDN_WS_PATH:-}" == "/api/v1/stream" ]]; then
-        CDN_WS_PATH="$(gen_random_api_path /api/v1 2>/dev/null || printf '/api/v1/stream')"
-      fi
-    else
-      ask CDN_WS_PATH "Путь WebSocket для CDN" "${CDN_WS_PATH:-/api/v1/stream}"
-    fi
-  fi
-  if cdn_transport_enabled xhttp; then
-    CDN_XHTTP_ENABLED=1
-    if [[ "${QUICK_SETUP:-0}" == 1 ]]; then
-      if [[ "${ENV_STORE_LOADED:-0}" != 1 && "${CDN_XHTTP_PATH:-}" == "/api/v3/sync/c1" ]]; then
-        CDN_XHTTP_PATH="$(gen_random_api_path /api/v3/sync 2>/dev/null || printf '/api/v3/sync/c1')"
-      fi
-    else
-      ask CDN_XHTTP_PATH "Путь XHTTP для CDN" "${CDN_XHTTP_PATH:-/api/v3/sync/c1}"
-    fi
-  fi
-  if cdn_transport_enabled grpc; then
-    CDN_GRPC_ENABLED=1
-    if [[ "${QUICK_SETUP:-0}" == 1 ]]; then
-      if [[ "${ENV_STORE_LOADED:-0}" != 1 && "${CDN_GRPC_PATH:-}" == "/api/v4/stream" ]]; then
-        CDN_GRPC_PATH="$(gen_random_api_path /api/v4 2>/dev/null || printf '/api/v4/stream')"
-      fi
-    else
-      ask CDN_GRPC_PATH "serviceName gRPC для CDN" "${CDN_GRPC_PATH:-/api/v4/stream}"
-    fi
-  fi
-  if [[ -z "${CLOUDFLARE_API_TOKEN:-}" ]]; then
-    note "Для CDN нужен Cloudflare Token с Zone:Read + DNS:Edit: им установщик создаст проксируемую"
-    note "A-запись CDN-домена и выпустит сертификат origin по DNS-01."
-    ask_secret CLOUDFLARE_API_TOKEN \
-      "Cloudflare API Token (для A-записи и DNS-01 сертификата CDN)" ""
-  fi
-fi
+prompt_flags
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# БЛОК 4/4: Панель Remnawave
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-if [[ "${QUICK_SETUP:-0}" == 1 ]]; then
-  if has_tty; then printf '\n %s%s━━━ Быстрая автоустановка: панель Remnawave ━━━%s\n' "${C_B:-}" "${C_CYN:-}" "${C_RST:-}" > /dev/tty 2>/dev/null || true; fi
-else
-  if has_tty; then printf '\n %s%s━━━ Блок 4/4: Панель Remnawave ━━━%s\n' "${C_B:-}" "${C_CYN:-}" "${C_RST:-}" > /dev/tty 2>/dev/null || true; fi
+# Кастомный Xray-core. Спрашиваем только в расширенном режиме: в быстром
+# оставляем штатный Xray из образа, но env/--custom-core-url всё равно работают.
+if (( ! QUICK_SETUP )); then
+  __core_choice="official"
+  __core_default=1
+  if [[ -n "${CUSTOM_CORE_URL:-}" ]]; then
+    __core_choice="custom"
+    __core_default=3
+    if [[ "$CUSTOM_CORE_URL" == "$(uwuray_core_url 2>/dev/null || true)" ]]; then
+      __core_choice="uwuray"
+      __core_default=2
+    fi
+  fi
+  ask_choice __core_choice "Xray-core для ноды" "$__core_default" \
+    "official: Штатный Xray из образа remnawave/node (рекомендуется)" \
+    "uwuray: UwURay (MakostaDev/UwURay) — форк с расширенным sniffing и опциями REALITY" \
+    "custom: Свой https:// URL на бинарник Xray"
+  case "$__core_choice" in
+    uwuray)
+      CUSTOM_CORE_URL="$(uwuray_core_url)" \
+        || die "UwURay не поддерживает архитектуру $(uname -m)."
+      warn "UwURay: используется mutable URL latest — для продакшена закрепите конкретный release."
+      ;;
+    custom)
+      ask CUSTOM_CORE_URL "URL бинарника Xray (https://...)" "${CUSTOM_CORE_URL:-}"
+      CUSTOM_CORE_URL="$(normalize_custom_core_url "$CUSTOM_CORE_URL")" \
+        || die "URL должен начинаться с https:// и не содержать пробелов/кавычек/#."
+      ;;
+    *)
+      CUSTOM_CORE_URL=""
+      ;;
+  esac
+  unset __core_choice __core_default
 fi
-note "Панель управляет нодами, пользователями и подписками."
-# === flags block end ===
 
 # Авто-настройка панели спрашивается до IP/порта: по домену панели IP для
 # firewall чаще всего определяется сам, а порт в быстром режиме — случайный.
@@ -3032,10 +4525,10 @@ if (( REMNAWAVE_AUTO_SETUP )); then
       break
     fi
     if [[ "${QUICK_SETUP:-0}" == 1 && "$NONINTERACTIVE" != 1 ]] && has_tty; then
-      warn "Некорректный URL панели — нужен адрес вида https://panel.example.com без пути."
+      warn "Некорректный URL панели — нужен https://panel.example.com без пути (http:// допустим только для localhost/приватного адреса)."
       ask REMNAWAVE_PANEL_URL "Введите домен панели ещё раз" ""
     else
-      die "Некорректный домен панели «$REMNAWAVE_PANEL_URL»: нужен URL вида https://panel.example.com (https:// можно не писать — добавится сам; слэш в конце допустим, а путь — нет)."
+      die "Некорректный домен панели «$REMNAWAVE_PANEL_URL»: нужен URL вида https://panel.example.com (https:// можно не писать — добавится сам; http:// — только для localhost/приватного адреса; слэш в конце допустим, а путь — нет)."
     fi
   done
   ok "URL панели: $REMNAWAVE_PANEL_URL"
@@ -3067,7 +4560,7 @@ if (( REMNAWAVE_AUTO_SETUP )); then
       while :; do
         __normalized_panel_url="$(normalize_panel_url "$REMNAWAVE_PANEL_URL")" || __normalized_panel_url=""
         [[ -n "$__normalized_panel_url" ]] && { REMNAWAVE_PANEL_URL="$__normalized_panel_url"; break; }
-        warn "Некорректный URL панели — нужен адрес вида https://panel.example.com без пути."
+        warn "Некорректный URL панели — нужен https://panel.example.com без пути (http:// допустим только для localhost/приватного адреса)."
         ask REMNAWAVE_PANEL_URL "Введите домен панели ещё раз" ""
       done
       ask_secret REMNAWAVE_API_TOKEN "Введите API токен панели ещё раз (скрытый ввод)" ""
@@ -3141,11 +4634,9 @@ fi
 # self-steal, 10443/10444 — Vision и XHTTP в Xray. CDN-порты (сайт CDN-хоста и
 # его инбаунды) берём из констант, чтобы список не разъезжался с ними: иначе
 # Node API занял бы порт CDN-сайта или инбаунда и нода молча не поднялась бы.
-case "$NODE_API_PORT" in
-  80|443|9443|10443|10444|"$CDN_TLS_PORT"|"$CDN_WS_PORT"|"$CDN_XHTTP_PORT"|"$CDN_GRPC_PORT")
-    die "Node API port $NODE_API_PORT занят этой схемой; выберите другой, например 2222."
-    ;;
-esac
+if is_reserved_node_port "$NODE_API_PORT"; then
+  die "Node API port $NODE_API_PORT занят этой схемой; выберите другой, например 2222."
+fi
 ACTIVE_SSH_PORT="${SSH_PORT_OVERRIDE:-$(detect_ssh_port)}"
 [[ "$NODE_API_PORT" != "$ACTIVE_SSH_PORT" ]] \
   || die "Node API port $NODE_API_PORT совпадает с SSH-портом; выберите другой порт ноды."
@@ -3187,16 +4678,15 @@ if (( ENABLE_CDN )); then
     die "Путь XHTTP и serviceName gRPC для CDN должны различаться."
   fi
 fi
-# Тема фасада → URL шаблона. Явный SELF_STEAL_TEMPLATE_URL имеет приоритет
-# и отключает подстановку по теме (иначе пользователь не мог бы задать свой
-# фасад, не переименовывая тему).
-if [[ -z "$SELF_STEAL_TEMPLATE_URL" ]]; then
-  SELF_STEAL_TEMPLATE_URL="$(self_steal_template_url "$SELF_STEAL_TEMPLATE")" \
-    || die "Неизвестная тема self-steal: $SELF_STEAL_TEMPLATE. Доступны: $(self_steal_template_list | tr '\n' ' ')."
-  SELF_STEAL_THEME_USED=1
-fi
-[[ "$SELF_STEAL_TEMPLATE_URL" == https://* ]] \
-  || die "SELF_STEAL_TEMPLATE_URL должен начинаться с https://"
+resolve_self_steal_template
+# Шаблон профиля может содержать REALITY privateKey — только HTTPS, иначе MITM
+# подменит ключи. SELF_STEAL_RAW_BASE используется для Xray-шаблона: тоже HTTPS.
+[[ "$MULTISELECT_TEMPLATE_URL" == https://* ]] \
+  || die "MULTISELECT_TEMPLATE_URL должен начинаться с https://"
+[[ "$SELF_STEAL_RAW_BASE" == https://* ]] \
+  || die "SELF_STEAL_RAW_BASE должен начинаться с https://"
+is_safe_path "$CERT_DIR" \
+  || die "Некорректный CERT_DIR: $CERT_DIR (нужен абсолютный путь без кавычек/скобок/переводов строк)."
 NODE_IMAGE="$(normalize_node_image "${NODE_IMAGE:-}")"
 [[ "$NODE_IMAGE" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*(:[0-9]+)?/[a-zA-Z0-9._/-]+(:[a-zA-Z0-9._-]+)?(@sha256:[0-9a-fA-F]{64})?$ ]] \
   || die "Некорректная ссылка на образ: $NODE_IMAGE"
@@ -3230,57 +4720,7 @@ if [[ -n "$CF_CURL_CFG" ]]; then
   CF_CURL_CFG=""
 fi
 
-( umask 077
-  {
-    printf 'export SERVER_IP=%q\n' "$SERVER_IP"
-    printf 'export BASE_DOMAIN=%q\n' "$BASE_DOMAIN"
-    printf 'export PREFIX=%q\n' "$PREFIX"
-    printf 'export VLESS_HOST=%q\n' "$VLESS_HOST"
-    printf 'export HY_HOST=%q\n' "$HY_HOST"
-    printf 'export ACME_EMAIL=%q\n' "$ACME_EMAIL"
-    printf 'export SELF_STEAL_HOST=%q\n' "$SELF_STEAL_HOST"
-    printf 'export VISION_SNI=%q\n' "$VISION_SNI"
-    # Оба решения (и «да», и «нет») сохраняются в читаемом виде y/n: иначе
-    # ответ «n» терялся бы и повторный запуск включал функцию обратно по дефолту.
-    printf 'export ENABLE_XHTTP=%s\n' "$(bool_yn "$ENABLE_XHTTP")"
-    if (( ENABLE_XHTTP )); then
-      printf 'export XHTTP_SNI=%q\n' "$XHTTP_SNI"
-      printf 'export XHTTP_PATH=%q\n' "$XHTTP_PATH"
-    fi
-    printf 'export ENABLE_CDN=%s\n' "$(bool_yn "$ENABLE_CDN")"
-    if (( ENABLE_CDN )); then
-      printf 'export CDN_HOST=%q\n' "$CDN_HOST"
-      printf 'export CDN_TRANSPORT=%q\n' "$CDN_TRANSPORT"
-      printf 'export CDN_WS_PATH=%q\n' "$CDN_WS_PATH"
-      printf 'export CDN_XHTTP_PATH=%q\n' "$CDN_XHTTP_PATH"
-      printf 'export CDN_GRPC_PATH=%q\n' "$CDN_GRPC_PATH"
-    fi
-    printf 'export PANEL_IP=%q\n' "${PANEL_IP:-}"
-    printf 'export NODE_API_PORT=%q\n' "${NODE_API_PORT:-2222}"
-    # Новые интерактивные ответы — сохраняем для идемпотентного повторного запуска
-    printf 'export NODE_TAG=%q\n' "$(panel_node_tag)"
-    printf 'export SELF_STEAL_TEMPLATE=%q\n' "${SELF_STEAL_TEMPLATE:-vaultdrop}"
-    if [[ -n "${SELF_STEAL_TEMPLATE_URL:-}" ]]; then
-      printf 'export SELF_STEAL_TEMPLATE_URL=%q\n' "$SELF_STEAL_TEMPLATE_URL"
-    fi
-    printf 'export XRAY_TEMPLATE_CHOICE=%q\n' "${XRAY_TEMPLATE_CHOICE:-standard}"
-    printf 'export CF_MODE=%s\n' "$(bool_yn "${CF_MODE:-0}")"
-    printf 'export QUICK_SETUP=%s\n' "$(bool_yn "${QUICK_SETUP:-0}")"
-    if [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]]; then
-      printf 'export CLOUDFLARE_API_TOKEN=%q\n' "$CLOUDFLARE_API_TOKEN"
-    fi
-    if [[ -n "${CLOUDFLARE_ZONE:-}" ]]; then
-      printf 'export CLOUDFLARE_ZONE=%q\n' "$CLOUDFLARE_ZONE"
-    fi
-    printf 'export REMNAWAVE_AUTO_SETUP=%s\n' "$(bool_yn "${REMNAWAVE_AUTO_SETUP:-0}")"
-    if [[ -n "${REMNAWAVE_PANEL_URL:-}" ]]; then
-      printf 'export REMNAWAVE_PANEL_URL=%q\n' "$REMNAWAVE_PANEL_URL"
-    fi
-    if [[ -n "${REMNAWAVE_API_TOKEN:-}" ]]; then
-      printf 'export REMNAWAVE_API_TOKEN=%q\n' "$REMNAWAVE_API_TOKEN"
-    fi
-  } > "$ENV_STORE"
-)
+write_env_store
 # -F: путь ищется фиксированной строкой, а не как regex (точки в пути не
 # должны совпадать с любым символом); %q корректно кавычивает записываемую строку.
 grep -qF "source $ENV_STORE" /root/.bashrc 2>/dev/null \
@@ -3298,7 +4738,9 @@ kv "SERVER_IP"     "$SERVER_IP"
 kv "VLESS"         "$VLESS_HOST"
 kv "HYSTERIA2"     "$HY_HOST"
 kv "SELF_STEAL"    "$SELF_STEAL_HOST -> 127.0.0.1:9443"
-if (( SELF_STEAL_THEME_USED )); then
+if [[ "$SELF_STEAL_TEMPLATE" == "$SELF_STEAL_TEMPLATE_NONE" && -z "${SELF_STEAL_TEMPLATE_URL:-}" ]]; then
+  kv "Фасад"         "свой сайт (none): $SELF_STEAL_ROOT"
+elif (( SELF_STEAL_THEME_USED )); then
   kv "Фасад"         "тема $SELF_STEAL_TEMPLATE"
 else
   kv "Фасад"         "$SELF_STEAL_TEMPLATE_URL"
@@ -3385,13 +4827,20 @@ step 3 "Базовые пакеты и Docker"
 retry 3 5 apt_get update -y || warn "apt-get update с ошибкой — продолжаю."
 retry 3 5 apt_get install -y curl gnupg debian-keyring debian-archive-keyring apt-transport-https \
                    ca-certificates lsb-release git jq unzip nano htop socat cron openssl \
-                   ufw psmisc \
+                   ufw psmisc iproute2 \
   || die "Не удалось установить базовые пакеты."
 
 DOCKER_RESTART_REQUIRED=0
 if ! have docker; then
-  retry 3 10 bash -c 'curl -fsSL https://get.docker.com | sh' \
-    || die "Не удалось установить Docker через get.docker.com."
+  DOCKER_INSTALL_TMP="$(mktemp)"
+  retry 3 10 curl -fsSL "$DOCKER_INSTALL_URL" -o "$DOCKER_INSTALL_TMP" \
+    || die "Не удалось скачать Docker install script ($DOCKER_INSTALL_URL)."
+  printf '%s  %s\n' "$DOCKER_INSTALL_SHA256" "$DOCKER_INSTALL_TMP" | sha256sum -c - >/dev/null \
+    || die "SHA256 Docker install script не совпал — установка Docker остановлена."
+  retry 3 10 sh "$DOCKER_INSTALL_TMP" \
+    || die "Docker install script завершился с ошибкой."
+  rm -f "$DOCKER_INSTALL_TMP"
+  DOCKER_INSTALL_TMP=""
   DOCKER_RESTART_REQUIRED=1
 else
   ok "Docker уже установлен"
@@ -3465,26 +4914,10 @@ else
   warn "--no-firewall: убедитесь, что 443 tcp/udp, 80/tcp открыты, а $NODE_API_PORT доступен только панели. Без firewall нет гарантий ограничения доступа Node API."
 fi
 
-caddy_build_matches() {
-  have caddy \
-    && [[ "$(caddy version 2>/dev/null | awk '{print $1}')" == "$CADDY_VERSION" ]] \
-    && caddy list-modules 2>/dev/null | grep -qE 'layer4' \
-    && caddy build-info 2>/dev/null | tr '\t' ' ' \
-      | grep -Fq "github.com/mholt/caddy-l4 $CADDY_L4_VERSION"
-}
 
 # Ранний fail-fast: если 443/tcp уже держит посторонний процесс (nginx,
 # apache…), Caddy не сможет занять порт — об этом лучше сказать до
 # многоминутной сборки, а не после неё.
-assert_port443_free() {
-  local line holder
-  have ss || return 0
-  line="$(ss -H -lntp 'sport = :443' 2>/dev/null | grep -vi caddy | head -1 || true)"
-  [[ -n "$line" ]] || return 0
-  holder="$(sed -n 's/.*users:(("\([^"]*\)".*/\1/p' <<<"$line")"
-  holder="${holder:-неизвестный процесс}"
-  die "Порт 443/tcp занят процессом «$holder»: остановите его (systemctl stop <сервис>), иначе Caddy не сможет слушать 443."
-}
 
 step 5 "Сборка Caddy с модулем layer4"
 assert_port443_free
@@ -3561,12 +4994,27 @@ else
   note "Порт 80 свободен — challenge пройдёт без остановки Caddy."
 fi
 if [[ ! -x /root/.acme.sh/acme.sh ]]; then
-  retry 3 10 bash -c "curl -fsSL https://get.acme.sh | sh -s email='$ACME_EMAIL'" \
+  # acme.sh --install копирует ./acme.sh из текущего каталога, поэтому кладём
+  # проверенный файл в отдельный каталог и запускаем его оттуда.
+  ACME_INSTALL_DIR="$(mktemp -d)"
+  ACME_INSTALL_TMP="$ACME_INSTALL_DIR/acme.sh"
+  retry 3 10 curl -fsSL "$ACME_INSTALL_URL" -o "$ACME_INSTALL_TMP" \
+    || die "Не удалось скачать acme.sh ($ACME_INSTALL_URL)."
+  printf '%s  %s\n' "$ACME_INSTALL_SHA256" "$ACME_INSTALL_TMP" | sha256sum -c - >/dev/null \
+    || die "SHA256 acme.sh не совпал — установка acme.sh остановлена."
+  ( cd "$ACME_INSTALL_DIR" && retry 3 10 sh ./acme.sh --install -m "$ACME_EMAIL" ) \
     || die "Не удалось установить acme.sh."
+  rm -rf -- "$ACME_INSTALL_DIR"
+  ACME_INSTALL_DIR=""
+  ACME_INSTALL_TMP=""
 fi
 ACME=/root/.acme.sh/acme.sh
 [[ -x "$ACME" ]] || die "acme.sh не найден по пути $ACME."
-"$ACME" --upgrade --auto-upgrade >/dev/null 2>&1 || true
+if [[ "$ACME_AUTO_UPGRADE" == 1 ]]; then
+  "$ACME" --upgrade --auto-upgrade >/dev/null 2>&1 || true
+else
+  note "acme.sh закреплён; автообновление выключено (ACME_AUTO_UPGRADE=1 — обновлять из upstream)."
+fi
 "$ACME" --set-default-ca --server letsencrypt >/dev/null 2>&1 || warn "Не удалось выставить CA по умолчанию."
 
 # Автопродление работает из crontab root: если задания нет (crontab чистили
@@ -3587,87 +5035,28 @@ fi
 # Caddy занимает :80 ради HTTP->HTTPS 301, поэтому standalone challenge требует
 # временно остановить Caddy. Хуки сохраняются в конфиг сертификата acme.sh и
 # срабатывают при автопродлении из cron (--renew/--cron) так же, как при первой выдаче.
-ACME_PRE_HOOK='systemctl stop caddy >/dev/null 2>&1 || true'
-ACME_POST_HOOK='systemctl start caddy >/dev/null 2>&1 || true'
 
 # Сколько дней осталось у уже выпущенного сертификата acme.sh; возвращает 1,
 # если файла нет или он нечитаем. Без этой проверки повторный запуск «пропускал»
 # бы выпуск, и просроченный сертификат продолжал бы работать до ручного
 # вмешательства. ACME_HOME переопределяется в tests/installer-funcs-checks.sh.
-acme_cert_days_left() {
-  local d="$1" home="${ACME_HOME:-/root/.acme.sh}" crt end end_epoch
-  for crt in "$home/${d}_ecc/${d}.crt" "$home/${d}/${d}.crt"; do
-    [[ -s "$crt" ]] || continue
-    end="$(openssl x509 -in "$crt" -noout -enddate 2>/dev/null | cut -d= -f2-)" || return 1
-    [[ -n "$end" ]] || return 1
-    end_epoch="$(LC_ALL=C date -d "$end" +%s 2>/dev/null)" || return 1
-    printf '%s' $((( end_epoch - $(date +%s) ) / 86400 ))
-    return 0
-  done
-  return 1
-}
 
-issue_cert() {
-  local d="$1" listed=0 days
-  local -a issue_args=(--issue --standalone -d "$d" --keylength ec-256 \
-                        --pre-hook "$ACME_PRE_HOOK" --post-hook "$ACME_POST_HOOK")
-  if "$ACME" --list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$d"; then
-    listed=1
-  fi
-  if (( listed )); then
-    if days="$(acme_cert_days_left "$d")" && (( days > 7 )); then
-      ok "Сертификат для $d уже выпущен (осталось ${days} дн.) — пропускаю issue"
-      return 0
-    fi
-    warn "Сертификат для $d отсутствует, нечитаем или истекает менее чем через 7 дней — перевыпускаю."
-    issue_args+=(--force)
-  fi
-  if systemctl is-active --quiet caddy; then
-    systemctl stop caddy || die "Не удалось освободить порт 80 для ACME."
-    CADDY_RESTORE_NEEDED=1
-    note "Caddy временно остановлен для ACME standalone challenge."
-  fi
-  if ss -H -lnt 'sport = :80' 2>/dev/null | grep -q .; then
-    ss -H -lntp 'sport = :80' 2>/dev/null | sed 's/^/   /' || true
-    die "Порт 80 занят другим процессом — ACME standalone challenge невозможен."
-  fi
-  if ! "$ACME" "${issue_args[@]}"; then
-    warn "Не удалось выпустить сертификат для $d (проверьте DNS/порт 80)."
-    return 1
-  fi
-}
 
 # Сертификат для CDN-хоста: HTTP-01 здесь невозможен — за прокси на :80 отвечает
 # сам CDN, а не наша нода. Поэтому DNS-01 (`dns_cf`) тем же токеном Cloudflare.
 # acme.sh сохраняет креденшелы DNS-API в конфиг сертификата, поэтому cron
 # обновляет его так же, как остальные.
-issue_cert_dns() {
-  local d="$1" listed=0 days
-  local -a issue_args=(--issue --dns dns_cf -d "$d" --keylength ec-256)
-  [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]] \
-    || { warn "Для DNS-01 сертификата $d нужен CLOUDFLARE_API_TOKEN."; return 1; }
-  if "$ACME" --list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$d"; then
-    listed=1
-  fi
-  if (( listed )); then
-    if days="$(acme_cert_days_left "$d")" && (( days > 7 )); then
-      ok "Сертификат для $d уже выпущен (осталось ${days} дн.) — пропускаю issue"
-      return 0
-    fi
-    warn "Сертификат для $d отсутствует, нечитаем или истекает — перевыпускаю через DNS-01."
-    issue_args+=(--force)
-  fi
-  # dns_cf читает CF_Token; CF_Zone_ID избавляет от повторного поиска зоны.
-  export CF_Token="$CLOUDFLARE_API_TOKEN"
-  if [[ -n "${CF_ZONE_ID:-}" ]]; then export CF_Zone_ID="$CF_ZONE_ID"; fi
-  if ! "$ACME" "${issue_args[@]}"; then
-    warn "Не удалось выпустить сертификат для $d через DNS-01: проверьте права токена (Zone:Read + DNS:Edit) и CLOUDFLARE_ZONE."
-    return 1
-  fi
-}
 
-issue_cert "$SELF_STEAL_HOST" || die "Без сертификата $SELF_STEAL_HOST настоящий self-steal невозможен."
-issue_cert "$HY_HOST" || die "Не удалось подготовить обязательный сертификат Hysteria2."
+ACME_METHOD_USED="$(acme_method_resolved)"
+if [[ "$ACME_METHOD_USED" == "dns" ]]; then
+  ok "ACME: DNS-01 для self-steal и Hysteria2 (продление без остановки Caddy)"
+else
+  warn "ACME: HTTP-01 — при первом выпуске и продлении Caddy кратко останавливается, 443/tcp может прерваться."
+  warn "Чтобы убрать простой, задайте Cloudflare-токен и ACME_METHOD=auto (или dns)."
+fi
+
+issue_cert_selected "$SELF_STEAL_HOST" || die "Без сертификата $SELF_STEAL_HOST настоящий self-steal невозможен."
+issue_cert_selected "$HY_HOST" || die "Не удалось подготовить обязательный сертификат Hysteria2."
 # Проверку через порт 80 для CDN-хоста не делаем вовсе: HTTP-01 за прокси
 # невозможно, а DNS-01 портов не требует и Caddy не останавливает.
 if (( ENABLE_CDN )); then
@@ -3679,7 +5068,7 @@ mkdir -p "$CERT_DIR/$SELF_STEAL_HOST" "$CERT_DIR/$HY_HOST"
 "$ACME" --install-cert -d "$SELF_STEAL_HOST" --ecc \
   --key-file       "$CERT_DIR/$SELF_STEAL_HOST/key.pem" \
   --fullchain-file "$CERT_DIR/$SELF_STEAL_HOST/fullchain.pem" \
-  --reloadcmd "systemctl reload caddy >/dev/null 2>&1 || true" \
+  --reloadcmd "systemctl restart caddy >/dev/null 2>&1 || true" \
   || die "Не удалось установить сертификат self-steal для $SELF_STEAL_HOST."
 "$ACME" --install-cert -d "$HY_HOST" --ecc \
   --key-file       "$CERT_DIR/$HY_HOST/key.pem" \
@@ -3692,7 +5081,7 @@ if (( ENABLE_CDN )); then
   "$ACME" --install-cert -d "$CDN_HOST" --ecc \
     --key-file       "$CERT_DIR/$CDN_HOST/key.pem" \
     --fullchain-file "$CERT_DIR/$CDN_HOST/fullchain.pem" \
-    --reloadcmd "systemctl reload caddy >/dev/null 2>&1 || true" \
+    --reloadcmd "systemctl restart caddy >/dev/null 2>&1 || true" \
     || die "Не удалось установить сертификат CDN для $CDN_HOST."
 fi
 
@@ -3721,122 +5110,41 @@ fi
 ok "Сертификаты установлены в $CERT_DIR (автопродление — таймер/cron acme.sh)"
 
 step 7 "Caddyfile — SNI-роутинг и локальный self-steal сайт"
-SELF_STEAL_ROOT=/var/www/remnanode-self-steal
 mkdir -p "$SELF_STEAL_ROOT"
-SELF_STEAL_TEMPLATE_TMP="$(mktemp)"
-if retry 3 3 curl -fsSL "$SELF_STEAL_TEMPLATE_URL" -o "$SELF_STEAL_TEMPLATE_TMP"; then
-  install -m 644 "$SELF_STEAL_TEMPLATE_TMP" "$SELF_STEAL_ROOT/index.html"
-  if (( SELF_STEAL_THEME_USED )); then
-    ok "Фасад self-steal установлен (тема $SELF_STEAL_TEMPLATE)"
+if [[ "$SELF_STEAL_TEMPLATE" == "$SELF_STEAL_TEMPLATE_NONE" && -z "${SELF_STEAL_TEMPLATE_URL:-}" ]]; then
+  # Свой сайт: ничего не скачиваем и не перезаписываем. Пустой каталог ухудшает
+  # маскировку (Caddy ответит 404), поэтому предупреждаем громко.
+  if [[ -s "$SELF_STEAL_ROOT/index.html" ]]; then
+    ok "Шаблон не устанавливался (none): используется свой сайт $SELF_STEAL_ROOT/index.html"
   else
-    ok "Фасад self-steal установлен (SELF_STEAL_TEMPLATE_URL)"
+    warn "SELF_STEAL_TEMPLATE=none, но $SELF_STEAL_ROOT/index.html отсутствует или пуст."
+    warn "Положите туда свой index.html до запуска сканеров: иначе на self-steal domain будет 404."
   fi
 else
-  warn "Не удалось скачать шаблон — устанавливаю минимальную локальную заглушку."
-  cat > "$SELF_STEAL_ROOT/index.html" <<EOF
+  SELF_STEAL_TEMPLATE_TMP="$(mktemp)"
+  if retry 3 3 curl -fsSL "$SELF_STEAL_TEMPLATE_URL" -o "$SELF_STEAL_TEMPLATE_TMP"; then
+    install -m 644 "$SELF_STEAL_TEMPLATE_TMP" "$SELF_STEAL_ROOT/index.html"
+    if (( SELF_STEAL_THEME_USED )); then
+      ok "Фасад self-steal установлен (тема $SELF_STEAL_TEMPLATE)"
+    else
+      ok "Фасад self-steal установлен (SELF_STEAL_TEMPLATE_URL)"
+    fi
+  else
+    warn "Не удалось скачать шаблон — устанавливаю минимальную локальную заглушку."
+    cat > "$SELF_STEAL_ROOT/index.html" <<EOF
 <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Secure workspace</title></head><body><main><h1>Secure file workspace</h1><form><label>Workspace ID <input autocomplete="off"></label><label>Password <input type="password" autocomplete="off"></label><button type="button">Sign in</button></form></main></body></html>
 EOF
+  fi
+  rm -f "$SELF_STEAL_TEMPLATE_TMP"
+  chmod -R a=rX "$SELF_STEAL_ROOT"
 fi
-rm -f "$SELF_STEAL_TEMPLATE_TMP"
-chmod -R a=rX "$SELF_STEAL_ROOT"
 
 cp -a /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.backup-$(date +%F-%H%M%S)" 2>/dev/null || true
 prune_matching_files /etc/caddy 'Caddyfile.backup-*' 5
-# Маршрут XHTTP вырезается целиком, когда XHTTP выключен: иначе Caddy уводил бы
-# SNI XHTTP в 127.0.0.1:10444, где после отключения inbound'а никто не слушает.
-XHTTP_L4_BLOCK=""
-if (( ENABLE_XHTTP )); then
-  XHTTP_L4_BLOCK="$(printf '      @xhttp tls sni %s\n      route @xhttp {\n        proxy 127.0.0.1:10444\n      }' "$XHTTP_SNI")"
-fi
-# SNI CDN-хоста уводим на отдельный TLS-сайт: именно с ним приходит CDN на :443.
-CDN_L4_BLOCK=""
-if (( ENABLE_CDN )); then
-  CDN_L4_BLOCK="$(printf '      @cdn tls sni %s\n      route @cdn {\n        proxy 127.0.0.1:%s\n      }' "$CDN_HOST" "$CDN_TLS_PORT")"
-fi
-cat > /etc/caddy/Caddyfile <<EOF
-{
-  auto_https disable_redirects
-  layer4 {
-    :443 {
-      @vision tls sni $SELF_STEAL_HOST
-      route @vision {
-        proxy 127.0.0.1:10443
-      }
-$XHTTP_L4_BLOCK
-$CDN_L4_BLOCK
-      route {
-        proxy 127.0.0.1:9443
-      }
-    }
-  }
-}
+render_caddyfile
 
-# Постоянный 301 на HTTPS с сохранением пути и query string.
-# Домен берётся из конфигурации, а не из заголовка Host, поэтому open redirect невозможен.
-http://$SELF_STEAL_HOST {
-  redir https://$SELF_STEAL_HOST{uri} permanent
-}
-
-https://$SELF_STEAL_HOST:9443 {
-  bind 127.0.0.1
-  tls $CERT_DIR/$SELF_STEAL_HOST/fullchain.pem $CERT_DIR/$SELF_STEAL_HOST/key.pem {
-    protocols tls1.2 tls1.3
-  }
-  root * $SELF_STEAL_ROOT
-  header {
-    -Server
-    Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:; form-action 'none'; base-uri 'none'; frame-ancestors 'none'"
-    X-Content-Type-Options nosniff
-    Referrer-Policy no-referrer
-    Permissions-Policy "camera=(), microphone=(), geolocation=()"
-    Strict-Transport-Security "max-age=31536000"
-  }
-  file_server
-}
-EOF
-
-if (( ENABLE_CDN )); then
-  # Отдельный блок для CDN-хоста. Публичный TLS терминирует CDN, а к нам на :443
-  # приходит уже его SNI — отсюда маршрут @cdn в layer4. Здесь мы терминируем
-  # TLS сертификатом CDN-хоста и отдаём: пути инбаундов — в Xray (loopback),
-  # всё остальное — тот же фасад, что и на self-steal сайте. Сторонний сканер
-  # по CDN-хосту видит обычный веб-сайт. Xray при этом не смотрит наружу.
-  CDN_ROUTES_BLOCK=""
-  if (( CDN_WS_ENABLED )); then
-    CDN_ROUTES_BLOCK+="$(printf '\n  @ws path %s*\n  reverse_proxy @ws 127.0.0.1:%s' "$CDN_WS_PATH" "$CDN_WS_PORT")"
-  fi
-  if (( CDN_XHTTP_ENABLED )); then
-    CDN_ROUTES_BLOCK+="$(printf '\n  @xhttpcdn path %s*\n  reverse_proxy @xhttpcdn 127.0.0.1:%s' "$CDN_XHTTP_PATH" "$CDN_XHTTP_PORT")"
-  fi
-  if (( CDN_GRPC_ENABLED )); then
-    # gRPC: Xray слушает h2c (HTTP/2 без TLS), поэтому upstream — h2c://...;
-    # поток не буферизуем, иначе gRPC-стримы будут ждать закрытия ответа.
-    CDN_ROUTES_BLOCK+="$(printf '\n  @grpccdn path %s/*\n  reverse_proxy @grpccdn h2c://127.0.0.1:%s {\n    flush_interval -1\n  }' "$CDN_GRPC_PATH" "$CDN_GRPC_PORT")"
-  fi
-  cat >> /etc/caddy/Caddyfile <<EOF
-
-https://$CDN_HOST:$CDN_TLS_PORT {
-  bind 127.0.0.1
-  tls $CERT_DIR/$CDN_HOST/fullchain.pem $CERT_DIR/$CDN_HOST/key.pem {
-    protocols tls1.2 tls1.3
-  }
-$CDN_ROUTES_BLOCK
-  root * $SELF_STEAL_ROOT
-  header {
-    -Server
-    Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:; form-action 'none'; base-uri 'none'; frame-ancestors 'none'"
-    X-Content-Type-Options nosniff
-    Referrer-Policy no-referrer
-    Permissions-Policy "camera=(), microphone=(), geolocation=()"
-    Strict-Transport-Security "max-age=31536000"
-  }
-  file_server
-}
-EOF
-fi
-
-caddy fmt --overwrite /etc/caddy/Caddyfile || warn "caddy fmt не удался — продолжаю."
-caddy validate --config /etc/caddy/Caddyfile || die "Caddyfile невалиден — исправьте SNI/синтаксис."
+caddy fmt --overwrite "$CADDYFILE_PATH" || warn "caddy fmt не удался — продолжаю."
+caddy validate --config "$CADDYFILE_PATH" || die "Caddyfile невалиден — исправьте SNI/синтаксис."
 systemctl restart caddy || die "Не удалось перезапустить Caddy."
 sleep 1
 if systemctl is-active --quiet caddy; then
@@ -3939,12 +5247,19 @@ SECRET_VALUE="$(printf '%s' "$SECRET_VALUE" | tr -d '[:space:]')"
 # На случай, если в старом окружении или .env оставался голый тег без репозитория
 NODE_IMAGE="$(normalize_node_image "$NODE_IMAGE")"
 
+# Логи Xray: если образ пишет файл, он окажется на хосте и будет ротироваться.
+# stdout по-прежнему ограничен Docker log-opts (50m × 5).
+mkdir -p "$XRAY_LOG_DIR"
+chmod 755 "$XRAY_LOG_DIR" 2>/dev/null || true
+
 if [[ "$BUILD_COMPOSE" -eq 1 ]]; then
   ( umask 077
     cat > "$NODE_DIR/.env" <<EOF
 NODE_PORT=$NODE_API_PORT
 SECRET_KEY=$SECRET_VALUE
 NODE_IMAGE=$NODE_IMAGE
+XRAY_LOG_DIR=$XRAY_LOG_DIR
+CUSTOM_CORE_URL=$CUSTOM_CORE_URL
 EOF
   )
   # Файл от старой версии мог остаться с другими правами: перезапись через
@@ -3955,7 +5270,7 @@ services:
   remnanode:
     container_name: remnanode
     hostname: remnanode
-    image: ${NODE_IMAGE:-remnawave/node:latest}
+    image: ${NODE_IMAGE:-remnawave/node:3.4.4}
     network_mode: host
     restart: always
     cap_add:
@@ -3974,8 +5289,10 @@ services:
     environment:
       - NODE_PORT=${NODE_PORT}
       - SECRET_KEY=${SECRET_KEY}
+      - CUSTOM_CORE_URL=${CUSTOM_CORE_URL:-}
     volumes:
       - /etc/remna-certs:/etc/remna-certs:ro
+      - ${XRAY_LOG_DIR:-/var/log/remnanode/xray}:/var/log/xray
 EOF
   ok "Записаны $NODE_DIR/.env (0600) и docker-compose.yml"
 else
@@ -3985,11 +5302,31 @@ else
       echo "NODE_PORT=$NODE_API_PORT"
       echo "SECRET_KEY=$SECRET_VALUE"
       echo "NODE_IMAGE=$NODE_IMAGE"
+      echo "XRAY_LOG_DIR=$XRAY_LOG_DIR"
+      echo "CUSTOM_CORE_URL=$CUSTOM_CORE_URL"
     } > "$NODE_DIR/.env"
   )
   chmod 600 "$NODE_DIR/.env"
   ok "Обновлён $NODE_DIR/.env (compose оставлен как есть)"
 fi
+
+# Ротация файловых логов Xray. Если образ пишет только в stdout, каталог пуст
+# и logrotate ничего не делает; Docker-драйвер уже ограничивает stdout.
+if [[ -d /etc/logrotate.d ]]; then
+  cat > /etc/logrotate.d/remnanode-xray <<EOF
+$XRAY_LOG_DIR/*.log {
+  size 50M
+  rotate 5
+  compress
+  delaycompress
+  missingok
+  notifempty
+  copytruncate
+}
+EOF
+  chmod 644 /etc/logrotate.d/remnanode-xray
+fi
+
 
 ( cd "$NODE_DIR" && retry 3 10 docker compose pull ) || die "docker compose pull не удался."
 ( cd "$NODE_DIR" && retry 3 10 docker compose up -d --remove-orphans ) || die "docker compose up не удался."
@@ -4033,46 +5370,9 @@ fi
 
 step 10 "Проверка слушателей и маршрутизации"
 
-has_tcp_listener() {
-  ss -H -lnt "sport = :$1" 2>/dev/null | grep -q .
-}
 
-has_tcp_listener_at() {
-  local address="$1" port="$2"
-  ss -H -lnt "sport = :$port" 2>/dev/null | awk '{print $4}' | grep -Fqx "$address:$port"
-}
 
-has_udp_listener() {
-  ss -H -lnu "sport = :$1" 2>/dev/null | grep -q .
-}
 
-all_protocol_listeners_ready() {
-  local xhttp_ready=1 cdn_ready=1
-  # 10444 слушает только включённый XHTTP: с выключенным профилем его нет.
-  if (( ENABLE_XHTTP )); then
-    has_tcp_listener_at 127.0.0.1 10444 || xhttp_ready=0
-  fi
-  # CDN-сайт Caddy слушает всегда, когда включён CDN, а инбаунды — только если
-  # они есть в назначенном панелью профиле (то есть включены на карточке ноды).
-  if (( ENABLE_CDN )); then
-    has_tcp_listener_at 127.0.0.1 "$CDN_TLS_PORT" || cdn_ready=0
-    if (( CDN_WS_ENABLED )); then
-      has_tcp_listener_at 127.0.0.1 "$CDN_WS_PORT" || cdn_ready=0
-    fi
-    if (( CDN_XHTTP_ENABLED )); then
-      has_tcp_listener_at 127.0.0.1 "$CDN_XHTTP_PORT" || cdn_ready=0
-    fi
-    if (( CDN_GRPC_ENABLED )); then
-      has_tcp_listener_at 127.0.0.1 "$CDN_GRPC_PORT" || cdn_ready=0
-    fi
-  fi
-  (( xhttp_ready == 1 && cdn_ready == 1 )) \
-    && has_tcp_listener 443 \
-    && has_tcp_listener_at 127.0.0.1 9443 \
-    && has_tcp_listener_at 127.0.0.1 10443 \
-    && has_tcp_listener "$NODE_API_PORT" \
-    && has_udp_listener 443
-}
 
 log "Жду все протокольные слушатели после получения конфигурации от панели (до 60s)..."
 listeners_ready=0
@@ -4122,19 +5422,6 @@ if [[ "$listeners_ready" -ne 1 ]]; then
 fi
 ok "Все TCP/UDP-слушатели активны"
 
-check_tls_route() {
-  local name="$1" sni="$2" output
-  printf '   %s%s%s (%s)%s\n' "${C_B:-}" "${C_MAG:-}" "$name" "$sni" "${C_RST:-}"
-  if output="$(timeout 12 openssl s_client -connect 127.0.0.1:443 -servername "$sni" \
-      -verify_hostname "$sni" -verify_return_error -brief </dev/null 2>&1)" \
-      && grep -Eq 'CONNECTION ESTABLISHED|Protocol version:' <<<"$output"; then
-    printf '%s\n' "$output" | head -8 | sed 's/^/     /'
-    return 0
-  fi
-  printf '%s\n' "$output" | head -8 | sed 's/^/     /'
-  warn "$name: TLS-маршрут для SNI $sni не прошёл проверку."
-  return 1
-}
 
 tls_failures=0
 ROUTE_PAIRS=("Vision:$VISION_SNI")
@@ -4161,39 +5448,6 @@ else
   die "Локальный TLS-сайт self-steal не прошёл проверку."
 fi
 
-verify_http_layer() {
-  local tmp
-  tmp="$(mktemp)"
-  if curl -sS -o /dev/null -D "$tmp" --max-time 10 \
-      --resolve "$SELF_STEAL_HOST:80:127.0.0.1" \
-      "http://$SELF_STEAL_HOST/probe/path?probe=1" 2>/dev/null \
-      && head -1 "$tmp" | grep -q ' 301' \
-      && grep -qi "^location: https://$SELF_STEAL_HOST/probe/path?probe=1" "$tmp"; then
-    ok "Порт 80 отдаёт постоянный 301 с сохранением пути и query"
-  else
-    sed 's/^/     /' "$tmp" | head -8
-    rm -f "$tmp"
-    die "Порт 80 не отдаёт 301 на HTTPS с сохранением URI (см. вывод выше)."
-  fi
-  if curl -sS -o /dev/null -D "$tmp" --max-time 10 \
-      --resolve "$SELF_STEAL_HOST:9443:127.0.0.1" \
-      "https://$SELF_STEAL_HOST:9443/" 2>/dev/null \
-      && grep -qi '^strict-transport-security: max-age=31536000' "$tmp"; then
-    ok "Локальный TLS-сайт: сертификат валиден и отдаёт HSTS max-age=31536000"
-  else
-    sed 's/^/     /' "$tmp" | head -8
-    rm -f "$tmp"
-    die "Self-steal сайт не отдал HSTS или сертификат не прошёл проверку."
-  fi
-  rm -f "$tmp"
-  local tls_ver
-  for tls_ver in tls1_2 tls1_3; do
-    echo | timeout 10 openssl s_client -connect 127.0.0.1:9443 \
-      -servername "$SELF_STEAL_HOST" -"$tls_ver" -brief >/dev/null 2>&1 \
-      || die "Локальный TLS-сайт не принимает $tls_ver — проверьте tls protocols в Caddyfile."
-  done
-  ok "Локальный TLS-сайт принимает TLS 1.2 и TLS 1.3"
-}
 
 printf '   %s%sHTTP-слой: :80 и локальный TLS-сайт%s\n' "${C_B:-}" "${C_MAG:-}" "${C_RST:-}"
 verify_http_layer
@@ -4235,6 +5489,18 @@ kv "HTTP 301"       "TCP/80  →  https://$SELF_STEAL_HOST  (путь и query �
 kv "TLS"            "1.2/1.3 + HSTS max-age=31536000 на self-steal сайте"
 kv "Node API"       "$SERVER_IP:$NODE_API_PORT  (только с панели $PANEL_IP)"
 kv "Образ ноды"     "$NODE_IMAGE"
+if [[ -n "${CUSTOM_CORE_URL:-}" ]]; then
+  kv "Xray core"     "кастомный: $CUSTOM_CORE_URL"
+else
+  kv "Xray core"     "штатный из образа"
+fi
+kv "REALITY"        "minClientVer=$REALITY_MIN_CLIENT_VER, XHTTP target=$XHTTP_TARGET"
+if [[ "$ACME_METHOD_USED" == "dns" ]]; then
+  kv "ACME"          "DNS-01 (продление без остановки Caddy)"
+else
+  kv "ACME"          "HTTP-01 (краткий простой 443/tcp при продлении)"
+fi
+kv "Логи Xray"      "stdout: docker logs; файлы: $XRAY_LOG_DIR (logrotate 50M×5)"
 echo
 if (( SELF_STEAL_THEME_USED )); then
   kv "Тема фасада"    "$SELF_STEAL_TEMPLATE"
@@ -4243,7 +5509,7 @@ kv "Config Profile" "$NODE_DIR/Multiselect.json  (вставьте в панел
 kv "Шаблон XRAY"    "$NODE_DIR/Xray_template.json  ($XRAY_TEMPLATE_CHOICE, тег $(panel_node_tag))"
 kv "Лог установки"   "$LOG_FILE"
 kv "Логи ноды"       "docker logs remnanode --tail 120"
-kv "Логи Xray"      "docker exec -it remnanode tail -n +1 -f /var/log/xray/current"
+kv "Логи Xray"      "docker logs remnanode --tail 120; файлы: $XRAY_LOG_DIR/*.log"
 kv "Статус Caddy"    "systemctl status caddy --no-pager"
 kv "Firewall"        "ufw status numbered"
 echo

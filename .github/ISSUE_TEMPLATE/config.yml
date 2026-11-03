@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Безопасность
+    url: https://github.com/bami7up/multi-protocol/blob/main/SECURITY.md
+    about: Уязвимости и утечки секретов — только по SECURITY.md, не публичным issue.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Интеграционная проверка того самого Caddyfile, который генерирует remnanode-setup.sh,
+# Интеграционная проверка Caddyfile, который генерирует lib/50-caddy.sh,
 # на настоящем Caddy из официального релиза (та же версия, что пинит установщик).
 #
 # Статическим разбором нельзя подтвердить требования HTTP-слоя, поэтому проверяем
@@ -88,6 +88,21 @@ else
   esac
   caddy_url="https://github.com/caddyserver/caddy/releases/download/${CADDY_VERSION}/caddy_${CADDY_VERSION#v}_linux_${caddy_arch}.tar.gz"
   curl -fsSL "$caddy_url" -o "$WORK/caddy.tgz" || fail "не удалось скачать $caddy_url"
+  # Проверяем SHA256 из GitHub API (asset digest): CI не должен исполнять
+  # бинарь, подменённый/повреждённый на пути к GitHub Releases. Официальный
+  # checksums.txt в v2.11.7 оказался рассинхронизирован с пересобранным asset,
+  # поэтому берём digest самого asset из API.
+  command -v jq >/dev/null 2>&1 || fail "для проверки SHA256 Caddy нужен jq"
+  caddy_release_url="https://api.github.com/repos/caddyserver/caddy/releases/tags/${CADDY_VERSION}"
+  curl -fsSL "$caddy_release_url" -o "$WORK/caddy-release.json" \
+    || fail "не удалось получить метаданные релиза Caddy $CADDY_VERSION"
+  caddy_expected_sha="$(jq -r --arg n "caddy_${CADDY_VERSION#v}_linux_${caddy_arch}.tar.gz" \
+    '.assets[] | select(.name == $n) | .digest // empty' "$WORK/caddy-release.json")"
+  caddy_expected_sha="${caddy_expected_sha#sha256:}"
+  [[ -n "$caddy_expected_sha" ]] \
+    || fail "в GitHub API нет digest для caddy_${CADDY_VERSION#v}_linux_${caddy_arch}.tar.gz"
+  [[ "$(sha256sum "$WORK/caddy.tgz" | awk '{print $1}')" == "$caddy_expected_sha" ]] \
+    || fail "SHA256 скачанного Caddy не совпал с GitHub API digest"
   tar -xzf "$WORK/caddy.tgz" -C "$WORK" caddy || fail "не удалось распаковать архив Caddy"
   CADDY="$WORK/caddy"
   [[ "$("$CADDY" version | awk '{print $1}')" == "$CADDY_VERSION" ]] \
@@ -95,23 +110,55 @@ else
   ok "скачан официальный Caddy $CADDY_VERSION ($caddy_arch)"
 fi
 
-# 2. Достаём Caddyfile из установщика и подгоняем под локальный тест.
-# Блоков два: основной Caddyfile и (при включённом CDN) дописываемый сайт
-# CDN-хоста — проверяем именно то, что окажется на ноде при CDN-режиме.
-awk '
-  /^[[:space:]]*cat >>? \/etc\/caddy\/Caddyfile <<EOF$/ { f = 1; next }
-  f && /^EOF$/ { f = 0; next }
-  f { print }
-' "$SETUP" > "$WORK/raw"
-[[ -s "$WORK/raw" ]] || fail "в установщике не найден heredoc с Caddyfile"
-grep -q 'VLESS_CDN' "$SETUP" || fail "в установщике нет CDN-инбаундов"
-grep -qF 'CDN_ROUTES_BLOCK' "$SETUP" \
-  || fail "в установщике нет сборщика маршрутов CDN-сайта"
-grep -qF "redir https://\$SELF_STEAL_HOST{uri} permanent" "$WORK/raw" \
+# 2. Генерируем Caddyfile той же функцией, что и установщик (lib/50-caddy.sh).
+for f in "$SRC"/lib/*.sh; do
+  [[ "$(basename "$f")" == "90-main.sh" ]] && continue
+  # shellcheck source=/dev/null
+  . "$f"
+done
+ok() { printf '✔ %s\n' "$*"; }
+
+export CADDYFILE_PATH="$WORK/raw"
+export SELF_STEAL_HOST="test.local"
+export CDN_HOST="cdn.test.local"
+export CDN_TLS_PORT="$CDN_HTTPS_PORT"
+export SELF_STEAL_TLS_PORT="$HTTPS_PORT"
+export SELF_STEAL_HTTP_PORT="$HTTP_PORT"
+export SELF_STEAL_ROOT="$WORK/www"
+export CERT_DIR="$WORK/certs"
+export ENABLE_CDN=1 ENABLE_XHTTP=1
+export XHTTP_SNI="www.gstatic.com"
+export CDN_WS_ENABLED=1 CDN_XHTTP_ENABLED=1 CDN_GRPC_ENABLED=1
+export CDN_WS_PORT="$CDN_WS_PORT" CDN_XHTTP_PORT="$CDN_XHTTP_PORT" CDN_GRPC_PORT="$CDN_GRPC_PORT"
+export CDN_WS_PATH="$CDN_PROBE_WS_PATH" CDN_XHTTP_PATH="$CDN_PROBE_XHTTP_PATH" CDN_GRPC_PATH="$CDN_PROBE_GRPC_PATH"
+render_caddyfile
+[[ -s "$WORK/raw" ]] || fail "render_caddyfile не создал Caddyfile"
+grep -qF "redir https://test.local{uri} permanent" "$WORK/raw" \
   || fail "в генерируемом Caddyfile нет постоянного 301 на :80"
 grep -q 'protocols tls1.2 tls1.3' "$WORK/raw" \
   || fail "в генерируемом Caddyfile не зафиксированы TLS 1.2/1.3"
+if grep -q 'tls internal' "$WORK/raw"; then
+  fail "loopback-сайт для локального XHTTP target появился без выбора local"
+fi
 
+# 2a. Локальный target XHTTP: на 127.0.0.1:9443 должен появиться отдельный
+#     loopback-сайт для XHTTP_SNI с внутренним сертификатом. Публичный
+#     self-steal сайт обслуживает только свой домен.
+export CADDYFILE_PATH="$WORK/raw-local"
+export XHTTP_TARGET="127.0.0.1:9443"
+mkdir -p "$WORK/www"
+render_caddyfile
+[[ -s "$WORK/raw-local" ]] || fail "render_caddyfile не создал Caddyfile для local target"
+grep -qF "https://www.gstatic.com:$HTTPS_PORT {" "$WORK/raw-local" \
+  || fail "нет loopback-сайта для XHTTP_SNI при local target"
+grep -q 'tls internal' "$WORK/raw-local" \
+  || fail "loopback-сайт XHTTP local target должен использовать tls internal"
+grep -qF "root * $WORK/www" "$WORK/raw-local" \
+  || fail "loopback-сайт XHTTP local target не отдаёт фасад"
+export CADDYFILE_PATH="$WORK/raw"
+export XHTTP_TARGET="www.gstatic.com:443"
+
+# Блок layer4 требует caddy-l4; для HTTP-слоя он не нужен.
 awk '
   /layer4 \{/ { skip = 1; depth = 1; next }
   skip {
@@ -120,62 +167,43 @@ awk '
     next
   }
   { print }
-' "$WORK/raw" > "$WORK/stripped"
-if grep -q 'layer4' "$WORK/stripped"; then
+' "$WORK/raw" > "$WORK/Caddyfile"
+if grep -q 'layer4' "$WORK/Caddyfile"; then
   fail "не удалось вырезать блок layer4 из Caddyfile"
 fi
+
 
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 -keyout "$WORK/key.pem" -out "$WORK/fullchain.pem" \
   -subj '/CN=test.local' -addext 'subjectAltName=DNS:test.local' >/dev/null 2>&1 \
   || fail "openssl не смог создать тестовый сертификат"
-mkdir -p "$WORK/www"
+mkdir -p "$WORK/www" "$CERT_DIR/test.local" "$CERT_DIR/cdn.test.local"
 printf 'self-steal facade\n' > "$WORK/www/index.html"
-
-# Сертификат CDN-хоста в тесте — копия тестового: важно, что Caddy грузит его
-# для сайта CDN, а не что он настоящий.
-mkdir -p "$WORK/cdn.test.local"
-cp "$WORK/fullchain.pem" "$WORK/cdn.test.local/fullchain.pem"
-cp "$WORK/key.pem" "$WORK/cdn.test.local/key.pem"
-
-sed -e "s|\\\$SELF_STEAL_HOST|test.local|g" \
-  -e "s|\\\$CDN_HOST|cdn.test.local|g" \
-  -e "s|http://test.local {|http://test.local:$HTTP_PORT {|" \
-  -e "s|:9443 {|:$HTTPS_PORT {|" \
-  -e "s|\\\$CDN_TLS_PORT|$CDN_HTTPS_PORT|g" \
-  -e "s|\\\$CERT_DIR/test.local|$WORK|g" \
-  -e "s|\\\$CERT_DIR/cdn.test.local|$WORK/cdn.test.local|g" \
-  -e "s|\\\$SELF_STEAL_ROOT|$WORK/www|g" \
-  "$WORK/stripped" > "$WORK/Caddyfile"
-
-# Маршруты CDN-сайта установщик собирает в переменную CDN_ROUTES_BLOCK — в
-# тексте heredoc стоит только её имя. Берём сборщик из установщика как есть и
-# подставляем его результат: так проверяются и маршруты, и их пути.
-sed -n '/^  CDN_ROUTES_BLOCK=""/,/^  cat >> \/etc\/caddy\/Caddyfile <<EOF$/p' "$SETUP" \
-  | sed '$d' > "$WORK/cdn-routes.sh"
-grep -q 'xhttpcdn' "$WORK/cdn-routes.sh" \
-  || fail "в сборщике маршрутов CDN нет маршрута XHTTP"
-{
-  set -Eeuo pipefail
-  # Значения читает извлекаемый фрагмент, поэтому здесь они экспортируются.
-  export CDN_WS_ENABLED=1 CDN_XHTTP_ENABLED=1 CDN_GRPC_ENABLED=1
-  export CDN_WS_PATH="$CDN_PROBE_WS_PATH" CDN_XHTTP_PATH="$CDN_PROBE_XHTTP_PATH"
-  export CDN_GRPC_PATH="$CDN_PROBE_GRPC_PATH"
-  export CDN_WS_PORT CDN_XHTTP_PORT CDN_GRPC_PORT
-  # shellcheck source=/dev/null
-  . "$WORK/cdn-routes.sh"
-  printf '%s\n' "$CDN_ROUTES_BLOCK"
-} > "$WORK/cdn-routes.txt"
-[[ -s "$WORK/cdn-routes.txt" ]] || fail "сборщик маршрутов CDN выдал пустой блок"
-awk -v routes="$WORK/cdn-routes.txt" '
-  /\$CDN_ROUTES_BLOCK/ { while ((getline line < routes) > 0) print line; next }
+cp "$WORK/fullchain.pem" "$CERT_DIR/test.local/fullchain.pem"
+cp "$WORK/key.pem" "$CERT_DIR/test.local/key.pem"
+cp "$WORK/fullchain.pem" "$CERT_DIR/cdn.test.local/fullchain.pem"
+cp "$WORK/key.pem" "$CERT_DIR/cdn.test.local/key.pem"
+awk '
+  /layer4 \{/ { skip = 1; depth = 1; next }
+  skip {
+    depth += gsub(/\{/, "{") - gsub(/\}/, "}")
+    if (depth <= 0) { skip = 0 }
+    next
+  }
   { print }
-' "$WORK/Caddyfile" > "$WORK/Caddyfile.with-cdn" && mv "$WORK/Caddyfile.with-cdn" "$WORK/Caddyfile"
+' "$WORK/raw-local" > "$WORK/Caddyfile-local"
+if ! "$CADDY" validate --adapter caddyfile --config "$WORK/Caddyfile-local"; then
+  printf '--- Caddyfile с локальным XHTTP target ---\n'
+  cat "$WORK/Caddyfile-local"
+  fail "Caddy не принял Caddyfile с локальным XHTTP target"
+fi
+ok "Caddyfile с локальным XHTTP target валиден"
+
 grep -qF "@ws path $CDN_PROBE_WS_PATH*" "$WORK/Caddyfile" \
   || fail "маршрут WebSocket CDN попал в Caddyfile не с тем путём"
 grep -qF "@xhttpcdn path $CDN_PROBE_XHTTP_PATH*" "$WORK/Caddyfile" \
   || fail "маршрут XHTTP CDN попал в Caddyfile не с тем путём"
 grep -qF "@grpccdn path $CDN_PROBE_GRPC_PATH/*" "$WORK/Caddyfile" \
-  || fail "маршрут gRPC CDN попал в Caddyfile не с тем serviceName"
+  || fail "маршрут gRPC CDN попал в Caddyfile не с тем путём"
 grep -qF "reverse_proxy @grpccdn h2c://127.0.0.1:$CDN_GRPC_PORT" "$WORK/Caddyfile" \
   || fail "gRPC-маршрут CDN должен вести в Xray по h2c (HTTP/2 без TLS)"
 grep -qF "https://$CDN_HOST:$CDN_HTTPS_PORT {" "$WORK/Caddyfile" \

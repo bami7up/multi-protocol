@@ -18,6 +18,13 @@ jobs:
         # то, что выполняется в сборке (fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 = v5).
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
+      - name: Verify generated installer is up to date
+        # remnanode-setup.sh собирается из lib/*.sh; правка модуля без пересборки
+        # не должна попадать в main.
+        run: |
+          bash build.sh
+          git diff --exit-code -- remnanode-setup.sh
+
       - name: Install validators
         run: |
           sudo apt-get update
@@ -32,6 +39,8 @@ jobs:
         run: |
           bash -n remnanode-setup.sh
           shellcheck -x remnanode-setup.sh
+          bash -n selfcheck.sh
+          shellcheck -x selfcheck.sh
           bash -n tests/caddy-http-checks.sh
           shellcheck -x tests/caddy-http-checks.sh
           bash -n tests/installer-funcs-checks.sh
@@ -208,6 +217,10 @@ jobs:
           #     redirection не меняет права файла, созданного старой версией.
           grep -qF 'chmod 600 "$NODE_DIR/.env"' remnanode-setup.sh \
             || fail ".env ноды не приводится к 0600 при повторном запуске"
+          grep -qF 'chmod 600 "$ENV_STORE"' remnanode-setup.sh \
+            || fail "ENV_STORE не приводится к 0600 (токены при старом 0644)"
+          grep -qF 'install -m 600 "$out_tmp" "$out"' remnanode-setup.sh \
+            || fail "Config Profile с REALITY privateKey пишется не с 0600"
 
           # 16. Подхват переменных в .bashrc ищется фиксированной строкой (-F),
           #     а не как regex, и записывается с кавычками.
@@ -327,7 +340,9 @@ jobs:
           # 34. Проверки профиля покрыты юнит-тестами: шаблон берётся из
           #     репозитория, поэтому переименование tag'а сломает CI, а не
           #     установку на сервере пользователя.
-          grep -qF 'multiselect_filter cdn_transport_enabled write_config_profile' tests/installer-funcs-checks.sh \
+          grep -q '^multiselect_filter() {' lib/30-templates.sh \
+            || fail "нет multiselect_filter в lib/30-templates.sh"
+          grep -q 'multiselect_filter' tests/installer-funcs-checks.sh \
             || fail "multiselect_filter не покрыт tests/installer-funcs-checks.sh"
           bash tests/installer-funcs-checks.sh >/dev/null \
             || fail "tests/installer-funcs-checks.sh не прошёл после правок профиля"
@@ -385,7 +400,9 @@ jobs:
           # 40. CDN-инбаунды есть в профиле, а их состав и пути покрыты тестами.
           grep -qF '"tag": "VLESS_CDN_WS"' Multiselect.json \
             || fail "в Multiselect.json нет CDN-инбаунда VLESS_CDN_WS"
-          grep -qF 'VLESS_CDN' tests/caddy-http-checks.sh \
+          grep -q 'render_caddyfile' tests/caddy-http-checks.sh \
+            || fail "тест Caddy не использует render_caddyfile из lib/"
+          grep -qF 'CDN_PROBE_GRPC_PATH' tests/caddy-http-checks.sh \
             || fail "CDN-маршруты Caddy не покрыты tests/caddy-http-checks.sh"
           bash tests/installer-funcs-checks.sh >/dev/null \
             || fail "tests/installer-funcs-checks.sh не прошёл после правок CDN"
@@ -485,12 +502,12 @@ jobs:
             fail "ошибки создания хостов снова глушатся в /dev/null"
           fi
 
-          # 50. Образ ноды всегда содержит репозиторий (remnawave/node:latest),
+          # 50. Образ ноды всегда содержит репозиторий (remnawave/node:3.4.4),
           #     а не голый тег «latest», который вызывает pull access denied.
           grep -q '^normalize_node_image() {' remnanode-setup.sh \
             || fail "нет normalize_node_image (голый тег в NODE_IMAGE сломает docker compose pull)"
-          grep -qF 'NODE_IMAGE="${NODE_IMAGE:-remnawave/node:latest}"' remnanode-setup.sh \
-            || fail "дефолт NODE_IMAGE не remnawave/node:latest"
+          grep -qF 'NODE_IMAGE="${NODE_IMAGE:-remnawave/node:3.4.4}"' remnanode-setup.sh \
+            || fail "дефолт NODE_IMAGE не remnawave/node:3.4.4"
           if grep -qF 'image: ${NODE_IMAGE:-latest}' remnanode-setup.sh; then
             fail "в docker-compose.yml вернулся голый образ latest без репозитория"
           fi
@@ -528,3 +545,90 @@ jobs:
             || fail "выбор шаблона XRAY_TEMPLATE_CHOICE снова спрятан от быстрого режима"
 
           echo "✔ инварианты переменных окружения на месте"
+
+          # 54. Панель: 200 с response:null — ошибка, а 202 action-endpoint —
+          #     успех без повторов; multi-node не перезаписывает чужую ноду.
+          if grep -qF 'or has("response")' remnanode-setup.sh; then
+            fail "panel_api_success снова считает response:null успехом"
+          fi
+          grep -q '^panel_find_node_by_name() {' remnanode-setup.sh \
+            || fail "нет panel_find_node_by_name (конфликт имени ноды)"
+          grep -q '^panel_profile_node_uuids() {' remnanode-setup.sh \
+            || fail "нет panel_profile_node_uuids (защита чужого профиля)"
+          grep -qF 'select(.name == "Default-Squad")' remnanode-setup.sh \
+            || fail "Internal Squad снова берётся первым, а не Default-Squad"
+          grep -qF 'panel_api POST "/nodes/$node_uuid/actions/restart"' remnanode-setup.sh \
+            || fail "restart ноды не использует прямой POST (202 может ретраиться)"
+
+          # 55. Публичная панель только по HTTPS; http разрешён лишь локально.
+          grep -qF 'if [[ "$scheme" == http ]]' remnanode-setup.sh \
+            || fail "нормализация URL панели не проверяет http-схему"
+          grep -qF 'MULTISELECT_TEMPLATE_URL" == https://*' remnanode-setup.sh \
+            || fail "MULTISELECT_TEMPLATE_URL не требует https"
+          grep -qF 'is_safe_path "$CERT_DIR"' remnanode-setup.sh \
+            || fail "CERT_DIR не валидируется перед подстановкой в Caddyfile"
+          grep -qF 'admin off' remnanode-setup.sh \
+            || fail "Caddy admin API не отключён"
+
+          # 56. Внешние install-скрипты и CI-бинарь Caddy проверяются по SHA256.
+          grep -qF 'DOCKER_INSTALL_SHA256' remnanode-setup.sh \
+            || fail "Docker install script не закреплён по SHA256"
+          grep -qF 'ACME_INSTALL_SHA256' remnanode-setup.sh \
+            || fail "acme.sh install script не закреплён по SHA256"
+          grep -qF 'caddy_expected_sha' tests/caddy-http-checks.sh \
+            || fail "CI не проверяет SHA256 скачанного Caddy"
+
+          # 57. --uninstall/--dry-run защищены от удаления / и /etc.
+          grep -q '^uninstall_node() {' remnanode-setup.sh \
+            || fail "нет uninstall_node"
+          grep -q '^is_safe_remove_path() {' remnanode-setup.sh \
+            || fail "нет is_safe_remove_path (--uninstall может удалить /)"
+          grep -q -- '--uninstall' remnanode-setup.sh \
+            || fail "--uninstall не описан"
+          grep -q -- '--dry-run' remnanode-setup.sh \
+            || fail "--dry-run не описан"
+
+          echo "✔ инварианты панели и hardening на месте"
+
+          # 58. Управляемые параметры из плана улучшений: ACME без простоя,
+          #     настраиваемые minClientVer/XHTTP target, логи Xray, selfcheck
+          #     и режим «свой сайт» не должны тихо исчезнуть.
+          grep -q '^acme_method_resolved() {' remnanode-setup.sh \
+            || fail "нет выбора ACME_METHOD (DNS-01/HTTP-01)"
+          grep -q '^issue_cert_selected() {' remnanode-setup.sh \
+            || fail "сертификаты self-steal/HY не используют ACME_METHOD"
+          grep -qF 'REALITY_MIN_CLIENT_VER="${REALITY_MIN_CLIENT_VER:-0.0.0}"' remnanode-setup.sh \
+            || fail "minClientVer не настраивается или дефолт перестал быть 0.0.0"
+          grep -qF 'XHTTP_TARGET' remnanode-setup.sh \
+            || fail "XHTTP target не настраивается"
+          grep -q '^is_xhttp_target_local() {' remnanode-setup.sh \
+            || fail "нет определения локального XHTTP target"
+          grep -qF 'tls internal' remnanode-setup.sh \
+            || fail "нет loopback-сайта Caddy для локального XHTTP target"
+          grep -qF 'remnanode-xray' remnanode-setup.sh \
+            || fail "нет logrotate для файловых логов Xray"
+          grep -qF 'XRAY_LOG_DIR' remnanode-setup.sh \
+            || fail "нет каталога логов Xray на хосте"
+          grep -qF 'SELF_STEAL_TEMPLATE_NONE' remnanode-setup.sh \
+            || fail "нет режима «свой сайт» (SELF_STEAL_TEMPLATE=none)"
+          grep -q '^run_reconfigure() {' remnanode-setup.sh \
+            || fail "нет интерактивного --reconfigure"
+          grep -q '^reconfigure_apply() {' remnanode-setup.sh \
+            || fail "нет применения изменений --reconfigure"
+          grep -q -- '--reconfigure' remnanode-setup.sh \
+            || fail "--reconfigure не описан"
+          grep -q '^normalize_custom_core_url() {' remnanode-setup.sh \
+            || fail "нет нормализации CUSTOM_CORE_URL"
+          grep -qF 'CUSTOM_CORE_URL=${CUSTOM_CORE_URL:-}' remnanode-setup.sh \
+            || fail "CUSTOM_CORE_URL не передаётся в docker-compose"
+          grep -qF -- '--custom-core-url' remnanode-setup.sh \
+            || fail "--custom-core-url не описан"
+          grep -qF 'acme.sh --cron' selfcheck.sh \
+            || fail "selfcheck.sh не подсказывает про acme.sh --cron"
+          grep -qF '526' selfcheck.sh \
+            || fail "selfcheck.sh не проверяет CDN 526/525"
+          if grep -qF 'image: ${NODE_IMAGE:-latest}' remnanode-setup.sh; then
+            fail "вернулся голый latest в compose"
+          fi
+
+          echo "✔ инварианты плана улучшений на месте"

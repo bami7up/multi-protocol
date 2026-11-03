@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Юнит-проверки чистых функций валидации из remnanode-setup.sh.
-# Функции извлекаются из установщика и выполняются здесь, чтобы регрессия
+# Юнит-проверки функций установщика.
+# Функции импортируются из lib/*.sh (без sed-извлечения), чтобы регрессия
 # (например, «висячие» одинарные двоеточия в is_ipv6 или отвергание punycode
 # TLD в is_fqdn) ломала CI, а не сервер пользователя.
 # shellcheck disable=SC2030,SC2031
@@ -12,32 +12,35 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 fail() { printf '✖ %s\n' "$*" >&2; exit 1; }
-ok()   { printf '✔ %s\n' "$*"; }
 
 [[ -r "$SETUP" ]] || fail "не найден $SETUP"
 
-for fn in is_ipv4 is_ipv6 is_private_ipv4 is_fqdn is_safe_xhttp_path \
-           acme_cert_days_left cf_rand_index cf_make_hosts cf_valid_saved_host \
-           multiselect_filter cdn_transport_enabled write_config_profile self_steal_template_url \
-           self_steal_template_list random_hex gen_random_api_path random_node_port \
-           normalize_node_image normalize_domain_input normalize_panel_url panel_url_host resolve_ipv4_host; do
-  sed -n "/^${fn}() {\$/,/^}\$/p" "$SETUP" > "$WORK/$fn.sh"
-  grep -q "^${fn}() {" "$WORK/$fn.sh" || fail "не удалось извлечь $fn из установщика"
-  grep -q '^}$' "$WORK/$fn.sh" || fail "тело $fn обрезано (нет закрывающей скобки)"
+# Источник истины — lib/*.sh. Тесты не извлекают функции sed-ом.
+for f in "$SRC"/lib/*.sh; do
+  [[ "$(basename "$f")" == "90-main.sh" ]] && continue
   # shellcheck source=/dev/null
-  . "$WORK/$fn.sh"
+  . "$f"
 done
-ok "функции валидации извлечены из установщика"
 
-# Словари генератора случайных хостов Cloudflare (однострочные массивы).
-grep -E '^CF_HOST_(ADJ|NOUN)=\(' "$SETUP" > "$WORK/cf-arrays.sh"
-grep -q '^CF_HOST_ADJ=(' "$WORK/cf-arrays.sh" || fail "нет словаря CF_HOST_ADJ"
-grep -q '^CF_HOST_NOUN=(' "$WORK/cf-arrays.sh" || fail "нет словаря CF_HOST_NOUN"
-# shellcheck source=/dev/null
-. "$WORK/cf-arrays.sh"
+# Стабы окружения: функции lib используют их во время тестов.
+ok()   { printf '✔ %s\n' "$*"; }
+log()  { :; }
+warn() { :; }
+note() { :; }
+die()  {
+  if [[ -n "${CF_CURL_CFG:-}" && -f "$CF_CURL_CFG" ]]; then rm -f "$CF_CURL_CFG"; fi
+  printf 'die: %s\n' "$*" >&2
+  exit 1
+}
+have() { return 0; }
+# shellcheck disable=SC2317
+sleep() { :; }
+dig()  { printf '%s\n' "${SERVER_IP:-}"; }
+ok "lib/ загружен: функции валидации, Cloudflare, шаблоны, панель, Caddy и сертификаты"
+
 (( ${#CF_HOST_ADJ[@]} >= 16 && ${#CF_HOST_NOUN[@]} >= 16 )) \
   || fail "словари генератора слишком малы: ${#CF_HOST_ADJ[@]}/${#CF_HOST_NOUN[@]}"
-ok "словари генератора хостов извлечены (${#CF_HOST_ADJ[@]} прилагательных, ${#CF_HOST_NOUN[@]} существительных)"
+ok "словари генератора хостов загружены (${#CF_HOST_ADJ[@]} прилагательных, ${#CF_HOST_NOUN[@]} существительных)"
 
 expect_valid()   { if ! "$@"; then fail "должно быть валидно: $*"; fi; }
 expect_invalid() { if "$@"; then fail "должно быть невалидно: $*"; fi; }
@@ -94,6 +97,34 @@ expect_invalid is_private_ipv4 '100.128.0.1'
 expect_invalid is_private_ipv4 '192.169.0.1'
 expect_invalid is_private_ipv4 ''
 ok "is_private_ipv4"
+
+# --- is_private_ipv6: http:// до локальной панели ---
+expect_valid   is_private_ipv6 '::1'
+expect_valid   is_private_ipv6 'fe80::1'
+expect_valid   is_private_ipv6 'fd00::1'
+expect_invalid is_private_ipv6 '2001:db8::1'
+expect_invalid is_private_ipv6 ''
+ok "is_private_ipv6"
+
+# --- is_safe_path: CERT_DIR подставляется в Caddyfile ---
+expect_valid   is_safe_path '/etc/remna-certs'
+expect_valid   is_safe_path '/opt/my certs'
+expect_invalid is_safe_path 'relative/path'
+expect_invalid is_safe_path '/etc/foo"bar'
+expect_invalid is_safe_path $'/etc/foo\nbar'
+expect_invalid is_safe_path '/etc/foo\\bar'
+ok "is_safe_path"
+
+# --- is_safe_remove_path: --uninstall не должен удалять / или /etc ---
+expect_valid   is_safe_remove_path '/opt/remnanode'
+expect_valid   is_safe_remove_path '/etc/remna-certs'
+expect_valid   is_safe_remove_path '/root/remnanode.env'
+expect_invalid is_safe_remove_path '/'
+expect_invalid is_safe_remove_path '/etc'
+expect_invalid is_safe_remove_path '/opt'
+expect_invalid is_safe_remove_path '/opt/../etc'
+expect_invalid is_safe_remove_path 'relative/path'
+ok "is_safe_remove_path"
 
 # --- is_fqdn, включая punycode TLD (регрессия P2-8) ---
 expect_valid   is_fqdn 'example.com'
@@ -158,34 +189,7 @@ expect_invalid cf_valid_saved_host 'quiet-otter.example.com' ''
 ok "cf_valid_saved_host"
 
 # --- Cloudflare: оркестровка cf_setup_hosts на моках API (без сети) ---
-# Проверяется реальный порядок действий: зона → свободность имён → создание/
-# обновление A-записей DNS-only → ожидание DNS, а также что die срабатывает
-# при ошибке API, отсутствии зоны и исчерпании перебора имён. curl подменяется
-# моком ПОСЛЕ извлечения функций.
-for fn in cf_api cf_json_success cf_json_error cf_curl_cfg_init \
-         cf_check_token_zone cf_upsert_a cf_a_exists cf_setup_hosts cf_zone_id_for_host \
-         cf_setup_cdn_host; do
-  sed -n "/^${fn}() {\$/,/^}\$/p" "$SETUP" > "$WORK/$fn.sh"
-  grep -q "^${fn}() {" "$WORK/$fn.sh" || fail "не удалось извлечь $fn из установщика"
-  # shellcheck source=/dev/null
-  . "$WORK/$fn.sh"
-done
-
-# Стабы окружения установщика: вывод, проверка утилит, dig (отвечает текущим
-# IP). Функции вывода log/warn/note объявлены здесь, а ok/fail уже есть сверху
-# и переопределять их нельзя — shellcheck считает вызовы до позднего
-# переопределения ошибкой (SC2218), и вывод кейсов нам всё равно нужен.
-log()  { :; }
-warn() { :; }
-note() { :; }
-die()  {
-  if [[ -n "${CF_CURL_CFG:-}" && -f "$CF_CURL_CFG" ]]; then rm -f "$CF_CURL_CFG"; fi
-  printf 'die: %s\n' "$*" >&2
-  exit 1
-}
-have() { return 0; }
-dig()  { printf '%s\n' "$SERVER_IP"; }
-
+# Функции cf_* уже загружены из lib/; curl/выход подменяются ниже.
 CF_MOCK_LOG="$WORK/cf-mock.log"
 CF_MOCK_ZONE_FOUND=1
 CF_MOCK_ZONE_NAME=example.com
@@ -393,10 +397,6 @@ ok "cf_setup_cdn_host: --no-cloudflare не трогает Cloudflare API"
 
 # Мастер обязан предлагать уникальный CDN-домен для каждой ноды сам
 # (cdn-<6 hex>.<базовый домен> — без коллизии между несколькими нодами на домене).
-sed -n '/^gen_cdn_host() {$/,/^}$/p' "$SETUP" > "$WORK/gen_cdn_host.sh"
-grep -q '^gen_cdn_host() {' "$WORK/gen_cdn_host.sh" || fail "не найдена функция gen_cdn_host"
-# shellcheck source=/dev/null
-. "$WORK/gen_cdn_host.sh"
 cdn_gen_1="$(gen_cdn_host "example.com")"
 cdn_gen_2="$(gen_cdn_host "example.com")"
 [[ "$cdn_gen_1" =~ ^cdn-[0-9a-f]{6}\.example\.com$ ]] \
@@ -404,7 +404,7 @@ cdn_gen_2="$(gen_cdn_host "example.com")"
 [[ "$cdn_gen_1" != "$cdn_gen_2" ]] \
   || fail "gen_cdn_host сгенерировал одинаковый домен дважды подряд: $cdn_gen_1"
 # shellcheck disable=SC2016
-grep -qF 'gen_cdn_host "${BASE_DOMAIN:-}"' "$SETUP" \
+grep -qF 'gen_cdn_host "${BASE_DOMAIN:-}"' "$SRC/lib/15-wizard.sh" \
   || fail "мастер не предлагает уникальный CDN-домен через gen_cdn_host"
 ok "CDN_HOST: по умолчанию генерируется уникальный cdn-<hex6>.<BASE_DOMAIN> на каждую ноду"
 
@@ -422,13 +422,24 @@ ok "CDN_HOST: по умолчанию генерируется уникальн�
   || fail "normalize_panel_url: без схемы должен добавляться https://"
 [[ "$(normalize_panel_url 'https://panel.example.com/')" == "https://panel.example.com" ]] \
   || fail "normalize_panel_url: хвостовой слэш не срезан"
-[[ "$(normalize_panel_url 'http://203.0.113.5:3000/')" == "http://203.0.113.5:3000" ]] \
-  || fail "normalize_panel_url: http с IP и портом должен сохраняться"
+[[ "$(normalize_panel_url 'http://127.0.0.1:3000/')" == "http://127.0.0.1:3000" ]] \
+  || fail "normalize_panel_url: http для localhost/private должен сохраняться"
+[[ "$(normalize_panel_url 'HTTPS://panel.example.com')" == "https://panel.example.com" ]] \
+  || fail "normalize_panel_url: схема в верхнем регистре не нормализуется"
+if normalize_panel_url 'http://panel.example.com' >/dev/null; then
+  fail "normalize_panel_url: публичный http:// принят (токен ушёл бы открыто)"
+fi
 if normalize_panel_url 'ftp://panel.example.com' >/dev/null; then
   fail "normalize_panel_url: чужая схема принята"
 fi
 if normalize_panel_url 'https://panel.example.com/login' >/dev/null; then
   fail "normalize_panel_url: URL с путём принят"
+fi
+if normalize_panel_url 'https://panel.example.com:99999' >/dev/null; then
+  fail "normalize_panel_url: порт вне диапазона принят"
+fi
+if normalize_panel_url 'https://panel.example.com:' >/dev/null; then
+  fail "normalize_panel_url: пустой порт принят"
 fi
 if normalize_panel_url 'https://' >/dev/null; then
   fail "normalize_panel_url: пустой хост принят"
@@ -588,6 +599,8 @@ export ENABLE_XHTTP=1
 export ENABLE_CDN=0
 write_config_profile >/dev/null
 [[ -f "$NODE_DIR/Multiselect.json" ]] || fail "Config Profile не сохранён в $NODE_DIR"
+[[ "$(stat -c '%a' "$NODE_DIR/Multiselect.json")" == "600" ]] \
+  || fail "Config Profile с REALITY privateKey должен быть 0600, а не $(stat -c '%a' "$NODE_DIR/Multiselect.json")"
 jq -e . "$NODE_DIR/Multiselect.json" >/dev/null \
   || fail "сохранённый Config Profile — не валидный JSON"
 [[ "$(jq -c '[.inbounds[].tag]' "$NODE_DIR/Multiselect.json")" == '["REALITY_VISION","REALITY_XHTTP","HYSTERIA2"]' ]] \
@@ -605,22 +618,12 @@ write_config_profile >/dev/null
 ok "write_config_profile: профиль сохранён в NODE_DIR/Multiselect.json"
 
 # --- условный L4-маршрут XHTTP в Caddyfile ---
-# Фрагмент извлекается из установщика как есть: с выключенным XHTTP Caddy не
-# должен уводить SNI XHTTP в 127.0.0.1:10444, где после отключения inbound'а
-# никто не слушает (иначе проверка TLS-маршрутов уронит установку).
-sed -n '/^XHTTP_L4_BLOCK=""/,/^fi$/p' "$SETUP" > "$WORK/l4-block.sh"
-grep -q '^XHTTP_L4_BLOCK=""' "$WORK/l4-block.sh" || fail "не удалось извлечь генерацию L4-блока XHTTP"
-grep -q '^fi$' "$WORK/l4-block.sh" || fail "фрагмент генерации L4-блока обрезан (нет fi)"
+# С выключенным XHTTP Caddy не должен уводить SNI XHTTP в 127.0.0.1:10444,
+# где после отключения inbound'а никто не слушает.
 export XHTTP_SNI=www.gstatic.com
 l4_block_with_xhttp() {
   local enable="$1"
-  (
-    set -Eeuo pipefail
-    ENABLE_XHTTP="$enable"
-    # shellcheck source=/dev/null
-    . "$WORK/l4-block.sh"
-    printf '%s' "$XHTTP_L4_BLOCK"
-  )
+  ( ENABLE_XHTTP="$enable"; xhttp_l4_block )
 }
 [[ "$(l4_block_with_xhttp 1)" == *"@xhttp tls sni www.gstatic.com"* ]] \
   || fail "с включённым XHTTP L4-маршрут XHTTP не генерируется"
@@ -629,27 +632,16 @@ l4_block_with_xhttp() {
 ok "Caddyfile: L4-маршрут XHTTP появляется только при включённом XHTTP"
 
 # --- условный L4-маршрут CDN ---
-# Тот же приём: без ENABLE_CDN Caddy не должен уводить SNI CDN-хоста на
-# 127.0.0.1:9444 (там нет сайта и сертификата).
-sed -n '/^CDN_L4_BLOCK=""/,/^fi$/p' "$SETUP" > "$WORK/l4-cdn.sh"
-grep -q '^CDN_L4_BLOCK=""' "$WORK/l4-cdn.sh" || fail "не удалось извлечь генерацию L4-блока CDN"
-grep -q '^fi$' "$WORK/l4-cdn.sh" || fail "фрагмент генерации L4-блока CDN обрезан (нет fi)"
-cdn_l4_block() {
+# Без ENABLE_CDN Caddy не должен уводить SNI CDN-хоста на 127.0.0.1:9444.
+cdn_block_test() {
   local enable="$1"
-  (
-    set -Eeuo pipefail
-    # Значения читает извлекаемый фрагмент, поэтому здесь они экспортируются.
-    export ENABLE_CDN="$enable" CDN_HOST=cdn.example.com CDN_TLS_PORT=9444
-    # shellcheck source=/dev/null
-    . "$WORK/l4-cdn.sh"
-    printf '%s' "$CDN_L4_BLOCK"
-  )
+  ( export ENABLE_CDN="$enable" CDN_HOST=cdn.example.com CDN_TLS_PORT=9444; cdn_l4_block )
 }
-[[ "$(cdn_l4_block 1)" == *"@cdn tls sni cdn.example.com"* ]] \
+[[ "$(cdn_block_test 1)" == *"@cdn tls sni cdn.example.com"* ]] \
   || fail "с включённым CDN L4-маршрут CDN не генерируется"
-[[ "$(cdn_l4_block 1)" == *"proxy 127.0.0.1:9444"* ]] \
+[[ "$(cdn_block_test 1)" == *"proxy 127.0.0.1:9444"* ]] \
   || fail "L4-маршрут CDN ведёт не на CDN-сайт Caddy"
-[[ -z "$(cdn_l4_block 0)" ]] \
+[[ -z "$(cdn_block_test 0)" ]] \
   || fail "с выключенным CDN L4-маршрут CDN всё ещё генерируется"
 ok "Caddyfile: L4-маршрут CDN появляется только при включённом CDN"
 
@@ -658,10 +650,6 @@ unset SELF_STEAL_HOST HY_HOST XHTTP_SNI XHTTP_PATH CERT_DIR ENABLE_XHTTP NODE_DI
 # --- self_steal_template_url: тема фасада → URL шаблона ---
 # Список тем в установщике обязан совпадать с файлами self-steal-templates/:
 # иначе --self-steal-template NAME дал бы 404 прямо на ноде.
-grep -E '^SELF_STEAL_(RAW_BASE|TEMPLATES)=' "$SETUP" > "$WORK/self-steal.sh"
-grep -q '^SELF_STEAL_TEMPLATES=(' "$WORK/self-steal.sh" || fail "нет списка тем self-steal"
-# shellcheck source=/dev/null
-. "$WORK/self-steal.sh"
 mapfile -t theme_names < <(self_steal_template_list)
 (( ${#theme_names[@]} >= 2 )) || fail "список тем self-steal пуст"
 themes_checked=0
@@ -685,19 +673,13 @@ ok "self_steal_template_url: $themes_checked тем совпадают с фай
 
 # Резолвер темы из шага 1 установщика: тема → URL, явный URL важнее темы,
 # чужое имя останавливает установку со списком доступных тем.
-sed -n "/^# Тема фасада → URL шаблона/,/^fi\$/p" "$SETUP" > "$WORK/resolve-theme.sh"
-grep -q 'self_steal_template_url' "$WORK/resolve-theme.sh" \
-  || fail "не удалось извлечь резолвер темы из установщика"
-grep -q 'if \[\[ -z' "$WORK/resolve-theme.sh" \
-  || fail "в извлечённом резолвере нет условия (извлекли не тот фрагмент)"
 resolve_theme() { # resolve_theme <тема> <явный URL> → «URL|признак использования темы»
   (
     set -Eeuo pipefail
     export SELF_STEAL_TEMPLATE="$1"
     export SELF_STEAL_TEMPLATE_URL="$2"
     export SELF_STEAL_THEME_USED=0
-    # shellcheck source=/dev/null
-    . "$WORK/resolve-theme.sh"
+    resolve_self_steal_template
     printf '%s|%s' "$SELF_STEAL_TEMPLATE_URL" "$SELF_STEAL_THEME_USED"
   )
 }
@@ -712,7 +694,90 @@ grep -q 'Неизвестная тема self-steal: no-such-theme' "$WORK/theme
   || fail "нет понятной ошибки про неизвестную тему: $(cat "$WORK/theme-err")"
 grep -qF vaultdrop "$WORK/theme-err" \
   || fail "в ошибке не перечислены доступные темы: $(cat "$WORK/theme-err")"
-ok "резолвер темы: тема → URL, явный URL важнее, чужое имя → die со списком тем"
+[[ "$(resolve_theme none '')" == '|0' ]] \
+  || fail "тема none должна оставлять SELF_STEAL_TEMPLATE_URL пустым (свой сайт), получено: $(resolve_theme none '')"
+ok "резолвер темы: тема → URL, явный URL важнее, none → свой сайт, чужое имя → die со списком тем"
+
+# --- REALITY minClientVer и XHTTP target ------------------------------------
+expect_valid   is_client_version '0.0.0'
+expect_valid   is_client_version '26.3.27'
+expect_invalid is_client_version '26.3'
+expect_invalid is_client_version '26.3.27.1'
+expect_invalid is_client_version 'latest'
+expect_invalid is_client_version ''
+[[ "$(normalize_client_version '')" == '0.0.0' ]] \
+  || fail "пустой minClientVer должен давать 0.0.0"
+[[ "$(normalize_client_version ' 26.3.27 ')" == '26.3.27' ]] \
+  || fail "minClientVer с пробелами не нормализуется"
+if normalize_client_version '26.3' >/dev/null; then
+  fail "неполная версия клиента принимается"
+fi
+ok "minClientVer: x.y.z валиден, пусто → 0.0.0, мусор отвергается"
+
+expect_valid   is_host_port 'www.gstatic.com:443'
+expect_valid   is_host_port '1.2.3.4:8443'
+expect_invalid is_host_port 'www.gstatic.com'
+expect_invalid is_host_port 'www.gstatic.com:0'
+expect_invalid is_host_port 'www.gstatic.com:70000'
+expect_invalid is_host_port 'bad host:443'
+[[ "$(normalize_xhttp_target '')" == 'www.gstatic.com:443' ]] \
+  || fail "пустой XHTTP_TARGET должен давать внешний target по умолчанию"
+[[ "$(export SELF_STEAL_TLS_PORT=9555; normalize_xhttp_target self)" == '127.0.0.1:9555' ]] \
+  || fail "XHTTP_TARGET=self должен вести на локальный self-steal порт"
+[[ "$(export SELF_STEAL_TLS_PORT=9555; normalize_xhttp_target local)" == '127.0.0.1:9555' ]] \
+  || fail "XHTTP_TARGET=local должен вести на локальный self-steal порт"
+XHTTP_TARGET=127.0.0.1:9443 is_xhttp_target_local \
+  || fail "is_xhttp_target_local не распознал loopback target"
+if XHTTP_TARGET=www.gstatic.com:443 is_xhttp_target_local; then
+  fail "is_xhttp_target_local считает внешний target локальным"
+fi
+if normalize_xhttp_target 'no-port' >/dev/null; then
+  fail "XHTTP_TARGET без порта принимается"
+fi
+ok "XHTTP_TARGET: host:port валиден, self/local → 127.0.0.1:<self-steal>, мусор отвергается"
+
+# --- ACME method selection ---------------------------------------------------
+[[ "$(ACME_METHOD=auto CLOUDFLARE_API_TOKEN=tok acme_method_resolved)" == 'dns' ]] \
+  || fail "ACME_METHOD=auto с токеном должен выбирать DNS-01"
+[[ "$(ACME_METHOD=auto CLOUDFLARE_API_TOKEN='' acme_method_resolved)" == 'http' ]] \
+  || fail "ACME_METHOD=auto без токена должен выбирать HTTP-01"
+[[ "$(ACME_METHOD=http CLOUDFLARE_API_TOKEN=tok acme_method_resolved)" == 'http' ]] \
+  || fail "явный ACME_METHOD=http переопределяется"
+[[ "$(ACME_METHOD=dns CLOUDFLARE_API_TOKEN='' acme_method_resolved)" == 'dns' ]] \
+  || fail "явный ACME_METHOD=dns переопределяется"
+ok "ACME_METHOD: auto → dns при токене, http без токена, явные значения сохраняются"
+
+# issue_cert_selected: auto сначала пробует DNS-01, а при отказе (токен не видит
+# зону домена) откатывается на HTTP-01; явный dns не откатывается.
+run_selected() { # <ACME_METHOD> <токен> <код issue_cert_dns>
+  (
+    set -Eeuo pipefail
+    export ACME_METHOD="$1" CLOUDFLARE_API_TOKEN="$2"
+    dns_rc="$3"
+    # shellcheck disable=SC2317,SC2329
+    issue_cert_dns() { printf 'dns'; return "$dns_rc"; }
+    # shellcheck disable=SC2317,SC2329
+    issue_cert()     { printf 'http'; }
+    issue_cert_selected example.com
+  )
+}
+[[ "$(run_selected auto tok 0)" == 'dns' ]]   || fail "auto+token должен пытаться через DNS-01"
+[[ "$(run_selected auto tok 1)" == 'dnshttp' ]]   || fail "auto должен откатываться на HTTP-01 при отказе DNS-01"
+if run_selected dns tok 1 >/dev/null 2>&1; then
+  fail "явный ACME_METHOD=dns не должен откатываться на HTTP-01"
+fi
+ok "issue_cert_selected: auto откатывается на HTTP-01, явный dns — нет"
+
+# --- Уникальный NODE_TAG: одинаковый PREFIX на разных IP не смешивает ноды ---
+tag_a="$(NODE_TAG='' SERVER_IP='203.0.113.10' VLESS_HOST='usa1.example.com' panel_node_tag)"
+tag_b="$(NODE_TAG='' SERVER_IP='198.51.100.42' VLESS_HOST='usa1.example.com' panel_node_tag)"
+[[ "$tag_a" != "$tag_b" ]] \
+  || fail "две ноды с одинаковым PREFIX получили один тег: $tag_a"
+[[ "$tag_a" == USA1_* && "$tag_b" == USA1_* ]] \
+  || fail "авто-тег потерял читаемый префикс: $tag_a / $tag_b"
+[[ "$(NODE_TAG='MANUAL' SERVER_IP='203.0.113.10' VLESS_HOST='usa1.example.com' panel_node_tag)" == 'MANUAL' ]] \
+  || fail "явно заданный NODE_TAG не должен дополняться суффиксом"
+ok "NODE_TAG: авто-тег уникален по адресу ноды, явный тег не переписывается"
 
 # --- acme_cert_days_left: повторный запуск не должен «пропускать» битый
 #     или истекающий сертификат (регрессия P2-2) ---
@@ -748,23 +813,45 @@ if acme_cert_days_left 'corrupt.test'; then
 fi
 ok "acme_cert_days_left: свежий учитывается, битый/отсутствующий требует перевыпуска"
 
+# --- issue_cert_dns: ротация CF-токена должна перевыпустить сертификат -------
+# acme.sh сохраняет CF_Token в своём конфиге; если токен сменился, простой
+# «сертификат ещё валиден — пропускаю» оставил бы cron со старым токеном.
+ACME="$WORK/acme/fake-acme.sh"
+export ISSUE_LOG="$WORK/acme/issues.log"
+export FAKE_DOMAIN="dns.test"
+: > "$ISSUE_LOG"
+cat > "$ACME" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "--list" ]]; then
+  printf 'Main_Domain\tKeyLength\tSAN_Domains\tCA\tCreated\tRenew\n'
+  printf '%s\n' "${FAKE_DOMAIN:-}"
+  exit 0
+fi
+printf '%s\n' "$*" >> "${ISSUE_LOG:?}"
+exit 0
+SH
+chmod +x "$ACME"
+mkcert 'dns.test' 90
+export CLOUDFLARE_API_TOKEN="token-one"
+issue_cert_dns 'dns.test' >/dev/null || fail "issue_cert_dns: первый выпуск упал"
+[[ "$(wc -l < "$ISSUE_LOG")" == "1" ]] || fail "issue_cert_dns: первый выпуск не вызвал acme.sh"
+grep -q -- '--force' "$ISSUE_LOG" || fail "issue_cert_dns: без маркера токена не форсирует выпуск"
+issue_cert_dns 'dns.test' >/dev/null || fail "issue_cert_dns: повторный вызов упал"
+[[ "$(wc -l < "$ISSUE_LOG")" == "1" ]] \
+  || fail "issue_cert_dns: повторный вызов с тем же токеном зря перевыпускает"
+export CLOUDFLARE_API_TOKEN="token-two"
+issue_cert_dns 'dns.test' >/dev/null || fail "issue_cert_dns: смена токена упала"
+[[ "$(wc -l < "$ISSUE_LOG")" == "2" ]] \
+  || fail "issue_cert_dns: смена CF-токена не перевыпустила сертификат (старые креды останутся в cron)"
+ok "issue_cert_dns: смена CF-токена перевыпускает сертификат, тот же токен — пропускает"
+unset CLOUDFLARE_API_TOKEN
+
 
 # --- Panel API: HTTP-код обязан доживать до panel_api_success ---
 # Регрессия: panel_api вызывается через $(...), и выставленный внутри подоболочки
 # PANEL_HTTP_CODE не возвращался вызывающему. Из-за этого panel_api_success
 # всегда видел «000» и считал ошибкой даже 200 с валидным токеном («не удалось
 # подключиться к панели» при заведомо рабочем токене).
-for fn in panel_curl_cfg_init panel_http_code_file panel_http_error_file panel_state_init panel_api_code panel_api \
-         panel_api_success panel_api_error panel_check_connection \
-         panel_connection_hint panel_api_retry \
-         panel_fetch_node_secret \
-         panel_profile_name panel_result_uuid panel_try_host \
-         panel_find_profile_by_name json5_to_json; do
-  sed -n "/^${fn}() {\$/,/^}\$/p" "$SETUP" > "$WORK/panel-$fn.sh"
-  grep -q "^${fn}() {" "$WORK/panel-$fn.sh" || fail "не удалось извлечь $fn из установщика"
-  # shellcheck source=/dev/null
-  . "$WORK/panel-$fn.sh"
-done
 
 PANEL_STATE_DIR="$WORK/panel-state"
 mkdir -p "$PANEL_STATE_DIR"
@@ -789,8 +876,6 @@ PANEL_MOCK_PROFILES_CODE=200
 PANEL_MOCK_NODES_CODE=200
 PANEL_MOCK_RC=0
 PANEL_MOCK_ERR=""
-sleep() { :; }
-
 panel_mock_reset() {
   export PANEL_HTTP_BODY=""
   export PANEL_HTTP_CODE_FILE=""
@@ -821,6 +906,18 @@ panel_check_connection \
 grep -q '^header = "Authorization: Bearer eyJ' "$PANEL_CURL_CFG" \
   || fail "panel_curl_cfg_init: токен не попал в curl config"
 ok "panel_api: HTTP-код и токен доходят до проверки (регрессия ложного «не удалось подключиться»)"
+
+# 200 с response:null и текстом ошибки — это не успех (раньше has("response")
+# делал такой ответ «успешным», и auto-setup рапортовал о создании хостов).
+panel_mock_reset
+printf '200' > "$(panel_http_code_file)"
+if panel_api_success '{"response":null,"message":"Forbidden"}'; then
+  fail "panel_api_success: response:null с ошибкой принят как успех"
+fi
+if panel_api_success '{"data":null}'; then
+  fail "panel_api_success: data:null принят как успех"
+fi
+ok "panel_api_success: null response/data не считается успехом"
 
 panel_mock_reset
 PANEL_MOCK_PROFILES_CODE=401
@@ -933,6 +1030,9 @@ panel_try_host a b c >/dev/null || rc=$?
 [[ "$rc" -eq 1 ]] || fail "panel_try_host: код ошибки потерян (rc=$rc)"
 HOST_STUB_RC=0
 unset -f panel_upsert_host
+# Вернуть настоящую функцию из lib/ (стаб выше был только для panel_try_host).
+# shellcheck source=/dev/null
+. "$SRC/lib/40-panel.sh"
 ok "panel_try_host: успех молчит, ошибка возвращает код"
 
 # panel_fetch_node_secret: Remnawave 3.x (secretKey) и 2.x (pubKey)
@@ -969,8 +1069,8 @@ fi
 ok "panel_fetch_node_secret: извлекает secretKey / pubKey и возвращает ошибку при сбое"
 
 # --- normalize_node_image и защита от голого образа «latest» -----------------
-[[ "$(normalize_node_image '')" == 'remnawave/node:latest' ]] \
-  || fail "normalize_node_image '': ожидался remnawave/node:latest"
+[[ "$(normalize_node_image '')" == 'remnawave/node:3.4.4' ]] \
+  || fail "normalize_node_image '': ожидался remnawave/node:3.4.4"
 [[ "$(normalize_node_image 'latest')" == 'remnawave/node:latest' ]] \
   || fail "normalize_node_image 'latest': голый тег не дополнен репозиторием"
 [[ "$(normalize_node_image '3.1.1')" == 'remnawave/node:3.1.1' ]] \
@@ -984,15 +1084,42 @@ ok "panel_fetch_node_secret: извлекает secretKey / pubKey и возвр
 [[ "$(normalize_node_image 'registry.local:5000/remnawave/node:3.1.1')" == 'registry.local:5000/remnawave/node:3.1.1' ]] \
   || fail "normalize_node_image сломал реестр с портом"
 # shellcheck disable=SC2016
-grep -qF 'NODE_IMAGE="${NODE_IMAGE:-remnawave/node:latest}"' "$SETUP" \
-  || fail "дефолт NODE_IMAGE в установщике не remnawave/node:latest"
+grep -qF 'NODE_IMAGE="${NODE_IMAGE:-remnawave/node:3.4.4}"' "$SRC/lib/00-header.sh" \
+  || fail "дефолт NODE_IMAGE в установщике не remnawave/node:3.4.4"
 # shellcheck disable=SC2016
-grep -qF 'image: ${NODE_IMAGE:-remnawave/node:latest}' "$SETUP" \
-  || fail "в docker-compose.yml не указан image: \${NODE_IMAGE:-remnawave/node:latest}"
+grep -qF 'image: ${NODE_IMAGE:-remnawave/node:3.4.4}' "$SRC/lib/90-main.sh" \
+  || fail "в docker-compose.yml не указан image: \${NODE_IMAGE:-remnawave/node:3.4.4}"
 # shellcheck disable=SC2016
-if grep -qF 'image: ${NODE_IMAGE:-latest}' "$SETUP"; then
+if grep -qF 'image: ${NODE_IMAGE:-latest}' "$SRC/lib/90-main.sh"; then
   fail "в docker-compose.yml остался голый образ latest без репозитория"
 fi
+
+# --- CUSTOM_CORE_URL: UwURay-пресет и безопасный https URL ------------------
+[[ "$(normalize_custom_core_url '')" == "" ]] \
+  || fail "пустой CUSTOM_CORE_URL должен означать штатный Xray"
+[[ "$(normalize_custom_core_url 'official')" == "" ]] \
+  || fail "official не должен превращаться в кастомный core"
+case "$(uname -m)" in
+  x86_64|amd64) uwu_expected='https://github.com/MakostaDev/UwURay/releases/latest/download/Xray-linux-64' ;;
+  aarch64|arm64) uwu_expected='https://github.com/MakostaDev/UwURay/releases/latest/download/Xray-linux-arm64-v8a' ;;
+  *) uwu_expected='' ;;
+esac
+if [[ -n "$uwu_expected" ]]; then
+  [[ "$(normalize_custom_core_url 'uwuray')" == "$uwu_expected" ]] \
+    || fail "uwuray-пресет не соответствует архитектуре"
+fi
+[[ "$(normalize_custom_core_url 'https://example.com/Xray-linux-64')" == 'https://example.com/Xray-linux-64' ]] \
+  || fail "валидный https URL кастомного core отвергнут"
+if normalize_custom_core_url 'http://example.com/xray' >/dev/null; then
+  fail "http:// URL кастомного core принимается (нужен https)"
+fi
+if normalize_custom_core_url 'https://example.com/a b' >/dev/null; then
+  fail "URL кастомного core с пробелом принимается"
+fi
+# shellcheck disable=SC2016
+grep -qF 'CUSTOM_CORE_URL=${CUSTOM_CORE_URL:-}' "$SRC/lib/90-main.sh" \
+  || fail "CUSTOM_CORE_URL не передаётся в docker-compose environment"
+ok "CUSTOM_CORE_URL: uwuray по архитектуре, https-валидация, compose"
 ok "normalize_node_image и docker-compose.yml: голый образ latest исключён"
 
 # --- write_config_profile: X25519 ключи REALITY и их идемпотентность ----------
@@ -1038,17 +1165,6 @@ ok "normalize_node_image и docker-compose.yml: голый образ latest и�
 ok "write_config_profile: валидные X25519 ключи REALITY генерируются и сохраняются при повторе"
 
 # --- Полный цикл panel_auto_setup против строгого мока Remnawave 3.x API ------
-for fn in write_xray_template panel_node_slug panel_node_tag panel_node_name panel_canonical_inbound_tag \
-          panel_prepare_profile_for_api panel_get_inbounds panel_find_node_by_address \
-          panel_find_host_by_remark panel_upsert_host \
-          panel_upsert_config_profile panel_upsert_node panel_trigger_node_start \
-          panel_upsert_internal_squad panel_find_subscription_template_uuid \
-          panel_upsert_subscription_template panel_auto_setup; do
-  sed -n "/^${fn}() {\$/,/^}\$/p" "$SETUP" > "$WORK/$fn.sh"
-  grep -q "^${fn}() {" "$WORK/$fn.sh" || fail "не удалось извлечь $fn"
-  # shellcheck source=/dev/null
-  . "$WORK/$fn.sh"
-done
 kv() { :; }
 
 (
@@ -1074,6 +1190,15 @@ const crypto = require('node:crypto');
 const [dbPath, method, path, rawBody, outPath] = process.argv.slice(2);
 const db = JSON.parse(fs.readFileSync(dbPath, 'utf8'));
 const body = rawBody ? JSON.parse(rawBody) : {};
+function syncProfileNodes(node) {
+  for (const p of db.profiles) p.nodes = (p.nodes || []).filter(x => x.uuid !== node.uuid);
+  const pid = node.configProfile && node.configProfile.activeConfigProfileUuid;
+  const p = db.profiles.find(x => x.uuid === pid);
+  if (p) {
+    p.nodes = p.nodes || [];
+    p.nodes.push({ uuid: node.uuid, name: node.name, countryCode: node.countryCode || 'XX' });
+  }
+}
 const reply = (code, obj) => {
   fs.writeFileSync(outPath, JSON.stringify(obj));
   process.stdout.write(String(code));
@@ -1128,12 +1253,14 @@ if (method === 'POST' && path === '/nodes') {
   if (db.nodes.some(n => n.name === body.name)) reply(409, { message: 'Node with this name already exists' });
   const created = { uuid: crypto.randomUUID(), ...body, isDisabled: false };
   db.nodes.push(created);
+  syncProfileNodes(created);
   reply(201, { response: created });
 }
 if (method === 'PATCH' && path === '/nodes') {
   const n = db.nodes.find(x => x.uuid === body.uuid);
   if (!n) reply(404, { message: 'Node not found' });
   Object.assign(n, body);
+  syncProfileNodes(n);
   reply(200, { response: n });
 }
 const enableMatch = path.match(/^\/nodes\/([^/]+)\/actions\/enable$/);
@@ -1146,7 +1273,8 @@ if (method === 'POST' && enableMatch) {
 const restartMatch = path.match(/^\/nodes\/([^/]+)\/actions\/restart$/);
 if (method === 'POST' && restartMatch) {
   db.restarts.push({ uuid: restartMatch[1], forceRestart: body.forceRestart });
-  reply(200, { response: { eventSent: true } });
+  // Реальный Remnawave 3.x отвечает 202 без содержательного тела.
+  reply(202, {});
 }
 if (method === 'GET' && path === '/hosts') {
   reply(200, { response: db.hosts });
@@ -1231,25 +1359,36 @@ JS
   export NODE_API_PORT=2222
   export XRAY_TEMPLATE_CHOICE="standard"
 
-  # 1. Свежая установка Node 1
+  # 1. Свежая установка Node 1. В панели уже есть чужой «Premium»-отряд:
+  #    автонастройка обязана создать/обновить Default-Squad, а не взять первый.
+  jq '.squads = [{"uuid":"premium-uuid","name":"Premium","inbounds":[{"uuid":"premium-inbound"}]}]' \
+    "$DB" > "$DB.tmp" && mv "$DB.tmp" "$DB"
   write_config_profile >/dev/null
   cp "$SRC/Xray_template.json" "$NODE_DIR/Xray_template.json"
-  panel_auto_setup >/dev/null || fail "panel_auto_setup упал на чистой Remnawave 3.x БД"
+  if ! panel_auto_setup >"$WORK/auto.log" 2>&1; then
+    cat "$WORK/auto.log" >&2
+    cp "$DB" /tmp/auto-db.json 2>/dev/null || true
+    fail "panel_auto_setup упал на чистой Remnawave 3.x БД"
+  fi
   [[ -n "${PANEL_NODE_UUID:-}" ]] || fail "PANEL_NODE_UUID не заполнен после panel_auto_setup"
   panel_trigger_node_start "$PANEL_NODE_UUID" >/dev/null
   [[ "$(jq '.nodes | length' "$DB")" == "1" ]] || fail "ожидалась 1 созданная нода"
   [[ "$(jq '.hosts | length' "$DB")" == "5" ]] || fail "ожидалось 5 хостов (4 скрытых + 1 видимый), получено $(jq '.hosts | length' "$DB")"
   [[ "$(jq '[.hosts[] | select(.isHidden == true)] | length' "$DB")" == "4" ]] || fail "ожидалось 4 скрытых хоста"
-  [[ "$(jq '[.hosts[] | select(.isHidden == true and .tags == ["QUIET_OTTER"])] | length' "$DB")" == "4" ]] \
-    || fail "скрытые хосты Node 1 должны иметь уникальный тег QUIET_OTTER, а не общий USA: $(jq -c '[.hosts[].tags]' "$DB")"
+  [[ "$(jq '[.hosts[] | select(.isHidden == true and .tags == ["QUIET_OTTER_631F"])] | length' "$DB")" == "4" ]] \
+    || fail "скрытые хосты Node 1 должны иметь уникальный тег QUIET_OTTER_631F, а не общий USA: $(jq -c '[.hosts[].tags]' "$DB")"
   [[ "$(jq '[.hosts[] | select((.tags // []) | index("USA"))] | length' "$DB")" == "0" ]] \
     || fail "остался захардкоженный тег USA у хостов"
-  [[ "$(jq '[.templates[] | select(.name == "XRAY standard quiet-otter" and .templateJson.routing.balancers[0].tag == "QUIET_OTTER" and .templateJson.remnawave.injectHosts[0].selector.pattern == "^QUIET_OTTER$")] | length' "$DB")" == "1" ]] \
-    || fail "шаблон XRAY standard quiet-otter не переписал тег балансировки под QUIET_OTTER"
+  [[ "$(jq '[.templates[] | select(.name == "XRAY standard quiet-otter" and .templateJson.routing.balancers[0].tag == "QUIET_OTTER_631F" and .templateJson.remnawave.injectHosts[0].selector.pattern == "^QUIET_OTTER_631F$")] | length' "$DB")" == "1" ]] \
+    || fail "шаблон XRAY standard quiet-otter не переписал тег балансировки под QUIET_OTTER_631F"
   [[ "$(jq '[.hosts[] | select(.isHidden == false and (.xrayJsonTemplateUuid != null))] | length' "$DB")" == "1" ]] \
     || fail "видимый виртуальный хост не связан с XRAY_JSON шаблоном"
-  [[ "$(jq '.squads[0].inbounds | length' "$DB")" == "4" ]] || fail "Default-Squad не создан с 4 inbound'ами"
-  [[ "$(jq '.restarts | length' "$DB")" == "1" ]] || fail "panel_trigger_node_start не вызвал /actions/restart"
+  [[ "$(jq '.squads | length' "$DB")" == "2" ]] || fail "Default-Squad не создан рядом с чужим Premium"
+  [[ "$(jq '[.squads[] | select(.name == "Default-Squad") | .inbounds | length][0]' "$DB")" == "4" ]] \
+    || fail "Default-Squad не создан с 4 inbound'ами"
+  [[ "$(jq '[.squads[] | select(.name == "Premium") | .inbounds | length][0]' "$DB")" == "1" ]] \
+    || fail "автонастройка изменила чужой Premium-отряд"
+  [[ "$(jq '.restarts | length' "$DB")" == "1" ]] || fail "panel_trigger_node_start не вызвал /actions/restart (202 не должен ретраиться)"
 
   # 2. Повторный запуск на той же ноде со сменой порта и isDisabled=true
   jq '.nodes[0].isDisabled = true' "$DB" > "$DB.tmp" && mv "$DB.tmp" "$DB"
@@ -1275,14 +1414,36 @@ JS
   # обязан вызвать write_xray_template сам, распарсить 32 КБ JSON5 и привязать к хосту.
   panel_auto_setup >/dev/null || fail "установка второй ноды со split-шаблоном упала"
   [[ "$(jq '.nodes | length' "$DB")" == "2" ]] || fail "вторая нода не создана в панели"
-  [[ "$(jq '[.hosts[] | select(.isHidden == true and .tags == ["AMBER_FALCON"])] | length' "$DB")" == "4" ]] \
-    || fail "скрытые хосты второй ноды не получили изолированный тег AMBER_FALCON"
-  [[ "$(jq '[.templates[] | select(.name == "XRAY split amber-falcon" and .templateJson.routing.balancers[0].tag == "AMBER_FALCON" and .templateJson.remnawave.injectHosts[0].selector.pattern == "^AMBER_FALCON$")] | length' "$DB")" == "1" ]] \
-    || fail "шаблон XRAY split amber-falcon не создан с тегом AMBER_FALCON"
+  [[ "$(jq '[.hosts[] | select(.isHidden == true and .tags == ["AMBER_FALCON_C34B"])] | length' "$DB")" == "4" ]] \
+    || fail "скрытые хосты второй ноды не получили изолированный тег AMBER_FALCON_C34B"
+  [[ "$(jq '[.templates[] | select(.name == "XRAY split amber-falcon" and .templateJson.routing.balancers[0].tag == "AMBER_FALCON_C34B" and .templateJson.remnawave.injectHosts[0].selector.pattern == "^AMBER_FALCON_C34B$")] | length' "$DB")" == "1" ]] \
+    || fail "шаблон XRAY split amber-falcon не создан с тегом AMBER_FALCON_C34B"
   [[ "$(jq '[.hosts[] | select(.isHidden == false) | .xrayJsonTemplateUuid] | unique | length' "$DB")" == "2" ]] \
     || fail "видимые хосты разных нод должны ссылаться на собственные XRAY_JSON шаблоны"
-  [[ "$(jq '.squads[0].inbounds | length' "$DB")" == "8" ]] \
-    || fail "Internal Squad затёр inbound'ы первой ноды вместо объединения: $(jq '.squads[0].inbounds | length' "$DB")"
+  [[ "$(jq '[.squads[] | select(.name == "Default-Squad") | .inbounds | length][0]' "$DB")" == "8" ]] \
+    || fail "Internal Squad затёр inbound'ы первой ноды вместо объединения: $(jq -c '[.squads[] | {name, n: (.inbounds|length)}]' "$DB")"
+
+  # 3b. Третья нода с тем же PREFIX/хостом и другим IP не должна перезаписать
+  #     первую: профиль уже назначен ноде quiet-otter, а на новом IP ноды нет.
+  NODE_DIR="$WORK/auto-node-conflict"
+  VLESS_HOST="quiet-otter.example.com"
+  SELF_STEAL_HOST="quiet-otter.example.com"
+  HY_HOST="brisk-lantern.example.com"
+  CDN_HOST="cdn.example.com"
+  SERVER_IP="198.51.100.99"
+  NODE_API_PORT=45678
+  XRAY_TEMPLATE_CHOICE="standard"
+  write_config_profile >/dev/null
+  if panel_auto_setup >/dev/null 2>&1; then
+    fail "panel_auto_setup: конфликт имени/профиля не остановил установку"
+  fi
+  [[ "$(jq -r '.nodes[] | select(.name == "node-quiet-otter.example.com") | .address' "$DB")" == "203.0.113.10" ]] \
+    || fail "конфликт перезаписал address первой ноды"
+  [[ "$(jq '.profiles | length' "$DB")" == "2" ]] \
+    || fail "конфликт создал/перезаписал профиль: $(jq -c '[.profiles[].name]' "$DB")"
+  [[ "$(jq '.hosts | length' "$DB")" == "10" ]] \
+    || fail "конфликт перезаписал/продублировал хосты: $(jq '.hosts | length' "$DB")"
+  ok "panel_auto_setup: конфликт имени/профиля не перезаписывает чужую ноду"
 
   # 4. Отказ 403 на /subscription-templates (нет права subscription-template:*):
   #    panel_check_connection обязан ловить его на шаге 1, а panel_auto_setup —
@@ -1330,7 +1491,7 @@ big_parsed="$(json5_to_json <<<"$big_json5" | jq -r '.items | length')" \
 ok "json5_to_json: шаблоны >8 КБ с комментариями и висячими запятыми не режутся в mawk"
 
 # --- Порядок шага 9: сначала нода в панели, затем SECRET_KEY и Docker --------
-step9="$(awk '/^step 9 /{flag=1} /^step 10 /{flag=0} flag' "$SETUP")"
+step9="$(awk '/^step 9 /{flag=1} /^step 10 /{flag=0} flag' "$SRC/lib/90-main.sh")"
 line_auto="$(printf '%s\n' "$step9" | grep -n 'panel_auto_setup' | head -1 | cut -d: -f1)"
 line_secret="$(printf '%s\n' "$step9" | grep -n 'ask_secret SECRET_RAW' | head -1 | cut -d: -f1)"
 line_pull="$(printf '%s\n' "$step9" | grep -n 'docker compose pull' | head -1 | cut -d: -f1)"

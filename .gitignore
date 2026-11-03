@@ -3,3 +3,4 @@
 remnanode.env
 *.backup-*
 build-caddy-l4/
+.remnanode-setup.*
