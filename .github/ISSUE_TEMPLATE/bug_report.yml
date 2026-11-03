@@ -24,6 +24,8 @@ body:
         - --quick
         - --advanced
         - --non-interactive
+        - --reconfigure
+        - --uninstall
         - ручная установка
     validations:
       required: true
@@ -50,6 +52,6 @@ body:
     id: environment
     attributes:
       label: Окружение
-      description: ОС, архитектура, версии Caddy/Go/образа ноды, панель/нода
+      description: ОС, архитектура, версии Caddy/Go/образа ноды, панель/нода, ACME_METHOD, CUSTOM_CORE_URL (если задан)
     validations:
       required: false

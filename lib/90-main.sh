@@ -547,7 +547,7 @@ elif [[ "$NONINTERACTIVE" == 1 ]] || (( QUICK_SETUP_ENV_PRESENT )) \
 else
   SETUP_MODE="quick"
   ask_choice SETUP_MODE "Режим установки" "1" \
-    "quick: Быстрая автоустановка — всего 8 вопросов (домен, токены, панель, CDN), остальное автоматически (рекомендуется)" \
+    "quick: Быстрая автоустановка — всего 8 вопросов (домен, токены, панель, CDN, XHTTP target), остальное автоматически (рекомендуется)" \
     "advanced: Расширенная настройка — все вопросы по блокам, полный ручной контроль"
   if [[ "$SETUP_MODE" == "quick" ]]; then QUICK_SETUP=1; else QUICK_SETUP=0; fi
 fi
@@ -727,7 +727,7 @@ if (( ! QUICK_SETUP )); then
   if has_tty; then printf '\n %s%s━━━ Блок 3/4: Протоколы ━━━%s\n' "${C_B:-}" "${C_CYN:-}" "${C_RST:-}" > /dev/tty 2>/dev/null || true; fi
   note "VLESS Reality/Vision и Hysteria2 включены всегда. Дополнительно можно включить:"
   note "  • XHTTP — современный транспорт, лучше работает в некоторых сетях"
-  note "  • VLESS за CDN — прячет IP ноды за Cloudflare/аналогами (требует отдельный домен)"
+  note "  • VLESS за CDN — прячет TCP-маршрут VLESS за Cloudflare/аналогами (Hysteria2 остаётся прямой)"
 fi
 : "${C_B:=}" "${C_CYN:=}" "${C_RST:=}" "${C_DIM:=}" "${C_GRY:=}" "${C_MAG:=}"
 prompt_flags

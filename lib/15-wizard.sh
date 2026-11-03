@@ -53,10 +53,11 @@ fi
 if [[ "${QUICK_SETUP:-0}" == 1 ]]; then
   ENABLE_CDN=1
 else
-  ask_bool ENABLE_CDN "Добавить VLESS за CDN (прячет IP ноды)?" "${ENABLE_CDN:-n}"
+  ask_bool ENABLE_CDN "Добавить VLESS за CDN (прячет TCP-маршрут VLESS)?" "${ENABLE_CDN:-n}"
 fi
 if (( ENABLE_CDN )); then
-  note "CDN прячет origin: клиент идёт на CDN-домен по 443, CDN — на :443 ноды."
+  note "CDN прячет TCP-маршрут VLESS: клиент идёт на CDN-домен по 443, CDN — на :443 ноды."
+  note "Hysteria2 (443/udp) остаётся прямой — обычный CDN не проксирует UDP."
   note "Публичный TLS терминирует CDN, между CDN и нодой — сертификат origin (DNS-01 через Cloudflare)."
   note "Проксируемую A-запись для CDN-домена установщик создаст сам в Cloudflare (оранжевое облако) —"
   note "вручную её создавать не нужно. Исключение — запуск с --no-cloudflare: тогда запись делаете вы."
