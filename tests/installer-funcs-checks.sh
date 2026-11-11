@@ -1490,8 +1490,10 @@ big_parsed="$(json5_to_json <<<"$big_json5" | jq -r '.items | length')" \
 [[ "$big_parsed" == "2" ]] || fail "json5_to_json повредил большой JSON5 ($big_parsed)"
 ok "json5_to_json: шаблоны >8 КБ с комментариями и висячими запятыми не режутся в mawk"
 
-# --- Порядок шага 9: сначала нода в панели, затем SECRET_KEY и Docker --------
-step9="$(awk '/^step 9 /{flag=1} /^step 10 /{flag=0} flag' "$SRC/lib/90-main.sh")"
+# --- Порядок шага «Нода Remnawave»: сначала нода в панели, затем SECRET_KEY и Docker
+# Секция ищется по названию, а не по номеру: номера шагов сдвигаются, когда
+# добавляется новый (так появился шаг WARP), а порядок внутри секции — нет.
+step9="$(awk '/^step [0-9]+ "Нода Remnawave/{flag=1} /^step [0-9]+ "(Проверка|WARP)/{if(flag) flag=0} flag' "$SRC/lib/90-main.sh")"
 line_auto="$(printf '%s\n' "$step9" | grep -n 'panel_auto_setup' | head -1 | cut -d: -f1)"
 line_secret="$(printf '%s\n' "$step9" | grep -n 'ask_secret SECRET_RAW' | head -1 | cut -d: -f1)"
 line_pull="$(printf '%s\n' "$step9" | grep -n 'docker compose pull' | head -1 | cut -d: -f1)"
@@ -1500,6 +1502,6 @@ line_start="$(printf '%s\n' "$step9" | grep -n 'panel_trigger_node_start' | head
   || fail "не найдены ключевые вызовы на шаге 9 ($line_auto/$line_secret/$line_pull/$line_start)"
 (( line_auto < line_secret && line_secret < line_pull && line_pull < line_start )) \
   || fail "нарушен порядок шага 9: panel_auto_setup($line_auto) → SECRET_KEY($line_secret) → pull($line_pull) → sync($line_start)"
-ok "шаг 9: нода создаётся в панели ДО запроса SECRET_KEY и docker compose pull"
+ok "шаг «Нода Remnawave»: нода создаётся в панели ДО запроса SECRET_KEY и docker compose pull"
 
 printf 'все проверки функций установщика прошли\n'

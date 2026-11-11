@@ -8,6 +8,8 @@
 #   * доступность CDN-хоста и типичные ошибки Cloudflare 525/526/530
 #     (обычно это не продлившийся origin-сертификат или Full (strict));
 #   * слушатели 443/tcp, 443/udp, Node API и loopback-порты Xray;
+#   * WARP (если включён): активность туннеля, правило fwmark, rp_filter,
+#     свежесть хэндшейка;
 #   * свободное место на /.
 #
 # Запуск:
@@ -23,6 +25,9 @@ ENV_STORE="${ENV_STORE:-/root/remnanode.env}"
 CERT_DIR="${CERT_DIR:-/etc/remna-certs}"
 SELF_STEAL_TLS_PORT="${SELF_STEAL_TLS_PORT:-9443}"
 NODE_API_PORT="${NODE_API_PORT:-2222}"
+WARP_IFACE="${WARP_IFACE:-warp}"
+WARP_FWMARK="${WARP_FWMARK:-255}"
+WARP_TABLE="${WARP_TABLE:-51820}"
 WARN_DAYS=14
 CRIT_DAYS=7
 QUIET=0
@@ -32,7 +37,7 @@ ERRORS=0
 for arg in "$@"; do
   case "$arg" in
     --quiet|-q) QUIET=1 ;;
-    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     *) printf 'Неизвестный аргумент: %s\n' "$arg" >&2; exit 2 ;;
   esac
 done
@@ -148,6 +153,50 @@ if have ss; then
   done
 else
   warn "ss не установлен — проверка слушателей пропущена"
+fi
+
+printf '\n== WARP (исходящий туннель) ==\n'
+warp_on="${ENABLE_WARP:-n}"; warp_on="${warp_on,,}"
+if [[ "$warp_on" =~ ^(1|y|yes|true|on)$ ]] && have systemctl; then
+  iface="${WARP_IFACE:-warp}"
+  mark="${WARP_FWMARK:-255}"
+  table="${WARP_TABLE:-51820}"
+  if systemctl is-active --quiet "wg-quick@$iface" 2>/dev/null; then
+    ok "туннель $iface активен"
+  else
+    fail "wg-quick@$iface не активен — AI-сервисы пойдут с реального IP (remnawave-warp start)"
+  fi
+  # Пропажа правила — самая коварная поломка: туннель «активен», хэндшейк
+  # свежий, а помеченные пакеты Xray уходят мимо него.
+  if have ip && ip rule show 2>/dev/null \
+      | grep -q "fwmark 0x$(printf '%x' "$mark") lookup ${table}"; then
+    ok "правило fwmark $mark → table $table на месте"
+  else
+    fail "нет правила fwmark $mark → table $table (трафик Xray идёт мимо WARP)"
+  fi
+  rp_all="$(cat /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null || echo 0)"
+  if [[ "$rp_all" == 1 ]]; then
+    fail "rp_filter=1 (strict): обратный трафик туннеля будет теряться"
+  else
+    ok "rp_filter=${rp_all:-?} (обратный трафик проходит)"
+  fi
+  if have wg; then
+    hs="$(wg show "$iface" latest-handshakes 2>/dev/null | awk '{print $2}' | head -1)"
+    if [[ "$hs" =~ ^[0-9]+$ ]] && (( hs > 0 )); then
+      age=$(( $(date +%s) - hs ))
+      if (( age > 180 )); then
+        warn "хэндшейк $age s назад — watchdog переключит endpoint (remnawave-warp log)"
+      else
+        ok "хэндшейк ${age}s назад"
+      fi
+    else
+      fail "хэндшейка нет — endpoint заблокирован или туннель не поднялся"
+    fi
+  fi
+elif [[ "$warp_on" =~ ^(1|y|yes|true|on)$ ]]; then
+  warn "systemctl нет — проверка WARP пропущена"
+else
+  note "WARP выключен (ENABLE_WARP=n) — проверка пропущена"
 fi
 
 printf '\n== Диск ==\n'

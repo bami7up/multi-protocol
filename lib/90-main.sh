@@ -51,6 +51,19 @@ while [[ $# -gt 0 ]]; do
       XRAY_TEMPLATE_CHOICE="${2:-}"
       [[ -n "$XRAY_TEMPLATE_CHOICE" ]] || { echo "--xray-template требует значение (standard или split)" >&2; exit 2; }
       shift ;;
+    --warp)       WARP_SETTING=1 ;;
+    --no-warp)    WARP_SETTING=0 ;;
+    --warp-route)
+      WARP_ROUTE_MODE="${2:-}"
+      case "$WARP_ROUTE_MODE" in
+        ai|all) ;;
+        *) echo "--warp-route принимает ai или all" >&2; exit 2 ;;
+      esac
+      shift ;;
+    --warp-mark)
+      WARP_FWMARK="${2:-}"
+      warp_valid_mark "$WARP_FWMARK" || { echo "--warp-mark требует число 1..2147483647" >&2; exit 2; }
+      shift ;;
     --panel-url)
       REMNAWAVE_PANEL_URL="${2:-}"
       [[ -n "$REMNAWAVE_PANEL_URL" ]] || { echo "--panel-url требует значение" >&2; exit 2; }
@@ -88,6 +101,15 @@ elif [[ "$CF_MODE_SETTING" == 0 ]]; then
 elif [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]]; then
   CF_MODE=1
 fi
+
+# Явный флаг WARP перекрывает env/сохранённое значение; пустое ENABLE_WARP
+# означает «решить по режиму мастера» (быстрый — включить, расширенный — спросить).
+if [[ "$WARP_SETTING" == 1 ]]; then
+  ENABLE_WARP=1
+elif [[ "$WARP_SETTING" == 0 ]]; then
+  ENABLE_WARP=0
+fi
+[[ "$WARP_SETTING" == 1 || "$WARP_ENV_PRESENT" == 1 ]] && WARP_ENV_PRESENT=1
 
 
 
@@ -490,6 +512,20 @@ QUICK_SETUP="$(parse_bool "${QUICK_SETUP:-n}" 0)"
 REMNAWAVE_AUTO_SETUP="$(parse_bool "${REMNAWAVE_AUTO_SETUP:-n}" 0)"
 ENABLE_XHTTP="$(parse_bool "${ENABLE_XHTTP:-y}" 0)"
 ENABLE_CDN="$(parse_bool "${ENABLE_CDN:-n}" 0)"
+# WARP: пустое значение означает «мастер решит по режиму», поэтому дефолт 0
+# (быстрый режим выставит 1 сам в prompt_flags).
+ENABLE_WARP="$(parse_bool "${ENABLE_WARP:-n}" 0)"
+WARP_ROUTE_MODE="${WARP_ROUTE_MODE,,}"
+WARP_ROUTE_MODE="${WARP_ROUTE_MODE:-ai}"
+case "$WARP_ROUTE_MODE" in
+  ai|all) ;;
+  *) die "WARP_ROUTE_MODE/--warp-route: допустимо ai или all, получено «$WARP_ROUTE_MODE»." ;;
+esac
+warp_valid_mark "$WARP_FWMARK" \
+  || die "WARP_FWMARK/--warp-mark: нужно число 1..2147483647, получено «$WARP_FWMARK»."
+if (( ENABLE_WARP )) && [[ "$(warp_arch 2>/dev/null || true)" == "" ]]; then
+  die "WARP на архитектуре $(uname -m) не поддерживается (нужны x86_64 или arm64)."
+fi
 
 # Новые настройки нормализуются после загрузки ENV_STORE: сохранённое значение
 # должно побеждать дефолт, а явный флаг — сохранённое.
@@ -525,7 +561,7 @@ if has_tty; then
 {
   printf '\n'
   printf ' %s%s Добро пожаловать в мастер установки! %s\n' "${C_B:-}${C_CYN:-}" "${C_RST:-}" ""
-  printf ' %sБыстрый режим задаст всего 8 вопросов; расширенный — все настройки по блокам.%s\n' "${C_DIM:-}${C_GRY:-}" "${C_RST:-}"
+  printf ' %sБыстрый режим задаст всего 9 вопросов; расширенный — все настройки по блокам.%s\n' "${C_DIM:-}${C_GRY:-}" "${C_RST:-}"
   printf ' %sЕсли не знаете что ответить — жмите Enter для значения по умолчанию.%s\n' "${C_DIM:-}${C_GRY:-}" "${C_RST:-}"
   printf '\n'
 } > /dev/tty 2>/dev/null || true
@@ -547,7 +583,7 @@ elif [[ "$NONINTERACTIVE" == 1 ]] || (( QUICK_SETUP_ENV_PRESENT )) \
 else
   SETUP_MODE="quick"
   ask_choice SETUP_MODE "Режим установки" "1" \
-    "quick: Быстрая автоустановка — всего 8 вопросов (домен, токены, панель, CDN, XHTTP target), остальное автоматически (рекомендуется)" \
+    "quick: Быстрая автоустановка — всего 9 вопросов (домен, токены, панель, CDN, XHTTP target, WARP), остальное автоматически (рекомендуется)" \
     "advanced: Расширенная настройка — все вопросы по блокам, полный ручной контроль"
   if [[ "$SETUP_MODE" == "quick" ]]; then QUICK_SETUP=1; else QUICK_SETUP=0; fi
 fi
@@ -728,6 +764,7 @@ if (( ! QUICK_SETUP )); then
   note "VLESS Reality/Vision и Hysteria2 включены всегда. Дополнительно можно включить:"
   note "  • XHTTP — современный транспорт, лучше работает в некоторых сетях"
   note "  • VLESS за CDN — прячет TCP-маршрут VLESS за Cloudflare/аналогами (Hysteria2 остаётся прямой)"
+  note "  • WARP — исходящий туннель до Cloudflare для AI-сервисов (OpenAI, Anthropic, Gemini)"
 fi
 : "${C_B:=}" "${C_CYN:=}" "${C_RST:=}" "${C_DIM:=}" "${C_GRY:=}" "${C_MAG:=}"
 prompt_flags
@@ -972,6 +1009,14 @@ fi
 export XRAY_TEMPLATE_CHOICE SELF_STEAL_TEMPLATE SELF_STEAL_TEMPLATE_URL
 export REMNAWAVE_PANEL_URL REMNAWAVE_API_TOKEN REMNAWAVE_AUTO_SETUP
 export CF_MODE CLOUDFLARE_API_TOKEN CLOUDFLARE_ZONE QUICK_SETUP
+if (( ENABLE_WARP )); then
+  export ENABLE_WARP WARP_ROUTE_MODE WARP_FWMARK WARP_TABLE WARP_MTU WARP_IFACE
+  export WARP_ROUTE_DOMAINS WARP_ROUTE_GEOSITE
+elif [[ -n "${WARP_SETTING}${WARP_ENV_PRESENT}" ]]; then
+  # Явно выключенный WARP тоже сохраняем: иначе повторный запуск в быстром
+  # режиме включил бы его обратно по дефолту.
+  export ENABLE_WARP
+fi
 
 # Запись CDN-хоста создаётся проксируемой: именно оранжевое облако направляет
 # трафик через CDN на origin. Это делается при каждом включённом CDN, а не
@@ -1028,6 +1073,15 @@ if (( ENABLE_CDN )); then
 fi
 kv "Config Profile" "$NODE_DIR/Multiselect.json"
 kv "Шаблон подписки" "$XRAY_TEMPLATE_CHOICE ($NODE_DIR/Xray_template.json)"
+if (( ENABLE_WARP )); then
+  if [[ "$WARP_ROUTE_MODE" == "all" ]]; then
+    kv "WARP"         "весь исходящий трафик ноды → Cloudflare WARP (fwmark $WARP_FWMARK)"
+  else
+    kv "WARP"         "AI-сервисы (OpenAI, Anthropic, Gemini) → Cloudflare WARP (fwmark $WARP_FWMARK)"
+  fi
+else
+  kv "WARP"           "(отключён — трафик идёт напрямую)"
+fi
 kv "PANEL_IP"      "$PANEL_IP"
 kv "NODE_API_PORT" "$NODE_API_PORT"
 if (( QUICK_SETUP )); then
@@ -1464,7 +1518,26 @@ else
   warn "BBR не активировался (сейчас: $cc). Возможно нужно новое ядро/перезапуск."
 fi
 
-step 9 "Нода Remnawave (compose)"
+step 9 "WARP — исходящий туннель Cloudflare"
+if (( ENABLE_WARP )); then
+  note "Туннель WireGuard до Cloudflare: подменяет адрес выхода для AI-сервисов,"
+  note "которые не пускают IP хостингов. Основной трафик сервера и клиентов не затрагивается."
+  warp_enable
+  WARP_LOCAL_IP="$(ip -4 addr show "$WARP_IFACE" 2>/dev/null \
+    | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)"
+  WARP_READY=1
+else
+  WARP_LOCAL_IP=""
+  note "WARP отключён: трафик ноды идёт напрямую с IP сервера."
+  # Туннель мог остаться от прошлого запуска: неиспользуемый, он только мешает
+  # (лишний интерфейс, правило и таймер watchdog продолжали бы жить).
+  if [[ -f /etc/systemd/system/remnawave-warp-watchdog.service || -f "$WARP_CONF" ]]; then
+    log "Удаляю WARP, оставшийся от предыдущей установки"
+    warp_disable
+  fi
+fi
+
+step 10 "Нода Remnawave (compose)"
 mkdir -p "$NODE_DIR"
 echo
 
@@ -1635,7 +1708,7 @@ if (( REMNAWAVE_AUTO_SETUP )) && [[ -n "${PANEL_NODE_UUID:-}" ]]; then
   panel_trigger_node_start "$PANEL_NODE_UUID" || true
 fi
 
-step 10 "Проверка слушателей и маршрутизации"
+step 11 "Проверка слушателей и маршрутизации"
 
 
 
@@ -1722,6 +1795,14 @@ verify_http_layer
 (( tls_failures == 0 )) || die "Не прошли TLS-проверку маршруты: $tls_failures. Установка не считается завершённой."
 ok "Все SNI/TLS-маршруты прошли проверку"
 
+# WARP: проверяем ровно то, на чём чаще всего ломается — правило метки,
+# rp_filter и проход ICMP через туннель. Нода при этом уже работает: Xray
+# уходит в WARP только помеченным трафиком, поэтому сбой WARP не роняет ноду.
+if (( ENABLE_WARP )) && [[ "$WARP_READY" == 1 ]]; then
+  printf '   %s%sWARP%s\n' "${C_B:-}" "${C_MAG:-}" "${C_RST:-}"
+  warp_verify
+fi
+
 prune_matching_files "$LOG_DIR" 'remnanode-setup-*.log' 10
 
 log "Очистка установочных остатков (apt, Docker)"
@@ -1760,6 +1841,14 @@ if [[ -n "${CUSTOM_CORE_URL:-}" ]]; then
   kv "Xray core"     "кастомный: $CUSTOM_CORE_URL"
 else
   kv "Xray core"     "штатный из образа"
+fi
+if (( ENABLE_WARP )) && [[ "$WARP_READY" == 1 ]]; then
+  if [[ "$WARP_ROUTE_MODE" == "all" ]]; then
+    kv "WARP"         "весь исходящий трафик → Cloudflare ($WARP_LOCAL_IP, fwmark $WARP_FWMARK)"
+  else
+    kv "WARP"         "AI-сервисы → Cloudflare ($WARP_LOCAL_IP, fwmark $WARP_FWMARK)"
+  fi
+  kv "WARP CLI"      "remnawave-warp (status | rotate | log | uninstall)"
 fi
 kv "REALITY"        "minClientVer=$REALITY_MIN_CLIENT_VER, XHTTP target=$XHTTP_TARGET"
 if [[ "$ACME_METHOD_USED" == "dns" ]]; then

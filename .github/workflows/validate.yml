@@ -47,12 +47,17 @@ jobs:
           shellcheck -x tests/installer-funcs-checks.sh
           bash -n tests/env-flags-checks.sh
           shellcheck -x tests/env-flags-checks.sh
+          bash -n tests/warp-checks.sh
+          shellcheck -x tests/warp-checks.sh
 
       - name: Unit-test installer validation functions
         run: bash tests/installer-funcs-checks.sh
 
       - name: Unit-test installer env flags and step 1 checks
         run: bash tests/env-flags-checks.sh
+
+      - name: Unit-test WARP integration
+        run: bash tests/warp-checks.sh
 
       - name: Validate JSON5 templates
         run: |
@@ -632,3 +637,69 @@ jobs:
           fi
 
           echo "✔ инварианты плана улучшений на месте"
+
+          # Проверки WARP: туннель меняет маршрутизацию ядра, поэтому его
+          # параметры и порядок действий фиксируются инвариантами.
+
+          # 59. Отдельный модуль и точка входа: WARP не растворился в main.
+          grep -q '^warp_enable() {' remnanode-setup.sh \
+            || fail "нет функции warp_enable (WARP не устанавливается)"
+          grep -q '^warp_disable() {' remnanode-setup.sh \
+            || fail "нет функции warp_disable (WARP не удаляется)"
+          grep -q '^warp_render_conf() {' remnanode-setup.sh \
+            || fail "нет warp_render_conf (конфиг WireGuard не собирается)"
+          grep -qF 'warp_domains="$(warp_route_domains_json)"' remnanode-setup.sh \
+            || fail "Config Profile не получает список доменов WARP"
+
+          # 60. wgcf закреплён по версии И по SHA256: «последняя версия» —
+          #     это запуск произвольного бинарника от root.
+          grep -q '^warp_wgcf_sha256() {' remnanode-setup.sh \
+            || fail "нет проверки SHA256 для wgcf"
+          grep -qF 'WGCF_SHA256_AMD64' remnanode-setup.sh \
+            || fail "SHA256 wgcf для amd64 не закреплён"
+          if grep -q 'wgcf/releases/latest' remnanode-setup.sh; then
+            fail "wgcf тянется как latest: версия должна быть закреплена"
+          fi
+          grep -qF 'sha256sum -c -' remnanode-setup.sh || fail "SHA256 скачиваний не проверяется"
+
+          # 61. Маршрутизация только помеченных пакетов: Table в конфиге,
+          #     ip rule fwmark, иначе дефолт сервера уехал бы в туннель.
+          grep -qF 'Table = ' lib/45-warp.sh || fail "в конфиге WARP нет Table"
+          grep -qF 'ip rule add fwmark' lib/45-warp.sh || fail "нет правила fwmark для WARP"
+          grep -qF 'sockopt' lib/30-templates.sh || fail "outbound WARP не помечает пакеты (sockopt)"
+          grep -qF 'mark: $warp_mark' lib/30-templates.sh || fail "метка WARP не попадает в профиль"
+          if grep -qF 'postdown = ip link' lib/45-warp.sh; then
+            fail "PostDown удаляет интерфейс вручную (этим занимается wg-quick)"
+          fi
+
+          # 62. rp_filter закрепляется: иначе после перезагрузки туннель
+          #     «активен», а трафика нет.
+          grep -q '^warp_relax_rp_filter() {' remnanode-setup.sh \
+            || fail "нет понижения rp_filter для WARP"
+          grep -qF '99-remnawave-warp.conf' remnanode-setup.sh \
+            || fail "rp_filter не закрепляется в sysctl.d"
+
+          # 63. Watchdog и CLI: таймер, backoff и удаление вместе с нодой.
+          grep -qF 'remnawave-warp-watchdog.timer' remnanode-setup.sh \
+            || fail "нет таймера watchdog WARP"
+          grep -qF 'backoff=$(( 180 * (2 ** exp) ))' remnanode-setup.sh \
+            || fail "нет backoff ротации endpoint (перезапуск каждые 3 минуты)"
+          grep -qF '/usr/local/bin/remnawave-warp' remnanode-setup.sh \
+            || fail "нет CLI remnawave-warp"
+          grep -qF 'warp_disable' remnanode-setup.sh \
+            || fail "WARP не снимается при --uninstall/выключении"
+          grep -qF 'warp_disable' lib/70-uninstall.sh \
+            || fail "--uninstall не удаляет WARP"
+
+          # 64. WARP описан в usage()/README, как и остальные возможности.
+          grep -qF -- '--warp-route MODE' remnanode-setup.sh \
+            || fail "usage() не описывает --warp-route"
+          grep -qF 'ENABLE_WARP, WARP_ROUTE_MODE' remnanode-setup.sh \
+            || fail "usage() не описывает переменные WARP"
+          grep -qF '## WARP: исходящий туннель Cloudflare' README.md \
+            || fail "в README нет раздела про WARP"
+          grep -qF 'remnawave-warp' README.md || fail "README не описывает CLI WARP"
+          bash tests/warp-checks.sh >/dev/null \
+            || fail "tests/warp-checks.sh не прошёл"
+
+          echo "✔ инварианты WARP на месте"

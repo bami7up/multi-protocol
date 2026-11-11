@@ -67,6 +67,16 @@ uninstall_node() {
     warn "UFW не активен — правила не трогаю."
   fi
 
+  # WARP снимаем до Caddy: правило fwmark и MSS-clamp не должны пережить
+  # удаление, иначе помеченный трафик уходил бы в никуда.
+  if [[ -f /etc/systemd/system/remnawave-warp-watchdog.service || -f "$WARP_CONF" ]]; then
+    if (( DRY_RUN )); then
+      note "[dry-run] снять WARP: wg-quick@$WARP_IFACE, watchdog, ip rule fwmark $WARP_FWMARK, $WARP_CONF"
+    else
+      warp_disable || warn "Не удалось полностью удалить WARP — проверьте ip rule и ip link."
+    fi
+  fi
+
   if have systemctl; then
     run_cmd systemctl stop caddy || true
     run_cmd systemctl disable caddy || true

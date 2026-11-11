@@ -17,6 +17,11 @@ reconfigure_print_summary() {
   else
     kv "CDN"            "(выключен)"
   fi
+  if (( ${ENABLE_WARP:-0} )); then
+    kv "WARP"           "включён (${WARP_ROUTE_MODE:-ai}, fwmark ${WARP_FWMARK:-255})"
+  else
+    kv "WARP"           "(выключен)"
+  fi
   kv "minClientVer"     "${REALITY_MIN_CLIENT_VER:-0.0.0}"
   kv "ACME"             "${ACME_METHOD:-auto} (для новых сертификатов)"
   kv "Авто-панель"      "$([[ "${REMNAWAVE_AUTO_SETUP:-0}" == 1 ]] && echo да || echo нет)"
@@ -137,9 +142,46 @@ reconfigure_ensure_cdn_cert() {
   ok "CDN-сертификат установлен для $CDN_HOST"
 }
 
+reconfigure_choose_warp() {
+  local on="${ENABLE_WARP:-0}" mode="${WARP_ROUTE_MODE:-ai}" route_default=1
+  ask_bool on "Поднять исходящий туннель WARP (Cloudflare)?" "${on:-y}"
+  ENABLE_WARP="$on"
+  if (( ENABLE_WARP )); then
+    [[ "$mode" == "all" ]] && route_default=2
+    ask_choice mode "Что заворачивать в WARP" "$route_default" \
+      "ai: только AI/заблокированные сервисы — остальное напрямую (рекомендуется)" \
+      "all: весь исходящий трафик ноды через WARP"
+    WARP_ROUTE_MODE="$mode"
+    note "WARP: включён, режим $WARP_ROUTE_MODE, fwmark $WARP_FWMARK"
+  else
+    note "WARP: будет выключен (туннель и watchdog удаляются)"
+  fi
+}
+
+# Применение решения по WARP: туннель поднимается/снимается, профиль и
+# маршрутизация пересобираются. WARP не трогает Caddy и сертификаты, поэтому
+# идёт отдельно от reconfigure_apply — там перезапуск Caddy не нужен.
+reconfigure_apply_warp() {
+  warp_validate_settings
+  if (( ENABLE_WARP )); then
+    warp_enable
+    WARP_LOCAL_IP="$(ip -4 addr show "$WARP_IFACE" 2>/dev/null \
+      | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)"
+    WARP_READY=1
+    # Маршруты через WARP касаются только исходящих соединений, но сертификаты
+    # и Caddy их не используют — перезапуск не нужен.
+    ok "WARP включён ($WARP_ROUTE_MODE, fwmark $WARP_FWMARK)"
+  else
+    warp_disable
+    ok "WARP выключен"
+  fi
+}
+
 reconfigure_apply() {
   (( ENABLE_XHTTP )) && ENABLE_XHTTP=1 || ENABLE_XHTTP=0
   (( ENABLE_CDN )) && ENABLE_CDN=1 || ENABLE_CDN=0
+  ENABLE_WARP="$(parse_bool "${ENABLE_WARP:-n}" 0)"
+  export ENABLE_WARP WARP_ROUTE_MODE WARP_FWMARK WARP_TABLE WARP_MTU WARP_IFACE
 
   if ! REALITY_MIN_CLIENT_VER="$(normalize_client_version "${REALITY_MIN_CLIENT_VER:-0.0.0}")"; then
     die "REALITY_MIN_CLIENT_VER: нужен вид 0.0.0."
@@ -171,6 +213,13 @@ reconfigure_apply() {
     reconfigure_apply_theme
   fi
   reconfigure_ensure_cdn_cert
+
+  # WARP поднимаем до записи env-файла: если регистрация в Cloudflare не
+  # удалась, fail-fast случится раньше, чем профиль уедет в панель с
+  # outbound'ом, которого на хосте нет.
+  if [[ "${RECONFIGURE_WARP_DIRTY:-0}" == 1 ]]; then
+    reconfigure_apply_warp
+  fi
 
   write_env_store
   ok "Настройки сохранены в $ENV_STORE"
@@ -215,6 +264,9 @@ run_reconfigure() {
   : "${CDN_TRANSPORT:=ws}" "${CDN_HOST:=}" "${CDN_WS_PATH:=/api/v1/stream}"
   : "${CDN_XHTTP_PATH:=/api/v3/sync/c1}" "${CDN_GRPC_PATH:=/api/v4/stream}"
   RECONFIGURE_THEME_DIRTY=0
+  RECONFIGURE_WARP_DIRTY=0
+  ENABLE_WARP="$(parse_bool "${ENABLE_WARP:-n}" 0)"
+  WARP_ROUTE_MODE="${WARP_ROUTE_MODE:-ai}"
 
   banner
   printf '\n %s%s%s\n' "${C_B:-}${C_CYN:-}" "Изменение настроек без переустановки" "${C_RST:-}"
@@ -229,6 +281,7 @@ run_reconfigure() {
     printf '   2) XHTTP / CDN (SNI, путь, target, CDN-домен, транспорт)\n' > /dev/tty
     printf '   3) minClientVer REALITY\n' > /dev/tty
     printf '   4) ACME method (для новых сертификатов)\n' > /dev/tty
+    printf '   5) WARP (включить/выключить, режим маршрутизации)\n' > /dev/tty
     printf '   0) Сохранить и применить\n' > /dev/tty
     printf '   q) Выйти без изменений\n' > /dev/tty
     ask choice__ "Выберите пункт" "0"
@@ -261,6 +314,10 @@ run_reconfigure() {
         unset __acme_default
         warn "Уже выпущенные сертификаты продолжат продлеваться прежним способом; новое значение — для новых выпусков/перевыпуска."
         ;;
+      5)
+        reconfigure_choose_warp
+        RECONFIGURE_WARP_DIRTY=1
+        ;;
       0)
         reconfigure_apply
         exit 0
@@ -270,7 +327,7 @@ run_reconfigure() {
         exit 0
         ;;
       *)
-        warn "Введите 0, 1, 2, 3, 4 или q."
+        warn "Введите 0, 1, 2, 3, 4, 5 или q."
         ;;
     esac
   done

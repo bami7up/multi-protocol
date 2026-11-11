@@ -30,6 +30,11 @@ cdn_transport_enabled() {
 multiselect_filter() {
   # Набор включённых транспортов в виде JSON-массива для jq.
   local transports="" t
+  local warp="${ENABLE_WARP:-0}" warp_mode="${WARP_ROUTE_MODE:-ai}"
+  local warp_mark="${WARP_FWMARK:-255}" warp_domains="[]"
+  if [[ "$warp" == 1 ]]; then
+    warp_domains="$(warp_route_domains_json)"
+  fi
   for t in ws xhttp grpc; do
     if cdn_transport_enabled "$t"; then
       transports+="\"$t\","
@@ -48,8 +53,15 @@ multiselect_filter() {
      --arg xtarget "$XHTTP_TARGET" \
      --argjson transports "$transports" \
      --argjson xhttp "$ENABLE_XHTTP" \
-     --argjson cdn "$ENABLE_CDN" '
+     --argjson cdn "$ENABLE_CDN" \
+     --argjson warp "$warp" \
+     --arg warp_mode "$warp_mode" \
+     --argjson warp_mark "$warp_mark" \
+     --argjson warp_domains "$warp_domains" '
     # Транспорт CDN-инбаунда по его тегу (у остальных инбаундов — null).
+    # Профиль может быть частичным (например, собран вручную) — нормализуем
+    # структуру, иначе `|=` на отсутствующей ветке даёт null и jq падает.
+    .inbounds //= [] | .outbounds //= [] | .routing //= {} | .routing.rules //= [] |
     def cdn_transport(tag):
       if tag == "VLESS_CDN_WS" then "ws"
       elif tag == "VLESS_CDN_XHTTP" then "xhttp"
@@ -96,6 +108,32 @@ multiselect_filter() {
           else . end
         )
     )
+    # WARP: Xray помечает свои пакеты (sockopt.mark), ядро по правилу
+    # fwmark → table уводит их в туннель. DomainStrategy ForceIPv4 обязателен:
+    # IPv6 у WARP часто «чёрная дыра», и часть доменов на ней зависает.
+    | .outbounds = ((.outbounds | map(select(.tag != "WARP"))) + (
+        if $warp == 1
+        then [{ tag: "WARP",
+                protocol: "freedom",
+                settings: { domainStrategy: "ForceIPv4" },
+                streamSettings: { sockopt: { mark: $warp_mark } } }]
+        else [] end))
+    # Порядок правил в Xray — это приоритет. WARP-правило ставим ПЕРЕД первым
+    # не-BLOCK правилом: блоки (bittorrent, приватные сети) должны срабатывать
+    # раньше, а маршруты по умолчанию (DIRECT/балансер) — позже. Если все
+    # правила блочные, WARP дописывается в конец и становится путём по умолчанию.
+    | .routing = ((.routing // {}) | .rules = (
+        (.rules // []) as $rules
+        | ($rules | map(select(.outboundTag != "WARP"))) as $clean
+        | ($clean | map(.outboundTag == "BLOCK") | index(false)) as $pos
+        | (if $warp_mode == "all"
+           then { type: "field", network: "tcp,udp", outboundTag: "WARP" }
+           else { type: "field", domain: $warp_domains, outboundTag: "WARP" }
+           end) as $wrule
+        | if $warp != 1 then $clean
+          elif $pos == null then $clean + [$wrule]
+          else ($clean[0:$pos] + [$wrule] + $clean[$pos:])
+          end))
   '
 }
 
@@ -192,6 +230,13 @@ write_config_profile() {
     fi
     if (( ENABLE_CDN )); then
       profile_inbounds+=" + CDN ($CDN_TRANSPORT)"
+    fi
+    if (( ${ENABLE_WARP:-0} )); then
+      if [[ "${WARP_ROUTE_MODE:-ai}" == "all" ]]; then
+        profile_inbounds+=" + WARP (весь трафик)"
+      else
+        profile_inbounds+=" + WARP (AI-сервисы)"
+      fi
     fi
     ok "Config Profile сохранён: $out ($profile_inbounds)"
   else

@@ -139,6 +139,43 @@ if (( ENABLE_CDN )); then
   fi
 fi
 
+# WARP: исходящий туннель до Cloudflare. Нужен сервисам, которые не пускают
+# адреса хостингов (AI: OpenAI, Anthropic, Gemini). В быстром режиме решение
+# принимается дефолтом (включить), но спросить о нём — единственный способ
+# дать выбор без перехода в расширенный режим. Явно заданный (env/флаг)
+# ENABLE_WARP не переспрашивается.
+if [[ "$WARP_ENV_PRESENT" == 1 ]]; then
+  ENABLE_WARP="$(parse_bool "$ENABLE_WARP" 0)"
+  if (( ENABLE_WARP )); then
+    note "WARP: включён (значение из env/сохранённых настроек)"
+  else
+    note "WARP: отключён (значение из env/сохранённых настроек)"
+  fi
+elif [[ "${QUICK_SETUP:-0}" == 1 ]]; then
+  ask_bool ENABLE_WARP "Поднять WARP (Cloudflare) для AI-сервисов?" "y"
+else
+  note "WARP — отдельный туннель до Cloudflare для сервисов, которые не пускают IP хостингов."
+  note "Через него пойдут только AI/заблокированные домены (OpenAI, Anthropic, Gemini), остальное — напрямую."
+  ask_bool ENABLE_WARP "Поднять исходящий туннель WARP (Cloudflare)?" "y"
+fi
+if (( ENABLE_WARP )); then
+  if [[ -n "${WARP_ROUTE_MODE:-}" && "$WARP_ROUTE_MODE" != "ai" && "$WARP_ROUTE_MODE" != "all" ]]; then
+    die "WARP_ROUTE_MODE должен быть ai или all (получено: $WARP_ROUTE_MODE)."
+  fi
+  if [[ "${QUICK_SETUP:-0}" == 1 ]]; then
+    WARP_ROUTE_MODE="${WARP_ROUTE_MODE:-ai}"
+  else
+    __warp_route_default=1
+    [[ "$WARP_ROUTE_MODE" == "all" ]] && __warp_route_default=2
+    ask_choice WARP_ROUTE_MODE "Что заворачивать в WARP" "$__warp_route_default" \
+      "ai: только AI/заблокированные сервисы — остальное напрямую (рекомендуется)" \
+      "all: весь исходящий трафик ноды через WARP"
+    unset __warp_route_default
+  fi
+  note "WARP: режим $WARP_ROUTE_MODE, метка fwmark $WARP_FWMARK, таблица $WARP_TABLE"
+  note "Управление после установки: remnawave-warp (status | rotate | log | uninstall)"
+fi
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # БЛОК 4/4: Панель Remnawave
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -180,6 +217,20 @@ write_env_store() {
       printf 'export CDN_WS_PATH=%q\n' "$CDN_WS_PATH"
       printf 'export CDN_XHTTP_PATH=%q\n' "$CDN_XHTTP_PATH"
       printf 'export CDN_GRPC_PATH=%q\n' "$CDN_GRPC_PATH"
+    fi
+    # WARP: решение сохраняется в читаемом виде (как ENABLE_XHTTP/ENABLE_CDN),
+    # иначе повторный запуск вернул бы его по дефолту режима.
+    printf 'export ENABLE_WARP=%s\n' "$(bool_yn "${ENABLE_WARP:-0}")"
+    if (( ${ENABLE_WARP:-0} )); then
+      printf 'export WARP_ROUTE_MODE=%q\n' "${WARP_ROUTE_MODE:-ai}"
+      printf 'export WARP_FWMARK=%q\n' "${WARP_FWMARK:-255}"
+      printf 'export WARP_TABLE=%q\n' "${WARP_TABLE:-51820}"
+      if [[ -n "${WARP_ROUTE_DOMAINS:-}" ]]; then
+        printf 'export WARP_ROUTE_DOMAINS=%q\n' "$WARP_ROUTE_DOMAINS"
+      fi
+      if [[ -n "${WARP_ROUTE_GEOSITE:-}" ]]; then
+        printf 'export WARP_ROUTE_GEOSITE=%q\n' "$WARP_ROUTE_GEOSITE"
+      fi
     fi
     printf 'export PANEL_IP=%q\n' "${PANEL_IP:-}"
     printf 'export NODE_API_PORT=%q\n' "${NODE_API_PORT:-2222}"
