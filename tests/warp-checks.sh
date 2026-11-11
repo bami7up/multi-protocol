@@ -375,4 +375,4 @@ if grep -q '^export WARP_ROUTE_DOMAINS=' "$ENV_STORE"; then
 fi
 ok "env-файл: ENABLE_WARP, режим, метка и домены сохраняются и снимаются"
 
-printf 'все проверки WARP прошли\n' 
+printf 'все проверки WARP прошли\n'

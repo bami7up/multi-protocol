@@ -657,7 +657,9 @@ warp_disable() {
   rm -f "$WARP_CONF" "$WARP_RP_FILTER_FILE"
   rm -rf -- "$WARP_DIR" "$WARP_STATE_DIR"
   rm -f /usr/local/bin/wgcf /usr/local/bin/remnawave-warp
-  have sysctl && sysctl --system >/dev/null 2>&1 || true
+  if have sysctl; then
+    sysctl --system >/dev/null 2>&1 || true
+  fi
   ok "WARP удалён (туннель, watchdog, CLI, правило маршрутизации)"
 }
 
