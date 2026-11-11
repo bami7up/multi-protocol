@@ -66,7 +66,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/
 
 Первым делом мастер спросит **режим установки** (пропускается флагами `--quick`/`--advanced` или env `QUICK_SETUP=y/n`; выбор сохраняется в `/root/remnanode.env`):
 
-- **Быстрая автоустановка (рекомендуется)** — всего **8 вводов**, остальное установщик выбирает сам — меньше действий, меньше ошибок:
+- **Быстрая автоустановка (рекомендуется)** — всего **9 вводов**, остальное установщик выбирает сам — меньше действий, меньше ошибок:
   1. `Базовый домен` — просто домен без `https://`, `www` и слэшей (например `example.com`); вставленный «как из браузера» вид (`https://Example.COM/`) установщик сам приведёт к чистому.
   2. `Cloudflare API Token` (скрытый ввод) — после этого поддомены VLESS/Hysteria2 создадутся сами со случайными именами, а для CDN создастся уникальный поддомен `cdn-<hex>.<ваш домен>` с проксируемой записью (несколько нод на одном домене не перезаписывают друг друга и работают на бесплатном Cloudflare Universal SSL `*.example.com`).
   3. `Домен панели` — **полным URL с `https://`**: правильно `https://panel.example.com` и `https://panel.example.com/` — хвостовой слэш срезается автоматически. Можно ввести просто `panel.example.com` — `https://` добавится сам. Неправильно — с путём: `panel.example.com/login`.
@@ -75,6 +75,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/
   6. `Шаблон подписки XRAY` — выбор одной клавишей: `1` (`standard`, по умолчанию по Enter — весь трафик через VPN) или `2` (`split` — раздельное туннелирование).
   7. `Транспорт VLESS за CDN` — `ws`, `xhttp`, `grpc`, `both` (ws+xhttp) или `all` (все три); по умолчанию — сохранённый или `ws`.
   8. `XHTTP target для REALITY` — `external` (`www.gstatic.com:443`, проверенный вариант) или `local` (локальный self-steal `127.0.0.1:9443`, экспериментальный режим).
+  9. `Поднять WARP (Cloudflare) для AI-сервисов?` — `y` (по умолчанию). Отдельный WireGuard-туннель только для AI-сервисов: остальной трафик идёт напрямую. `n` — не ставить (см. [WARP: исходящий туннель Cloudflare](#warp-исходящий-туннель-cloudflare)).
 
   Автоматически и без вопросов: XHTTP включён (SNI `www.gstatic.com`), пути транспортов XHTTP/CDN — случайные, CDN включён (`cdn-<hex>.<домен>`, запись создаёт сам установщик), тема фасада на свежей установке — случайная из пяти, **уникальный тег балансировки ноды (`NODE_TAG`)** (например `QUIET_OTTER_631F` / `AMBER_FALCON_C34B` вместо общего `USA`; суффикс — короткий хэш адреса ноды, поэтому несколько нод в одной панели не смешивают скрытые хосты), **порт ноды — случайный** из диапазона 11000–59999 (показывается в сводке и сохраняется; повторный запуск порт, CDN-домен, тег, пути и тему не меняет). На шаге 9 установщик сначала создаёт в панели Config Profile (с автоматически сгенерированными X25519 ключами REALITY), саму ноду, персональный шаблон подписки ноды (`XRAY standard <node>` / `XRAY split <node>`), скрытые рабочие и видимый виртуальный хосты и Internal Squad, затем получает `SECRET_KEY` через `GET /keygen`, запускает `remnawave/node:3.4.4` (переопределяется `NODE_IMAGE`) и сразу синхронизирует Xray.
 - **Расширенная настройка** — прежние 4 блока с полным ручным контролем (ниже). Нужна, если нет Cloudflare, поддомены создаёте вручную или хотите свои пути/транспорт CDN/ручной CDN-домен.
@@ -96,6 +97,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bami7up/multi-protocol/main/
 **Блок 3/4 — Протоколы:**
 - `Включить XHTTP?` — `y` (рекомендуется, современный транспорт) → спросит маскировочный `SNI` (`www.gstatic.com`), `путь` (`/api/v3/sync/r1`) и `target REALITY`: `external` (`www.gstatic.com:443`) или `local` (`127.0.0.1:9443`, локальный self-steal; экспериментально).
 - `Добавить VLESS за CDN?` — `y`/`n`. При `y` — `CDN_HOST` (например `cdn.example.com` под оранжевым облаком), `транспорт` (`ws`/`xhttp`/`grpc`/`both`/`all`) и пути. **Куда:** отдельный SNI-маршрут Caddy `127.0.0.1:9444` → `10446–10448`. **Зачем:** прячет TCP-маршрут VLESS/CDN; Hysteria2 остаётся прямой.
+- `Поднять исходящий туннель WARP?` — `y`/`n` (по умолчанию `y`), затем `Что заворачивать в WARP`: `ai` (только AI/заблокированные сервисы, рекомендуется) или `all` (весь исходящий трафик ноды). **Куда:** `wg-quick@warp`, `/etc/wireguard/warp.conf`, `remnawave-warp` CLI. **Зачем:** OpenAI/Anthropic/Gemini не пускают IP хостингов — туннель подменяет адрес выхода только для них.
 
 **Блок 4/4 — Панель Remnawave:**
 - `IP панели` и `Порт ноды` (обычно `2222`) — нужны для UFW (открыть `NODE_PORT` только с IP панели). **Куда:** firewall ноды.
@@ -416,6 +418,7 @@ bash selfcheck.sh --quiet    # только проблемы
 | `lib/*.sh` | Не загружается на ноду | Исходники установщика: header, common, wizard, Cloudflare, шаблоны, Panel API, Caddy, сертификаты, uninstall, main |
 | `build.sh` | Для разработки/CI | Собирает единый `remnanode-setup.sh` из `lib/*.sh` |
 | `selfcheck.sh` | Запуск на ноде (cron/systemd timer) | Проверка сертификатов, CDN 525/526, слушателей и диска |
+| `lib/45-warp.sh` | Не загружается на ноду | WARP: конфиг WireGuard, watchdog, CLI `remnawave-warp`, правила маршрутизации |
 | `self-steal-templates/*.html` | В панель не загружается | Темы фасада (`vaultdrop`, `mail`, `cloud`, `admin`, `docs`); `none` — свой сайт |
 
 Служебные: `tests/` (проверки), `.github/workflows/validate.yml` (CI), `build.sh`, `lib/` (исходники), `LICENSE`, `SECURITY.md`, `VERSION`, `CHANGELOG.md`, `.github/ISSUE_TEMPLATE/`, `AUDIT.md`, `AUDIT-2026-11-03.md`.
@@ -531,6 +534,73 @@ SELF_STEAL_TEMPLATE=none bash remnanode-setup.sh --non-interactive --yes   # с�
 
 **Свой сайт (`none`):** установщик не скачивает шаблон и не перезаписывает каталог. Если `index.html` отсутствует, он предупреждает: Caddy будет отдавать 404, что ухудшает маскировку. Путь можно изменить через `SELF_STEAL_ROOT`.
 
+## WARP: исходящий туннель Cloudflare
+
+**Куда:** ядро ноды (`wg-quick@warp`) + `ip rule` + Xray outbound `WARP` в Config Profile.
+**Зачем:** AI-сервисы (OpenAI, Anthropic, Gemini) и часть заблокированных сайтов не пускают адреса хостингов и отвечают `403`. Запросы к ним уходят через Cloudflare WARP, адрес выхода меняется — сервис отвечает. Весь остальной трафик ноды и клиентов идёт напрямую с IP сервера: туннель не влияет ни на вход клиентов, ни на связь с панелью.
+
+```text
+Xray (нода)
+  │  outbound WARP: freedom + sockopt.mark 255
+  ▼
+ip rule fwmark 255 → table 51820          ← политика маршрутизации, main не меняется
+  ▼
+warp (wg-quick, MTU 1280, MSS clamp 1240)
+  ▼
+188.114.96|97.x:{2408,500,4500,1701}      ← watchdog меняет endpoint при блокировке
+  ▼
+Cloudflare WARP → openai.com / api.anthropic.com / generativelanguage.googleapis.com
+```
+
+Реализовано по мотивам [tagashi666/vps-warp](https://github.com/tagashi666/vps-warp), но живёт внутри установщика: отдельный модуль `lib/45-warp.sh`, никаких внешних скриптов.
+
+**Что делает установщик (шаг 9):**
+
+1. ставит `wireguard-tools`, `iptables`, `iputils-ping`;
+2. скачивает `wgcf` (закреплён тег **и** SHA256 под amd64/arm64) и регистрирует аккаунт в Cloudflare в `/etc/remnawave-warp/wgcf` (не в `$HOME`: `sudo` сбрасывает `HOME`, аккаунт терялся бы);
+3. собирает `/etc/wireguard/warp.conf` (0600) с нуля: только IPv4-адрес туннеля (IPv6 у WARP у части провайдеров — чёрная дыра), `Table = 51820`, `ip rule fwmark 255`, TCP MSS clamping и `PersistentKeepalive = 15`;
+4. понижает `rp_filter` со strict на loose и закрепляет в `/etc/sysctl.d/99-remnawave-warp.conf` — иначе обратный трафик туннеля дропается, и это выглядит как «хэндшейк есть, интерфейс активен, а трафика нет»;
+5. поднимает `wg-quick@warp`, ставит таймер `remnawave-warp-watchdog.timer` и CLI `remnawave-warp`;
+6. добавляет в `Multiselect.json` outbound `WARP` (`freedom` + `sockopt.mark`) и правило маршрутизации.
+
+**Что уходит в WARP** (`WARP_ROUTE_MODE=ai`, по умолчанию): `geosite:openai`, `geosite:anthropic`, `geosite:google-gemini`, `geosite:category-ai-!cn` и конкретные домены (`claude.ai`, `chatgpt.com`, `gemini.google.com`, `perplexity.ai`, `api.x.ai`, …). Добавить свои — `WARP_ROUTE_DOMAINS=example.org,*.foo.net` и/или `WARP_ROUTE_GEOSITE=anthropic,openai`; мусор в списке отбрасывается с предупреждением, а не уезжает в профиль. `WARP_ROUTE_MODE=all` заворачивает весь исходящий трафик ноды (тогда `DIRECT` остаётся только для BLOCK-правил).
+
+Правило `WARP` вставляется **после** BLOCK-правил (bittorrent, приватные сети) и **перед** маршрутом по умолчанию: порядок правил в Xray — это приоритет.
+
+**Управление на ноде:**
+
+| Команда | Что делает |
+|---|---|
+| `remnawave-warp` | статус: IP туннеля, endpoint, хэндшейк, правило, `rp_filter`, трафик |
+| `remnawave-warp start` / `stop` / `restart` | интерфейс (endpoint при `restart` сохраняется) |
+| `remnawave-warp rotate` | случайный endpoint Cloudflare и перезапуск |
+| `remnawave-warp log` | журнал watchdog (история ротаций) |
+| `remnawave-warp uninstall` | снять туннель, watchdog, правило, `sysctl`-файл и CLI |
+
+Строка `Маршрутизация:` в статусе показывает, на месте ли правило `fwmark 255 → table 51820`. Если там `MISSING` — помеченные пакеты Xray уходят с реального IP сервера: со стороны всё «работает», но не так, как задумано; лечится `remnawave-warp restart`.
+
+**Watchdog** срабатывает каждые 3 минуты: проверяет возраст хэндшейка (порог 180 s) и пингует `1.1.1.1`/`8.8.8.8`/`9.9.9.9` **с той же меткой**, которой ходит Xray. При сбое меняет endpoint и перезапускает туннель; пауза между ротациями растёт 3 → 6 → 12 → 24 → 30 минут и сбрасывается, как только связь вернулась. Смысл: при полной блокировке Cloudflare ротация не поможет, а 480 перезапусков WireGuard в сутки — сам по себе заметный признак. Если туннель остановлен вручную (`remnawave-warp stop`), watchdog молчит.
+
+**Требования и ограничения:**
+
+- только `x86_64`/`arm64` и системный `systemd` (иначе установщик откажется ещё до изменений);
+- нужен `CAP_NET_ADMIN` (`SO_MARK`) — он уже выдан контейнеру ноды в `docker-compose.yml`; `privileged: true` не требуется;
+- регистрация в Cloudflare бывает отклонена (rate-limit или блокировка IP хостинга) — установщик скажет об этом и не оставит ноду в нерабочем состоянии: нода продолжит работать напрямую;
+- ключ **WARP+** (`WARP_LICENSE` или вопрос мастера) опционален и на диск не сохраняется;
+- метка по умолчанию `255` (`WARP_FWMARK`/`--warp-mark`); менять только если 255 занята чем-то ещё — значение автоматически попадает в конфиг, правило, свежий профиль и вывод статуса;
+- **только AI/заблокированные домены**: список — не «гео-обход», а точечное исключение адресов хостинга. Для `all` помните, что через WARP пойдёт и трафик к сайтам клиентов.
+
+Проверить после установки:
+
+```bash
+remnawave-warp                     # ACTIVE, свежий хэндшейк, правило ok
+curl -s https://api.ipify.org      # прямой IP сервера
+ping -m 255 -c1 1.1.1.1            # маршрут помеченных пакетов живой
+docker exec remnanode xray version # нода подхватила профиль с outbound WARP
+```
+
+---
+
 ## Сертификаты и ACME: HTTP-01 vs DNS-01
 
 Установщик выпускает сертификаты через `acme.sh` для self-steal домена, Hysteria2 и (при CDN) origin-домена.
@@ -630,10 +700,14 @@ bash remnanode-setup.sh --non-interactive --yes
 --no-cloudflare       не использовать Cloudflare
 --panel-url URL       URL панели Remnawave (для авто-настройки)
 --node-tag TAG        уникальный тег балансировки ноды (A-Z0-9_:, до 32 символов)
---quick               быстрый режим мастера: 8 вопросов, остальное — авто/случайно
+--warp                поднять исходящий туннель Cloudflare WARP (WireGuard) для AI-сервисов
+--no-warp             не ставить WARP
+--warp-route MODE     ai (только AI/заблокированные сервисы, по умолчанию) или all (весь трафик)
+--warp-mark N         метка пакетов для WARP (sockopt.mark, по умолчанию 255)
+--quick               быстрый режим мастера: 9 вопросов, остальное — авто/случайно
 --advanced            расширенный режим мастера: все вопросы по блокам
 --uninstall           удалить managed-компоненты (нода, Caddyfile, сертификаты, UFW, env); пакеты остаются
---reconfigure         интерактивно изменить настройки установленной ноды (фасад, XHTTP/CDN, minClientVer, ACME)
+--reconfigure         интерактивно изменить настройки установленной ноды (фасад, XHTTP/CDN, WARP, minClientVer, ACME)
 --dry-run             показать план --uninstall без изменений
 --version             показать версию/ревизию
 -y, --yes             подтвердить yes/no
@@ -641,7 +715,9 @@ bash remnanode-setup.sh --non-interactive --yes
 -h, --help            справка
 ```
 
-Переменные: `BASE_DOMAIN`, `PREFIX`, `SELF_STEAL_HOST`, `ENABLE_XHTTP`, `XHTTP_SNI`, `XHTTP_PATH`, `REALITY_MIN_CLIENT_VER`, `XHTTP_TARGET`, `ENABLE_CDN`, `CDN_HOST`, `CDN_TRANSPORT`, `CDN_WS_PATH`, `CDN_XHTTP_PATH`, `CDN_GRPC_PATH`, `PANEL_IP`, `NODE_API_PORT`, `SECRET_KEY`, `NODE_IMAGE`, `CUSTOM_CORE_URL`, `SELF_STEAL_TEMPLATE`, `SELF_STEAL_TEMPLATE_URL`, `SELF_STEAL_ROOT`, `MULTISELECT_TEMPLATE_URL`, `SELF_STEAL_RAW_BASE`, `NODE_TAG`, `ACME_METHOD`, `XRAY_LOG_DIR`, `XCADDY_VERSION`, `CADDY_VERSION`, `CADDY_L4_VERSION`, `DOCKER_INSTALL_URL`, `DOCKER_INSTALL_SHA256`, `ACME_INSTALL_URL`, `ACME_INSTALL_SHA256`, `ACME_AUTO_UPGRADE`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ZONE`, `REMNAWAVE_PANEL_URL`, `REMNAWAVE_API_TOKEN`, `REMNAWAVE_AUTO_SETUP`, `QUICK_SETUP`, `XRAY_TEMPLATE_CHOICE`, `NODE_DIR`, `CERT_DIR`, `ENV_STORE`, `KEEP_BUILD_TOOLS`. Логические понимают `y/yes/1/true/on`/`n/no/0/false/off`. `SERVER_IP` из env важнее автодетекта (для NAT).
+Переменные: `BASE_DOMAIN`, `PREFIX`, `SELF_STEAL_HOST`, `ENABLE_XHTTP`, `XHTTP_SNI`, `XHTTP_PATH`, `REALITY_MIN_CLIENT_VER`, `XHTTP_TARGET`, `ENABLE_CDN`, `CDN_HOST`, `CDN_TRANSPORT`, `CDN_WS_PATH`, `CDN_XHTTP_PATH`, `CDN_GRPC_PATH`,
+`ENABLE_WARP`, `WARP_ROUTE_MODE`, `WARP_FWMARK`, `WARP_TABLE`, `WARP_MTU`, `WARP_IFACE`,
+`WARP_ROUTE_DOMAINS`, `WARP_ROUTE_GEOSITE`, `WARP_LICENSE`, `WGCF_VERSION`, `PANEL_IP`, `NODE_API_PORT`, `SECRET_KEY`, `NODE_IMAGE`, `CUSTOM_CORE_URL`, `SELF_STEAL_TEMPLATE`, `SELF_STEAL_TEMPLATE_URL`, `SELF_STEAL_ROOT`, `MULTISELECT_TEMPLATE_URL`, `SELF_STEAL_RAW_BASE`, `NODE_TAG`, `ACME_METHOD`, `XRAY_LOG_DIR`, `XCADDY_VERSION`, `CADDY_VERSION`, `CADDY_L4_VERSION`, `DOCKER_INSTALL_URL`, `DOCKER_INSTALL_SHA256`, `ACME_INSTALL_URL`, `ACME_INSTALL_SHA256`, `ACME_AUTO_UPGRADE`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ZONE`, `REMNAWAVE_PANEL_URL`, `REMNAWAVE_API_TOKEN`, `REMNAWAVE_AUTO_SETUP`, `QUICK_SETUP`, `XRAY_TEMPLATE_CHOICE`, `NODE_DIR`, `CERT_DIR`, `ENV_STORE`, `KEEP_BUILD_TOOLS`. Логические понимают `y/yes/1/true/on`/`n/no/0/false/off`. `SERVER_IP` из env важнее автодетекта (для NAT).
 
 ## Внешние источники и воспроизводимость
 
@@ -649,6 +725,7 @@ bash remnanode-setup.sh --non-interactive --yes
 |---|---|---|
 | `docker/docker-install@ada7a567` | Docker, если не установлен | `DOCKER_INSTALL_URL` + `DOCKER_INSTALL_SHA256` |
 | `acme.sh v3.1.6` | `acme.sh` в `/root/.acme.sh` | `ACME_INSTALL_URL` + `ACME_INSTALL_SHA256`; автообновление — `ACME_AUTO_UPGRADE=1` |
+| `wgcf v2.3.1` | Регистрация аккаунта WARP и WireGuard-профиль | `WGCF_VERSION` + `WGCF_SHA256_AMD64` / `WGCF_SHA256_ARM64` (проверяется при скачивании) |
 | `dl.google.com/go` | Go для сборки Caddy | `GO_VERSION` + SHA256 |
 | `caddyserver/caddy` | исходники Caddy | `CADDY_VERSION` |
 | `mholt/caddy-l4` | layer4 | `CADDY_L4_VERSION` |

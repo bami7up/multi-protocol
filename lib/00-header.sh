@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Заголовок установщика: версия, константы, usage и цвета.
 # Единый remnanode-setup.sh собирается из lib/*.sh через build.sh.
 
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 
 BUILD_COMPOSE=1
 MANAGE_FIREWALL=1
@@ -33,9 +33,9 @@ CF_ZONE_NAME=""
 # проксируемую запись сам, "manual"/"" — запись должен создать пользователь.
 # Значение показывается в сводке, чтобы отсутствие записи не было тихим.
 CDN_DNS_MANAGED=""
-# Быстрый режим мастера (--quick / QUICK_SETUP=y): только 8 вопросов —
+# Быстрый режим мастера (--quick / QUICK_SETUP=y): только 9 вопросов —
 # домен, токен Cloudflare, домен панели, токен панели, IP панели, шаблон
-# подписки, транспорт CDN и XHTTP target (external/local).
+# подписки, транспорт CDN, XHTTP target (external/local) и WARP (да/нет).
 # Поддомены, CDN, пути, тема фасада и порт ноды выбираются автоматически.
 # QUICK_SETUP_SETTING: "" — решать по env/сохранённому/вопросу, 1 — --quick,
 # 0 — --advanced. ENV_STORE_LOADED отличает свежую установку от повторной
@@ -65,6 +65,67 @@ NODE_IMAGE="${NODE_IMAGE:-remnawave/node:3.4.4}"
 # иначе полный https:// URL на бинарник. Мutable "latest" удобен, но не
 # воспроизводим: для продакшена лучше закрепить конкретный release URL.
 CUSTOM_CORE_URL="${CUSTOM_CORE_URL:-}"
+# WARP: исходящий туннель WireGuard до Cloudflare для сервисов, которые не
+# пускают адреса хостингов (AI: OpenAI, Anthropic, Gemini). В туннель уходит
+# только помеченный трафик — остальное идёт напрямую с IP сервера. Схема:
+# отдельная таблица маршрутизации + ip rule fwmark, watchdog с ротацией
+# endpoint, CLI remnawave-warp. Реализация — lib/45-warp.sh.
+# ENABLE_WARP: "" — решить по режиму мастера, 1 — включить, 0 — не ставить.
+ENABLE_WARP="${ENABLE_WARP:-}"
+WARP_SETTING=""
+# Задан ли WARP явно (env/сохранённый env-файл/флаг) — тогда мастер не
+# спрашивает и не переопределяет решение дефолтом режима.
+WARP_ENV_PRESENT=0
+[[ -n "${ENABLE_WARP:-}" ]] && WARP_ENV_PRESENT=1
+# Метка (SO_MARK) в sockopt у outbound'а WARP. Должна совпадать с ip rule.
+WARP_FWMARK="${WARP_FWMARK:-255}"
+WARP_TABLE="${WARP_TABLE:-51820}"
+WARP_MTU="${WARP_MTU:-1280}"
+WARP_IFACE="${WARP_IFACE:-warp}"
+# MSS = MTU − 40 (IPv4+TCP); без clamping тяжёлые сайты зависают.
+WARP_MSS=$((WARP_MTU - 40))
+# Путь трафика через WARP: ai — только AI/заблокированные сервисы (домены
+# берутся из WARP_ROUTE_DOMAINS_DEFAULT), all — весь исходящий трафик ноды.
+WARP_ROUTE_MODE="${WARP_ROUTE_MODE:-ai}"
+WARP_CONF="/etc/wireguard/${WARP_IFACE}.conf"
+WARP_STATE_DIR="/etc/remnawave-warp"
+WARP_DIR="/opt/remnawave-warp"
+WARP_RP_FILTER_FILE="/etc/sysctl.d/99-remnawave-warp.conf"
+# Пул endpoint'ов Cloudflare: индексы 188.114.96/97 — те, что обычно проходят.
+WARP_ENDPOINT_SUBNETS="${WARP_ENDPOINT_SUBNETS:-188.114.96 188.114.97}"
+WARP_ENDPOINT_PORTS="${WARP_ENDPOINT_PORTS:-2408 500 4500 1701}"
+# wgcf регистрирует аккаунт и генерирует WireGuard-профиль. Версия закреплена:
+# «последняя» превращала бы установку в запуск произвольного бинарника от root.
+WGCF_VERSION="${WGCF_VERSION:-v2.3.1}"
+WGCF_SHA256_AMD64="${WGCF_SHA256_AMD64:-4fb7a136aa470ece11d17949c7db07b040ec9c604742dc8680bcf1889f85d0c8}"
+WGCF_SHA256_ARM64="${WGCF_SHA256_ARM64:-710ab2d8ac145d81a4cf0c11bdb0e05914f77ae2a45f67b87e718d84b4cb7301}"
+# Ключ WARP+ (опционально): вводится один раз и на диск не сохраняется.
+WARP_LICENSE="${WARP_LICENSE:-}"
+# Домены/geosite, которые уходят в WARP. Добавить свои: WARP_ROUTE_DOMAINS
+# (список через запятую) и WARP_ROUTE_GEOSITE (имена geosite-категорий).
+WARP_ROUTE_DOMAINS="${WARP_ROUTE_DOMAINS:-}"
+WARP_ROUTE_GEOSITE="${WARP_ROUTE_GEOSITE:-}"
+WARP_ROUTE_DOMAINS_DEFAULT=(
+  "geosite:openai"
+  "geosite:anthropic"
+  "geosite:google-gemini"
+  "geosite:category-ai-!cn"
+  "domain:claude.ai"
+  "domain:chatgpt.com"
+  "domain:chat.com"
+  "domain:openai.com"
+  "domain:anthropic.com"
+  "domain:gemini.google.com"
+  "domain:aistudio.google.com"
+  "domain:generativelanguage.googleapis.com"
+  "domain:perplexity.ai"
+  "domain:copilot.microsoft.com"
+  "domain:api.x.ai"
+  "domain:grok.com"
+)
+# Заполняется на шаге WARP: IP туннеля для сводки.
+WARP_LOCAL_IP=""
+WARP_READY=0
 # Внешние install-скрипты закреплены по commit/tag и SHA256: get.docker.com и
 # get.acme.sh отдают плавающий master. Свои значения можно передать через env.
 DOCKER_INSTALL_URL="${DOCKER_INSTALL_URL:-https://raw.githubusercontent.com/docker/docker-install/ada7a567e59b/install.sh}"
@@ -186,15 +247,21 @@ remnanode-setup.sh — установка ноды Remnawave (VLESS + Hysteria2 
   --acme-method M       auto | dns | http. auto: DNS-01 при Cloudflare-токене,
                         иначе HTTP-01; dns не останавливает Caddy и не рвёт 443/tcp
   --xray-template T     шаблон подписки: standard (весь трафик через VPN) или split
+  --warp                поднять исходящий туннель Cloudflare WARP (WireGuard) для
+                        AI-сервисов и включить outbound WARP в Config Profile
+  --no-warp             не ставить WARP (по умолчанию WARP включается в быстром режиме)
+  --warp-route MODE     ai — через WARP только AI/заблокированные сервисы
+                        (по умолчанию), all — весь исходящий трафик ноды
+  --warp-mark N         метка пакетов для WARP (sockopt.mark, по умолчанию 255)
   --cloudflare          создать A-записи через Cloudflare API
   --no-cloudflare       не использовать Cloudflare, даже если токен в env
   --panel-url URL       URL панели Remnawave (напр. https://panel.example.com)
-  --quick               быстрый режим мастера: 8 вопросов, остальное — авто/случайно
+  --quick               быстрый режим мастера: 9 вопросов, остальное — авто/случайно
   --advanced            расширенный режим мастера: все вопросы (как раньше)
   --uninstall           удалить управляемые компоненты (нода, Caddyfile,
                         сертификаты, UFW-правила, env-файл); пакеты остаются
   --reconfigure         интерактивно изменить настройки уже установленной ноды
-                        (тема фасада, XHTTP/CDN, minClientVer, ACME method)
+                        (тема фасада, XHTTP/CDN, WARP, minClientVer, ACME method)
   --dry-run             показать, что удалит --uninstall, без изменений
   --version             показать версию/ревизию
   -y | --yes            авто-подтверждение всех «y/n» вопросов
@@ -206,6 +273,8 @@ remnanode-setup.sh — установка ноды Remnawave (VLESS + Hysteria2 
   ENABLE_CDN, CDN_HOST, CDN_TRANSPORT, CDN_WS_PATH, CDN_XHTTP_PATH, CDN_GRPC_PATH,
   PANEL_IP, NODE_API_PORT, SECRET_KEY, NODE_IMAGE, NODE_TAG,
   CUSTOM_CORE_URL,
+  ENABLE_WARP, WARP_ROUTE_MODE, WARP_FWMARK, WARP_TABLE, WARP_MTU, WARP_IFACE,
+  WARP_ROUTE_DOMAINS, WARP_ROUTE_GEOSITE, WARP_LICENSE, WGCF_VERSION,
   SELF_STEAL_TEMPLATE, SELF_STEAL_TEMPLATE_URL, SELF_STEAL_ROOT,
   MULTISELECT_TEMPLATE_URL,
   REALITY_MIN_CLIENT_VER, XHTTP_TARGET, ACME_METHOD,
@@ -218,16 +287,16 @@ remnanode-setup.sh — установка ноды Remnawave (VLESS + Hysteria2 
   QUICK_SETUP, SERVER_IP, NODE_DIR, CERT_DIR, ENV_STORE, KEEP_BUILD_TOOLS,
   XRAY_LOG_DIR
 
-Логические переменные (ENABLE_XHTTP, ENABLE_CDN, REMNAWAVE_AUTO_SETUP, QUICK_SETUP, KEEP_BUILD_TOOLS) понимают
+Логические переменные (ENABLE_XHTTP, ENABLE_CDN, ENABLE_WARP, REMNAWAVE_AUTO_SETUP, QUICK_SETUP, KEEP_BUILD_TOOLS) понимают
 y/yes/1/true/on и n/no/0/false/off в любом регистре; пустое значение означает ответ по умолчанию.
 Значение SERVER_IP (в том числе из сохранённого env-файла) важнее автодетекта:
 задайте его, если нода за NAT или внешние сервисы определения IP недоступны.
 
 Интерактивный мастер сначала спросит режим:
-  быстрый (рекомендуется): всего 8 вопросов — домен, токен Cloudflare,
+  быстрый (рекомендуется): всего 9 вопросов — домен, токен Cloudflare,
     домен панели (полным URL: https://panel.example.com), токен панели,
-    IP панели, шаблон подписки, транспорт CDN и XHTTP target (external/local);
-    поддомены, CDN-домен, пути, тема и порт ноды — автоматически;
+    IP панели, шаблон подписки, транспорт CDN, XHTTP target (external/local)
+    и WARP (да/нет); поддомены, CDN-домен, пути, тема и порт ноды — автоматически;
   расширенный: прежние 4 блока вопросов со всеми настройками.
 USAGE
 }
@@ -242,4 +311,4 @@ else
 fi
 
 RULE='────────────────────────────────────────────────────────────────'
-STEP_TOTAL=10
+STEP_TOTAL=11

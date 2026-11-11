@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Заголовок установщика: версия, константы, usage и цвета.
 # Единый remnanode-setup.sh собирается из lib/*.sh через build.sh.
 
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 
 BUILD_COMPOSE=1
 MANAGE_FIREWALL=1
@@ -33,9 +33,9 @@ CF_ZONE_NAME=""
 # проксируемую запись сам, "manual"/"" — запись должен создать пользователь.
 # Значение показывается в сводке, чтобы отсутствие записи не было тихим.
 CDN_DNS_MANAGED=""
-# Быстрый режим мастера (--quick / QUICK_SETUP=y): только 8 вопросов —
+# Быстрый режим мастера (--quick / QUICK_SETUP=y): только 9 вопросов —
 # домен, токен Cloudflare, домен панели, токен панели, IP панели, шаблон
-# подписки, транспорт CDN и XHTTP target (external/local).
+# подписки, транспорт CDN, XHTTP target (external/local) и WARP (да/нет).
 # Поддомены, CDN, пути, тема фасада и порт ноды выбираются автоматически.
 # QUICK_SETUP_SETTING: "" — решать по env/сохранённому/вопросу, 1 — --quick,
 # 0 — --advanced. ENV_STORE_LOADED отличает свежую установку от повторной
@@ -65,6 +65,67 @@ NODE_IMAGE="${NODE_IMAGE:-remnawave/node:3.4.4}"
 # иначе полный https:// URL на бинарник. Мutable "latest" удобен, но не
 # воспроизводим: для продакшена лучше закрепить конкретный release URL.
 CUSTOM_CORE_URL="${CUSTOM_CORE_URL:-}"
+# WARP: исходящий туннель WireGuard до Cloudflare для сервисов, которые не
+# пускают адреса хостингов (AI: OpenAI, Anthropic, Gemini). В туннель уходит
+# только помеченный трафик — остальное идёт напрямую с IP сервера. Схема:
+# отдельная таблица маршрутизации + ip rule fwmark, watchdog с ротацией
+# endpoint, CLI remnawave-warp. Реализация — lib/45-warp.sh.
+# ENABLE_WARP: "" — решить по режиму мастера, 1 — включить, 0 — не ставить.
+ENABLE_WARP="${ENABLE_WARP:-}"
+WARP_SETTING=""
+# Задан ли WARP явно (env/сохранённый env-файл/флаг) — тогда мастер не
+# спрашивает и не переопределяет решение дефолтом режима.
+WARP_ENV_PRESENT=0
+[[ -n "${ENABLE_WARP:-}" ]] && WARP_ENV_PRESENT=1
+# Метка (SO_MARK) в sockopt у outbound'а WARP. Должна совпадать с ip rule.
+WARP_FWMARK="${WARP_FWMARK:-255}"
+WARP_TABLE="${WARP_TABLE:-51820}"
+WARP_MTU="${WARP_MTU:-1280}"
+WARP_IFACE="${WARP_IFACE:-warp}"
+# MSS = MTU − 40 (IPv4+TCP); без clamping тяжёлые сайты зависают.
+WARP_MSS=$((WARP_MTU - 40))
+# Путь трафика через WARP: ai — только AI/заблокированные сервисы (домены
+# берутся из WARP_ROUTE_DOMAINS_DEFAULT), all — весь исходящий трафик ноды.
+WARP_ROUTE_MODE="${WARP_ROUTE_MODE:-ai}"
+WARP_CONF="/etc/wireguard/${WARP_IFACE}.conf"
+WARP_STATE_DIR="/etc/remnawave-warp"
+WARP_DIR="/opt/remnawave-warp"
+WARP_RP_FILTER_FILE="/etc/sysctl.d/99-remnawave-warp.conf"
+# Пул endpoint'ов Cloudflare: индексы 188.114.96/97 — те, что обычно проходят.
+WARP_ENDPOINT_SUBNETS="${WARP_ENDPOINT_SUBNETS:-188.114.96 188.114.97}"
+WARP_ENDPOINT_PORTS="${WARP_ENDPOINT_PORTS:-2408 500 4500 1701}"
+# wgcf регистрирует аккаунт и генерирует WireGuard-профиль. Версия закреплена:
+# «последняя» превращала бы установку в запуск произвольного бинарника от root.
+WGCF_VERSION="${WGCF_VERSION:-v2.3.1}"
+WGCF_SHA256_AMD64="${WGCF_SHA256_AMD64:-4fb7a136aa470ece11d17949c7db07b040ec9c604742dc8680bcf1889f85d0c8}"
+WGCF_SHA256_ARM64="${WGCF_SHA256_ARM64:-710ab2d8ac145d81a4cf0c11bdb0e05914f77ae2a45f67b87e718d84b4cb7301}"
+# Ключ WARP+ (опционально): вводится один раз и на диск не сохраняется.
+WARP_LICENSE="${WARP_LICENSE:-}"
+# Домены/geosite, которые уходят в WARP. Добавить свои: WARP_ROUTE_DOMAINS
+# (список через запятую) и WARP_ROUTE_GEOSITE (имена geosite-категорий).
+WARP_ROUTE_DOMAINS="${WARP_ROUTE_DOMAINS:-}"
+WARP_ROUTE_GEOSITE="${WARP_ROUTE_GEOSITE:-}"
+WARP_ROUTE_DOMAINS_DEFAULT=(
+  "geosite:openai"
+  "geosite:anthropic"
+  "geosite:google-gemini"
+  "geosite:category-ai-!cn"
+  "domain:claude.ai"
+  "domain:chatgpt.com"
+  "domain:chat.com"
+  "domain:openai.com"
+  "domain:anthropic.com"
+  "domain:gemini.google.com"
+  "domain:aistudio.google.com"
+  "domain:generativelanguage.googleapis.com"
+  "domain:perplexity.ai"
+  "domain:copilot.microsoft.com"
+  "domain:api.x.ai"
+  "domain:grok.com"
+)
+# Заполняется на шаге WARP: IP туннеля для сводки.
+WARP_LOCAL_IP=""
+WARP_READY=0
 # Внешние install-скрипты закреплены по commit/tag и SHA256: get.docker.com и
 # get.acme.sh отдают плавающий master. Свои значения можно передать через env.
 DOCKER_INSTALL_URL="${DOCKER_INSTALL_URL:-https://raw.githubusercontent.com/docker/docker-install/ada7a567e59b/install.sh}"
@@ -186,15 +247,21 @@ remnanode-setup.sh — установка ноды Remnawave (VLESS + Hysteria2 
   --acme-method M       auto | dns | http. auto: DNS-01 при Cloudflare-токене,
                         иначе HTTP-01; dns не останавливает Caddy и не рвёт 443/tcp
   --xray-template T     шаблон подписки: standard (весь трафик через VPN) или split
+  --warp                поднять исходящий туннель Cloudflare WARP (WireGuard) для
+                        AI-сервисов и включить outbound WARP в Config Profile
+  --no-warp             не ставить WARP (по умолчанию WARP включается в быстром режиме)
+  --warp-route MODE     ai — через WARP только AI/заблокированные сервисы
+                        (по умолчанию), all — весь исходящий трафик ноды
+  --warp-mark N         метка пакетов для WARP (sockopt.mark, по умолчанию 255)
   --cloudflare          создать A-записи через Cloudflare API
   --no-cloudflare       не использовать Cloudflare, даже если токен в env
   --panel-url URL       URL панели Remnawave (напр. https://panel.example.com)
-  --quick               быстрый режим мастера: 8 вопросов, остальное — авто/случайно
+  --quick               быстрый режим мастера: 9 вопросов, остальное — авто/случайно
   --advanced            расширенный режим мастера: все вопросы (как раньше)
   --uninstall           удалить управляемые компоненты (нода, Caddyfile,
                         сертификаты, UFW-правила, env-файл); пакеты остаются
   --reconfigure         интерактивно изменить настройки уже установленной ноды
-                        (тема фасада, XHTTP/CDN, minClientVer, ACME method)
+                        (тема фасада, XHTTP/CDN, WARP, minClientVer, ACME method)
   --dry-run             показать, что удалит --uninstall, без изменений
   --version             показать версию/ревизию
   -y | --yes            авто-подтверждение всех «y/n» вопросов
@@ -206,6 +273,8 @@ remnanode-setup.sh — установка ноды Remnawave (VLESS + Hysteria2 
   ENABLE_CDN, CDN_HOST, CDN_TRANSPORT, CDN_WS_PATH, CDN_XHTTP_PATH, CDN_GRPC_PATH,
   PANEL_IP, NODE_API_PORT, SECRET_KEY, NODE_IMAGE, NODE_TAG,
   CUSTOM_CORE_URL,
+  ENABLE_WARP, WARP_ROUTE_MODE, WARP_FWMARK, WARP_TABLE, WARP_MTU, WARP_IFACE,
+  WARP_ROUTE_DOMAINS, WARP_ROUTE_GEOSITE, WARP_LICENSE, WGCF_VERSION,
   SELF_STEAL_TEMPLATE, SELF_STEAL_TEMPLATE_URL, SELF_STEAL_ROOT,
   MULTISELECT_TEMPLATE_URL,
   REALITY_MIN_CLIENT_VER, XHTTP_TARGET, ACME_METHOD,
@@ -218,16 +287,16 @@ remnanode-setup.sh — установка ноды Remnawave (VLESS + Hysteria2 
   QUICK_SETUP, SERVER_IP, NODE_DIR, CERT_DIR, ENV_STORE, KEEP_BUILD_TOOLS,
   XRAY_LOG_DIR
 
-Логические переменные (ENABLE_XHTTP, ENABLE_CDN, REMNAWAVE_AUTO_SETUP, QUICK_SETUP, KEEP_BUILD_TOOLS) понимают
+Логические переменные (ENABLE_XHTTP, ENABLE_CDN, ENABLE_WARP, REMNAWAVE_AUTO_SETUP, QUICK_SETUP, KEEP_BUILD_TOOLS) понимают
 y/yes/1/true/on и n/no/0/false/off в любом регистре; пустое значение означает ответ по умолчанию.
 Значение SERVER_IP (в том числе из сохранённого env-файла) важнее автодетекта:
 задайте его, если нода за NAT или внешние сервисы определения IP недоступны.
 
 Интерактивный мастер сначала спросит режим:
-  быстрый (рекомендуется): всего 8 вопросов — домен, токен Cloudflare,
+  быстрый (рекомендуется): всего 9 вопросов — домен, токен Cloudflare,
     домен панели (полным URL: https://panel.example.com), токен панели,
-    IP панели, шаблон подписки, транспорт CDN и XHTTP target (external/local);
-    поддомены, CDN-домен, пути, тема и порт ноды — автоматически;
+    IP панели, шаблон подписки, транспорт CDN, XHTTP target (external/local)
+    и WARP (да/нет); поддомены, CDN-домен, пути, тема и порт ноды — автоматически;
   расширенный: прежние 4 блока вопросов со всеми настройками.
 USAGE
 }
@@ -242,7 +311,7 @@ else
 fi
 
 RULE='────────────────────────────────────────────────────────────────'
-STEP_TOTAL=10
+STEP_TOTAL=11
 
 # AUTO-GENERATED: remnanode-setup.sh собирается из lib/*.sh через build.sh.
 
@@ -1165,6 +1234,43 @@ if (( ENABLE_CDN )); then
   fi
 fi
 
+# WARP: исходящий туннель до Cloudflare. Нужен сервисам, которые не пускают
+# адреса хостингов (AI: OpenAI, Anthropic, Gemini). В быстром режиме решение
+# принимается дефолтом (включить), но спросить о нём — единственный способ
+# дать выбор без перехода в расширенный режим. Явно заданный (env/флаг)
+# ENABLE_WARP не переспрашивается.
+if [[ "$WARP_ENV_PRESENT" == 1 ]]; then
+  ENABLE_WARP="$(parse_bool "$ENABLE_WARP" 0)"
+  if (( ENABLE_WARP )); then
+    note "WARP: включён (значение из env/сохранённых настроек)"
+  else
+    note "WARP: отключён (значение из env/сохранённых настроек)"
+  fi
+elif [[ "${QUICK_SETUP:-0}" == 1 ]]; then
+  ask_bool ENABLE_WARP "Поднять WARP (Cloudflare) для AI-сервисов?" "y"
+else
+  note "WARP — отдельный туннель до Cloudflare для сервисов, которые не пускают IP хостингов."
+  note "Через него пойдут только AI/заблокированные домены (OpenAI, Anthropic, Gemini), остальное — напрямую."
+  ask_bool ENABLE_WARP "Поднять исходящий туннель WARP (Cloudflare)?" "y"
+fi
+if (( ENABLE_WARP )); then
+  if [[ -n "${WARP_ROUTE_MODE:-}" && "$WARP_ROUTE_MODE" != "ai" && "$WARP_ROUTE_MODE" != "all" ]]; then
+    die "WARP_ROUTE_MODE должен быть ai или all (получено: $WARP_ROUTE_MODE)."
+  fi
+  if [[ "${QUICK_SETUP:-0}" == 1 ]]; then
+    WARP_ROUTE_MODE="${WARP_ROUTE_MODE:-ai}"
+  else
+    __warp_route_default=1
+    [[ "$WARP_ROUTE_MODE" == "all" ]] && __warp_route_default=2
+    ask_choice WARP_ROUTE_MODE "Что заворачивать в WARP" "$__warp_route_default" \
+      "ai: только AI/заблокированные сервисы — остальное напрямую (рекомендуется)" \
+      "all: весь исходящий трафик ноды через WARP"
+    unset __warp_route_default
+  fi
+  note "WARP: режим $WARP_ROUTE_MODE, метка fwmark $WARP_FWMARK, таблица $WARP_TABLE"
+  note "Управление после установки: remnawave-warp (status | rotate | log | uninstall)"
+fi
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # БЛОК 4/4: Панель Remnawave
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1206,6 +1312,20 @@ write_env_store() {
       printf 'export CDN_WS_PATH=%q\n' "$CDN_WS_PATH"
       printf 'export CDN_XHTTP_PATH=%q\n' "$CDN_XHTTP_PATH"
       printf 'export CDN_GRPC_PATH=%q\n' "$CDN_GRPC_PATH"
+    fi
+    # WARP: решение сохраняется в читаемом виде (как ENABLE_XHTTP/ENABLE_CDN),
+    # иначе повторный запуск вернул бы его по дефолту режима.
+    printf 'export ENABLE_WARP=%s\n' "$(bool_yn "${ENABLE_WARP:-0}")"
+    if (( ${ENABLE_WARP:-0} )); then
+      printf 'export WARP_ROUTE_MODE=%q\n' "${WARP_ROUTE_MODE:-ai}"
+      printf 'export WARP_FWMARK=%q\n' "${WARP_FWMARK:-255}"
+      printf 'export WARP_TABLE=%q\n' "${WARP_TABLE:-51820}"
+      if [[ -n "${WARP_ROUTE_DOMAINS:-}" ]]; then
+        printf 'export WARP_ROUTE_DOMAINS=%q\n' "$WARP_ROUTE_DOMAINS"
+      fi
+      if [[ -n "${WARP_ROUTE_GEOSITE:-}" ]]; then
+        printf 'export WARP_ROUTE_GEOSITE=%q\n' "$WARP_ROUTE_GEOSITE"
+      fi
     fi
     printf 'export PANEL_IP=%q\n' "${PANEL_IP:-}"
     printf 'export NODE_API_PORT=%q\n' "${NODE_API_PORT:-2222}"
@@ -1527,6 +1647,11 @@ cdn_transport_enabled() {
 multiselect_filter() {
   # Набор включённых транспортов в виде JSON-массива для jq.
   local transports="" t
+  local warp="${ENABLE_WARP:-0}" warp_mode="${WARP_ROUTE_MODE:-ai}"
+  local warp_mark="${WARP_FWMARK:-255}" warp_domains="[]"
+  if [[ "$warp" == 1 ]]; then
+    warp_domains="$(warp_route_domains_json)"
+  fi
   for t in ws xhttp grpc; do
     if cdn_transport_enabled "$t"; then
       transports+="\"$t\","
@@ -1545,8 +1670,15 @@ multiselect_filter() {
      --arg xtarget "$XHTTP_TARGET" \
      --argjson transports "$transports" \
      --argjson xhttp "$ENABLE_XHTTP" \
-     --argjson cdn "$ENABLE_CDN" '
+     --argjson cdn "$ENABLE_CDN" \
+     --argjson warp "$warp" \
+     --arg warp_mode "$warp_mode" \
+     --argjson warp_mark "$warp_mark" \
+     --argjson warp_domains "$warp_domains" '
     # Транспорт CDN-инбаунда по его тегу (у остальных инбаундов — null).
+    # Профиль может быть частичным (например, собран вручную) — нормализуем
+    # структуру, иначе `|=` на отсутствующей ветке даёт null и jq падает.
+    .inbounds //= [] | .outbounds //= [] | .routing //= {} | .routing.rules //= [] |
     def cdn_transport(tag):
       if tag == "VLESS_CDN_WS" then "ws"
       elif tag == "VLESS_CDN_XHTTP" then "xhttp"
@@ -1593,6 +1725,32 @@ multiselect_filter() {
           else . end
         )
     )
+    # WARP: Xray помечает свои пакеты (sockopt.mark), ядро по правилу
+    # fwmark → table уводит их в туннель. DomainStrategy ForceIPv4 обязателен:
+    # IPv6 у WARP часто «чёрная дыра», и часть доменов на ней зависает.
+    | .outbounds = ((.outbounds | map(select(.tag != "WARP"))) + (
+        if $warp == 1
+        then [{ tag: "WARP",
+                protocol: "freedom",
+                settings: { domainStrategy: "ForceIPv4" },
+                streamSettings: { sockopt: { mark: $warp_mark } } }]
+        else [] end))
+    # Порядок правил в Xray — это приоритет. WARP-правило ставим ПЕРЕД первым
+    # не-BLOCK правилом: блоки (bittorrent, приватные сети) должны срабатывать
+    # раньше, а маршруты по умолчанию (DIRECT/балансер) — позже. Если все
+    # правила блочные, WARP дописывается в конец и становится путём по умолчанию.
+    | .routing = ((.routing // {}) | .rules = (
+        (.rules // []) as $rules
+        | ($rules | map(select(.outboundTag != "WARP"))) as $clean
+        | ($clean | map(.outboundTag == "BLOCK") | index(false)) as $pos
+        | (if $warp_mode == "all"
+           then { type: "field", network: "tcp,udp", outboundTag: "WARP" }
+           else { type: "field", domain: $warp_domains, outboundTag: "WARP" }
+           end) as $wrule
+        | if $warp != 1 then $clean
+          elif $pos == null then $clean + [$wrule]
+          else ($clean[0:$pos] + [$wrule] + $clean[$pos:])
+          end))
   '
 }
 
@@ -1689,6 +1847,13 @@ write_config_profile() {
     fi
     if (( ENABLE_CDN )); then
       profile_inbounds+=" + CDN ($CDN_TRANSPORT)"
+    fi
+    if (( ${ENABLE_WARP:-0} )); then
+      if [[ "${WARP_ROUTE_MODE:-ai}" == "all" ]]; then
+        profile_inbounds+=" + WARP (весь трафик)"
+      else
+        profile_inbounds+=" + WARP (AI-сервисы)"
+      fi
     fi
     ok "Config Profile сохранён: $out ($profile_inbounds)"
   else
@@ -2979,6 +3144,755 @@ PANEL_CONN_REASON=""
 PANEL_CONN_DETAIL=""
 PANEL_CONN_CODE=""
 
+# --- WARP outbound: ядерный WireGuard-туннель до Cloudflare WARP ---
+#
+# Зачем. Часть сервисов — в первую очередь AI (OpenAI, Anthropic, Gemini) —
+# не пускает клиентов с IP-адресов хостингов и отвечает 403. Туннель до
+# Cloudflare WARP подменяет адрес выхода, и такие сервисы начинают работать,
+# при этом остальной трафик сервера и клиентов идёт напрямую.
+#
+# Как. Схема повторяет tagashi666/vps-warp, но живёт внутри установщика:
+#   * туннель поднимает штатный wg-quick (никаких проприетарных демонов);
+#   * маршруты складываются в отдельную таблицу (Table = $WARP_TABLE), а
+#     политика `ip rule fwmark $WARP_FWMARK` уводит в неё только помеченные
+#     пакеты. Помечает их Xray: у outbound'а WARP стоит sockopt.mark;
+#   * в основной таблице маршрутизации ничего не меняется, поэтому падение
+#     WARP не рвёт связь с панелью и не мешает входу клиентов;
+#   * TCP MSS clamping (1240 при MTU 1280) — иначе тяжёлые сайты подвисают;
+#   * rp_filter понижается со strict до loose: обратный трафик туннеля
+#     приходит асимметрично и при strict молча дропается (симптом коварный:
+#     хэндшейк свежий, интерфейс активен, а трафика нет);
+#   * watchdog раз в 3 минуты проверяет хэндшейк и пинг через метку, при
+#     сбое меняет endpoint Cloudflare и перезапускает туннель, с backoff;
+#   * всё управление — CLI `remnawave-warp` (status/start/stop/rotate/log/...).
+
+# Архитектура для бинарника wgcf.
+warp_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64)  printf 'amd64' ;;
+    aarch64|arm64) printf 'arm64' ;;
+    *) return 1 ;;
+  esac
+}
+
+# Ожидаемая SHA256 суммы скачанного wgcf. Пины нужны, чтобы «обновите до
+# последней версии» не превращалось в запуск произвольного бинарника от root.
+warp_wgcf_sha256() {
+  case "$1" in
+    amd64) printf '%s' "$WGCF_SHA256_AMD64" ;;
+    arm64) printf '%s' "$WGCF_SHA256_ARM64" ;;
+    *) return 1 ;;
+  esac
+}
+
+warp_trim() {
+  local v="${1#*=}"
+  v="${v#"${v%%[![:space:]]*}"}"
+  printf '%s' "${v%"${v##*[![:space:]]}"}"
+}
+
+# Первый IPv4 из строки вида «172.16.0.2/32, 2606:4700::/128».
+warp_first_ipv4() {
+  local part
+  local IFS=','
+  for part in $1; do
+    part="${part//[[:space:]]/}"
+    if [[ "$part" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; then
+      printf '%s' "$part"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Endpoint из профиля wgcf: host:port без пробелов.
+warp_first_hostport() {
+  local v="${1//[[:space:]]/}"
+  [[ "$v" =~ ^[A-Za-z0-9._-]+:[0-9]{1,5}$ ]] || return 1
+  printf '%s' "$v"
+}
+
+# Случайный endpoint Cloudflare из пула, который обычно не режут провайдеры.
+# $RANDOM вместо shuf: shuf есть не всегда, а пустой RAND_* дал бы битый
+# конфиг WireGuard (молча, на этапе, где уже поздно).
+warp_random_endpoint() {
+  local subnets ports subnet host port
+  read -r -a subnets <<<"$WARP_ENDPOINT_SUBNETS"
+  read -r -a ports <<<"$WARP_ENDPOINT_PORTS"
+  subnet="${subnets[RANDOM % ${#subnets[@]}]}"
+  host=$(( RANDOM % 254 + 1 ))
+  port="${ports[RANDOM % ${#ports[@]}]}"
+  printf '%s.%s:%s' "$subnet" "$host" "$port"
+}
+
+# Метка 0 бесполезна (fwmark 0 означает «без метки»), а mark больше 32 бит
+# ядро не примет — отсекаем на входе, а не на apply.
+warp_valid_mark() {
+  local m="${1:-}"
+  [[ "$m" =~ ^[0-9]{1,10}$ ]] || return 1
+  (( 10#$m >= 1 && 10#$m <= 2147483647 ))
+}
+
+# Пакеты помечаются через SO_MARK — это право CAP_NET_ADMIN. Без него Xray в
+# контейнере молча уйдёт напрямую с реального IP, поэтому проверяем заранее.
+warp_validate_settings() {
+  warp_valid_mark "$WARP_FWMARK" || die "WARP_FWMARK=$WARP_FWMARK некорректен: нужно число 1..2147483647."
+  if ! [[ "$WARP_TABLE" =~ ^[0-9]{1,10}$ ]] || ! (( 10#$WARP_TABLE >= 1 )); then
+    die "WARP_TABLE=$WARP_TABLE некорректен: нужно число больше нуля."
+  fi
+  if ! [[ "$WARP_MTU" =~ ^[0-9]{3,4}$ ]] || ! (( 10#$WARP_MTU >= 1280 && 10#$WARP_MTU <= 1500 )); then
+    die "WARP_MTU=$WARP_MTU некорректен: WARP работает на MTU 1280..1500."
+  fi
+  [[ "$WARP_IFACE" =~ ^[a-z][a-z0-9]{0,14}$ ]] \
+    || die "WARP_IFACE=$WARP_IFACE некорректен: нужно имя интерфейса (a-z0-9, до 15 символов)."
+}
+
+# Зависимости: wg-quick/wg, iptables (MSS clamp и правило метки), ping
+# (watchdog проверяет связь именно пингом через туннель).
+warp_install_deps() {
+  local -a pkgs=()
+  have wg || pkgs+=(wireguard-tools)
+  have wg-quick || pkgs+=(wireguard)
+  have iptables || pkgs+=(iptables)
+  have ping || pkgs+=(iputils-ping)
+  (( ${#pkgs[@]} == 0 )) && { ok "Зависимости WARP уже установлены"; return 0; }
+  log "Устанавливаю зависимости WARP: ${pkgs[*]}"
+  apt_get install -y "${pkgs[@]}" >/dev/null || die "Не удалось установить зависимости WARP: ${pkgs[*]}"
+  have wg-quick || die "wg-quick не появился в системе после установки wireguard."
+  ok "Зависимости WARP установлены (${pkgs[*]})"
+}
+
+# wgcf нужен только на время установки/обновления: он регистрирует аккаунт в
+# Cloudflare и генерирует WireGuard-конфиг. Дальше туннель живёт на ядре.
+warp_install_wgcf() {
+  local arch="$1" tmp url sha
+  if [[ -x /usr/local/bin/wgcf ]] \
+      && [[ "$(/usr/local/bin/wgcf --version 2>/dev/null | awk '{print $NF}')" == "${WGCF_VERSION#v}" ]]; then
+    ok "wgcf ${WGCF_VERSION#v} уже установлен"
+    return 0
+  fi
+  sha="$(warp_wgcf_sha256 "$arch")" || die "Нет пина SHA256 для wgcf/$arch."
+  url="https://github.com/ViRb3/wgcf/releases/download/${WGCF_VERSION}/wgcf_${WGCF_VERSION#v}_linux_${arch}"
+  tmp="$(mktemp)" || die "mktemp для wgcf не удался."
+  if ! retry 3 5 curl -fsSL "$url" -o "$tmp"; then
+    rm -f "$tmp"
+    die "Не удалось скачать wgcf: $url"
+  fi
+  printf '%s  %s\n' "$sha" "$tmp" | sha256sum -c - >/dev/null \
+    || { rm -f "$tmp"; die "SHA256 wgcf не совпал — установка остановлена ($url)."; }
+  install -m 0755 "$tmp" /usr/local/bin/wgcf || { rm -f "$tmp"; die "Не удалось установить wgcf."; }
+  rm -f "$tmp"
+  ok "wgcf ${WGCF_VERSION#v} установлен (/usr/local/bin/wgcf)"
+}
+
+# Регистрация в Cloudflare. Рабочий каталог — $WARP_STATE_DIR/wgcf, а не $HOME:
+# sudo сбрасывает HOME, и аккаунт терялся бы после перезахода.
+warp_register() {
+  local dir="$WARP_STATE_DIR/wgcf" i
+  mkdir -p "$dir"
+  chmod 700 "$WARP_STATE_DIR" "$dir" 2>/dev/null || true
+  if [[ ! -f "$dir/wgcf-account.toml" ]]; then
+    log "Регистрирую аккаунт Cloudflare WARP (до 3 попыток)"
+    for i in 1 2 3; do
+      # `yes` отвечает на запрос принятия условий; таймаут — чтобы Ctrl-C и
+      # зависшая сеть не держали установку бесконечно.
+      if ( cd "$dir" && timeout 60 bash -c 'yes | wgcf register' >/dev/null 2>&1 ); then
+        break
+      fi
+      (( i < 3 )) && sleep 3
+    done
+  fi
+  if [[ ! -f "$dir/wgcf-account.toml" ]]; then
+    warn "Cloudflare отклонил регистрацию (rate-limit или блокировка IP хостинга)."
+    return 1
+  fi
+  chmod 600 "$dir/wgcf-account.toml"
+  if ! ( cd "$dir" && wgcf generate >/dev/null 2>&1 ); then
+    warn "wgcf не смог сгенерировать профиль ($dir/wgcf-profile.conf)."
+    return 1
+  fi
+  ok "Профиль WARP сгенерирован ($dir/wgcf-profile.conf)"
+}
+
+# WARP+ опционален: лицензионный ключ повышает приоритет трафика. Ключ не
+# сохраняется на диск — он попадает в аккаунт wgcf и нужен только один раз.
+warp_apply_license() {
+  local dir="$WARP_STATE_DIR/wgcf" key
+  key="$(printf '%s' "${WARP_LICENSE:-}" | tr -cd 'a-zA-Z0-9-')"
+  [[ -n "$key" ]] || return 0
+  log "Активирую ключ WARP+"
+  if ( cd "$dir" && wgcf update --license-key "$key" >/dev/null 2>&1 ) \
+      && ( cd "$dir" && wgcf generate >/dev/null 2>&1 ); then
+    ok "Лицензия WARP+ активирована"
+  else
+    warn "Ключ WARP+ не принят — остаюсь на бесплатном тарифе."
+  fi
+}
+
+# Сборка итогового конфига WireGuard. Пишем файл целиком, а не правим вывод
+# wgcf sed-ом: так IPv6-адреса и маршруты, на которых провайдеры вешают
+# blackhole, просто не попадают в конфиг, а секции и порядок директив
+# остаются предсказуемыми (и проверяемыми юнит-тестом).
+warp_render_conf() {
+  local src="${1:-$WARP_STATE_DIR/wgcf/wgcf-profile.conf}" dst="${2:-$WARP_CONF}"
+  local line private_key="" peer_pub="" addr4="" endpoint=""
+  [[ -r "$src" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    case "$line" in
+      PrivateKey\ =*|PrivateKey=*) [[ -n "$private_key" ]] || private_key="$(warp_trim "$line")" ;;
+      PublicKey\ =*|PublicKey=*)   [[ -n "$peer_pub" ]]    || peer_pub="$(warp_trim "$line")" ;;
+      Address\ =*|Address=*)       [[ -n "$addr4" ]]       || addr4="$(warp_first_ipv4 "$(warp_trim "$line")")" ;;
+      Endpoint\ =*|Endpoint=*)     [[ -n "$endpoint" ]]    || endpoint="$(warp_first_hostport "$(warp_trim "$line")")" ;;
+    esac
+  done < "$src"
+  [[ -n "$private_key" && -n "$peer_pub" && -n "$addr4" ]] || return 1
+  # Ключи WireGuard — base64 ровно 32 байт (44 символа с «=» на конце).
+  [[ "$private_key" =~ ^[A-Za-z0-9+/]{43}=$ ]] || return 1
+  [[ "$peer_pub" =~ ^[A-Za-z0-9+/]{43}=$ ]] || return 1
+  [[ "$addr4" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] || return 1
+  # Endpoint из профиля wgcf — общий engage.cloudflareclient.com, который как
+  # раз и режут; берём случайный адрес из пула Cloudflare.
+  endpoint="$(warp_random_endpoint)"
+
+  mkdir -p "$(dirname "$dst")"
+  ( umask 077
+    {
+      printf '[Interface]\n'
+      printf 'PrivateKey = %s\n' "$private_key"
+      printf 'Address = %s\n' "$addr4"
+      printf 'MTU = %s\n' "$WARP_MTU"
+      # Явный Table уводит маршруты wg-quick из main: дефолт сервера цел, а в
+      # туннель попадает только помеченное. Без Table пакеты ушли бы все.
+      printf 'Table = %s\n' "$WARP_TABLE"
+      # del перед add: после жёсткой перезагрузки или OOM-killed wg-quick
+      # правило могло остаться, и каждый старт добавлял бы дубликат.
+      printf 'PostUp = ip rule del fwmark %s table %s 2>/dev/null || true\n' "$WARP_FWMARK" "$WARP_TABLE"
+      printf 'PostUp = ip rule add fwmark %s table %s || true\n' "$WARP_FWMARK" "$WARP_TABLE"
+      printf 'PostDown = ip rule del fwmark %s table %s 2>/dev/null || true\n' "$WARP_FWMARK" "$WARP_TABLE"
+      # MSS clamping: при MTU 1280 «тяжёлые» сайты иначе подвисают на TLS.
+      printf 'PostUp = iptables -t mangle -D POSTROUTING -o %s -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss %s 2>/dev/null || true\n' "$WARP_IFACE" "$WARP_MSS"
+      printf 'PostUp = iptables -t mangle -A POSTROUTING -o %s -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss %s || true\n' "$WARP_IFACE" "$WARP_MSS"
+      printf 'PostDown = iptables -t mangle -D POSTROUTING -o %s -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss %s 2>/dev/null || true\n' "$WARP_IFACE" "$WARP_MSS"
+      printf '\n[Peer]\n'
+      printf 'PublicKey = %s\n' "$peer_pub"
+      # Только IPv4: IPv6-маршрут WARP у части провайдеров чёрная дыра, и
+      # часть доменов «зависает» на попытке подключиться по IPv6.
+      printf 'AllowedIPs = 0.0.0.0/0\n'
+      printf 'Endpoint = %s\n' "$endpoint"
+      printf 'PersistentKeepalive = 15\n'
+    } > "$dst"
+  ) || return 1
+  chmod 600 "$dst"
+  return 0
+}
+
+# rp_filter: туннель асимметричен by design. Помеченные пакеты уходят через
+# $WARP_IFACE, а расшифрованные ответы приходят без метки, смотрятся в main и
+# упираются в дефолт через основной NIC — строгий rp_filter (=1) их дропает.
+# Ядро берёт max(conf.all, conf.<iface>), поэтому опускать нужно оба уровня.
+# Трогаем только значение 1: осознанно выставленный 0 остаётся как есть.
+warp_relax_rp_filter() {
+  local scope cur
+  local -a touched=()
+  for scope in all default; do
+    cur="$(cat "/proc/sys/net/ipv4/conf/${scope}/rp_filter" 2>/dev/null)" || continue
+    [[ "$cur" == 1 ]] || continue
+    sysctl -qw "net.ipv4.conf.${scope}.rp_filter=2" 2>/dev/null && touched+=("$scope")
+  done
+  (( ${#touched[@]} )) || return 0
+  {
+    printf '# Добавлено установщиком multi-protocol: policy-routing WARP требует\n'
+    printf '# нестрогого reverse-path filter. Удаляется при --uninstall.\n'
+    for scope in "${touched[@]}"; do
+      printf 'net.ipv4.conf.%s.rp_filter = 2\n' "$scope"
+    done
+  } > "$WARP_RP_FILTER_FILE"
+  chmod 644 "$WARP_RP_FILTER_FILE"
+  ok "rp_filter понижен strict → loose (${touched[*]:-нет}) и закреплён в $WARP_RP_FILTER_FILE"
+}
+
+# Эффективное значение rp_filter так, как его считает ядро.
+warp_rp_filter_effective() {
+  local all iface
+  all="$(cat /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null || echo 0)"
+  iface="$(cat "/proc/sys/net/ipv4/conf/${WARP_IFACE}/rp_filter" 2>/dev/null || echo 0)"
+  [[ "$all" =~ ^[0-9]+$ ]] || all=0
+  [[ "$iface" =~ ^[0-9]+$ ]] || iface=0
+  (( all > iface )) && printf '%s' "$all" || printf '%s' "$iface"
+}
+
+warp_wait_handshake() {
+  local i hs age
+  for i in $(seq 1 20); do
+    hs="$(wg show "$WARP_IFACE" latest-handshakes 2>/dev/null | awk '{print $2}' | head -1)"
+    if [[ "$hs" =~ ^[0-9]+$ ]] && (( hs > 0 )); then
+      age=$(( $(date +%s) - hs ))
+      ok "WARP: хэндшейк установлен (${age}s назад)"
+      return 0
+    fi
+    sleep 1
+  done
+  warn "WARP: хэндшейк не пришёл за 20s. Интерфейс поднят, но связь может быть заблокирована — проверьте: remnawave-warp log"
+  return 1
+}
+
+# Watchdog: раз в 3 минуты. Проверяет хэндшейк и пинг ровно тем маршрутом,
+# которым ходит Xray (метка → правило → таблица WARP). При сбое меняет
+# endpoint и перезапускает туннель. Пауза между ротациями растёт 3→6→…→30
+# минут, потому что при полной блокировке Cloudflare перезапуск раз в 3
+# минуты (480 в сутки) сам по себе заметный признак.
+warp_write_watchdog() {
+  mkdir -p "$WARP_DIR"
+  chmod 700 "$WARP_DIR"
+  {
+    printf '%s\n' '#!/bin/bash'
+    printf '%s\n' '# Сгенерировано установщиком multi-protocol; правки будут потеряны.'
+    printf 'IFACE=%q\n' "$WARP_IFACE"
+    printf 'FWMARK=%q\n' "$WARP_FWMARK"
+    printf 'CONF=%q\n' "$WARP_CONF"
+    printf 'STATE_FILE=%q\n' "$WARP_STATE_DIR/watchdog.state"
+    printf 'SUBNETS=%q\n' "$WARP_ENDPOINT_SUBNETS"
+    printf 'PORTS=%q\n' "$WARP_ENDPOINT_PORTS"
+  } > "$WARP_DIR/watchdog.sh"
+  cat >> "$WARP_DIR/watchdog.sh" <<'WARPWDEOF'
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# Туннель остановлен оператором — молчим, это не сбой.
+systemctl is-active --quiet "wg-quick@${IFACE}" || exit 0
+[[ -f "$CONF" ]] || { echo "WARP watchdog: нет $CONF — нечего проверять"; exit 1; }
+
+hs_ts=$(wg show "$IFACE" latest-handshakes 2>/dev/null | awk '{print $2}' | head -1)
+hs_ts=${hs_ts:-0}
+now=$(date +%s)
+age=$(( now - hs_ts ))
+
+# busybox ping не знает -m, поэтому есть запасной вариант через интерфейс.
+if ping -V 2>&1 | grep -qi iputils; then
+    PING_ARGS=(-m "$FWMARK")
+else
+    PING_ARGS=(-I "$IFACE")
+fi
+
+ping_ok=0
+for ip in 1.1.1.1 8.8.8.8 9.9.9.9; do
+    if ping "${PING_ARGS[@]}" -c 1 -W 2 "$ip" >/dev/null 2>&1; then
+        ping_ok=1
+        break
+    fi
+done
+
+healthy=1
+[[ "$hs_ts" -eq 0 || $age -gt 180 ]] && healthy=0
+[[ $ping_ok -eq 0 ]] && healthy=0
+
+fails=0
+last_rot=0
+if [[ -f "$STATE_FILE" ]]; then
+    read -r fails last_rot < "$STATE_FILE" || true
+fi
+[[ "$fails" =~ ^[0-9]+$ ]] || fails=0
+[[ "$last_rot" =~ ^[0-9]+$ ]] || last_rot=0
+
+if [[ $healthy -eq 1 ]]; then
+    [[ $fails -ne 0 ]] && printf '0 %s\n' "$last_rot" > "$STATE_FILE"
+    exit 0
+fi
+
+exp=$(( fails > 4 ? 4 : fails ))
+backoff=$(( 180 * (2 ** exp) ))
+[[ $backoff -gt 1800 ]] && backoff=1800
+if [[ $(( now - last_rot )) -lt $backoff ]]; then
+    echo "WARP watchdog: связи нет (сбой #$((fails + 1))), следующая ротация через $(( backoff - (now - last_rot) ))s"
+    exit 0
+fi
+
+read -r -a subnets <<< "$SUBNETS"
+read -r -a ports <<< "$PORTS"
+subnet="${subnets[RANDOM % ${#subnets[@]}]}"
+host=$(( RANDOM % 254 + 1 ))
+port="${ports[RANDOM % ${#ports[@]}]}"
+endpoint="${subnet}.${host}:${port}"
+
+sed -i "s/^Endpoint = .*/Endpoint = ${endpoint}/" "$CONF" || exit 1
+systemctl restart "wg-quick@${IFACE}"
+printf '%s %s\n' "$(( fails + 1 ))" "$now" > "$STATE_FILE"
+echo "WARP watchdog: связи нет (хэндшейк ${age}s, ping $ping_ok). Endpoint → ${endpoint}"
+WARPWDEOF
+  chmod 700 "$WARP_DIR/watchdog.sh"
+
+  cat > /etc/systemd/system/remnawave-warp-watchdog.service <<EOF
+[Unit]
+Description=multi-protocol: WARP tunnel watchdog
+After=wg-quick@${WARP_IFACE}.service
+
+[Service]
+Type=oneshot
+ExecStart=$WARP_DIR/watchdog.sh
+EOF
+  cat > /etc/systemd/system/remnawave-warp-watchdog.timer <<'EOF'
+[Unit]
+Description=multi-protocol: проверка WARP каждые 3 минуты
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=3min
+
+[Install]
+WantedBy=timers.target
+EOF
+  chmod 644 /etc/systemd/system/remnawave-warp-watchdog.service \
+             /etc/systemd/system/remnawave-warp-watchdog.timer
+  systemctl daemon-reload
+  systemctl enable --now remnawave-warp-watchdog.timer >/dev/null 2>&1 \
+    || warn "Не удалось включить таймер remnawave-warp-watchdog.timer."
+  ok "Watchdog WARP установлен (remnawave-warp-watchdog.timer, каждые 3 минуты)"
+}
+
+# CLI. Собирается так же, как watchdog: заголовок с %q-значениями, затем
+# quoted heredoc — иначе пришлось бы экранировать каждый «$» в теле.
+warp_write_cli() {
+  {
+    printf '%s\n' '#!/bin/bash'
+    printf '%s\n' '# Сгенерировано установщиком multi-protocol; правки будут потеряны.'
+    printf 'IFACE=%q\n' "$WARP_IFACE"
+    printf 'FWMARK=%q\n' "$WARP_FWMARK"
+    printf 'WTABLE=%q\n' "$WARP_TABLE"
+    printf 'WMSS=%q\n' "$WARP_MSS"
+    printf 'CONF=%q\n' "$WARP_CONF"
+    printf 'IFACE=%q\n' "$WARP_IFACE"
+    printf 'STATE_DIR=%q\n' "$WARP_STATE_DIR"
+    printf 'APP_DIR=%q\n' "$WARP_DIR"
+    printf 'RP_FLAG_FILE=%q\n' "$WARP_RP_FILTER_FILE"
+    printf 'SUBNETS=%q\n' "$WARP_ENDPOINT_SUBNETS"
+    printf 'PORTS=%q\n' "$WARP_ENDPOINT_PORTS"
+  } > /usr/local/bin/remnawave-warp
+  cat >> /usr/local/bin/remnawave-warp <<'WARPCLIEOF'
+if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    echo "remnawave-warp: нужны права root (sudo remnawave-warp $*)"
+    exit 1
+fi
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+C_RST=$'\e[0m'; C_B=$'\e[1m'; C_GRN=$'\e[32m'; C_RED=$'\e[31m'
+C_YLW=$'\e[33m'; C_GRY=$'\e[90m'; C_CYN=$'\e[36m'
+
+format_bytes() {
+    local b="$1"
+    if [[ -z "$b" || "$b" == 0 ]]; then echo "0 KB"; return; fi
+    if   (( b < 1048576 ));    then echo "$((b / 1024)) KB"
+    elif (( b < 1073741824 )); then echo "$((b / 1048576)) MB"
+    else echo "$(awk "BEGIN {printf \"%.1f\", $b/1073741824}") GB"
+    fi
+}
+
+random_endpoint() {
+    read -r -a subnets <<< "$SUBNETS"
+    read -r -a ports <<< "$PORTS"
+    echo "${subnets[RANDOM % ${#subnets[@]}]}.$(( RANDOM % 254 + 1 )):${ports[RANDOM % ${#ports[@]}]}"
+}
+
+show_status() {
+    local c_stat t_stat tunnel_ip endpoint raw_stats rx tx hs_ts age c_hs t_hs c_rule t_rule rp c_rp t_rp
+
+    if systemctl is-active --quiet "wg-quick@${IFACE}"; then
+        c_stat="$C_GRN"; t_stat="ACTIVE"
+    else
+        c_stat="$C_RED"; t_stat="INACTIVE"
+    fi
+
+    tunnel_ip=$(ip -4 addr show "$IFACE" 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)
+    endpoint=$(sed -n 's/^Endpoint = //p' "$CONF" 2>/dev/null | head -1)
+    raw_stats=$(wg show "$IFACE" transfer 2>/dev/null | head -1)
+    rx=$(format_bytes "$(awk '{print $2}' <<< "$raw_stats")")
+    tx=$(format_bytes "$(awk '{print $3}' <<< "$raw_stats")")
+
+    hs_ts=$(wg show "$IFACE" latest-handshakes 2>/dev/null | awk '{print $2}' | head -1)
+    if [[ "$hs_ts" =~ ^[0-9]+$ ]] && (( hs_ts > 0 )); then
+        age=$(( $(date +%s) - hs_ts ))
+        c_hs="$C_GRN"; t_hs="${age}s назад"
+    else
+        c_hs="$C_RED"; t_hs="нет соединения"
+    fi
+
+    # Пропажа правила означает, что помеченные пакеты Xray уходят с реального
+    # IP сервера — со стороны «всё работает», но не так, как задумано.
+    if ip rule show 2>/dev/null | grep -q "fwmark 0x$(printf '%x' "$FWMARK") lookup ${WTABLE}"; then
+        c_rule="$C_GRN"; t_rule="ok (fwmark ${FWMARK} → table ${WTABLE})"
+    else
+        c_rule="$C_RED"; t_rule="MISSING (fwmark ${FWMARK} → table ${WTABLE})"
+    fi
+
+    rp=$(cat /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null || echo 0)
+    if [[ "$rp" == 1 ]]; then
+        c_rp="$C_RED"; t_rp="STRICT (=1) — обратный трафик будет теряться"
+    else
+        c_rp="$C_GRN"; t_rp="loose (=${rp:-?})"
+    fi
+
+    echo
+    echo -e "  ${C_B}${C_CYN}WARP — Cloudflare${C_RST}"
+    echo -e "  ${C_GRY}─────────────────────────────────────${C_RST}"
+    echo -e "   ${C_GRY}Статус:${C_RST}      ${c_stat}${C_B}${t_stat}${C_RST}"
+    echo -e "   ${C_GRY}IP туннеля:${C_RST}  ${C_CYN}${tunnel_ip:---}${C_RST}"
+    echo -e "   ${C_GRY}Endpoint:${C_RST}    ${C_CYN}${endpoint:---}${C_RST}"
+    echo -e "   ${C_GRY}Хэндшейк:${C_RST}    ${c_hs}${t_hs}${C_RST}"
+    echo -e "   ${C_GRY}Маршрутизация:${C_RST} ${c_rule}${t_rule}${C_RST}"
+    echo -e "   ${C_GRY}rp_filter:${C_RST}   ${c_rp}${t_rp}${C_RST}"
+    echo -e "   ${C_GRY}Трафик:${C_RST}      ${C_YLW}↓ ${rx}${C_RST}  ${C_GRY}|${C_RST}  ${C_YLW}↑ ${tx}${C_RST}"
+    echo -e "  ${C_GRY}─────────────────────────────────────${C_RST}"
+    echo -e "   ${C_GRY}Команды:${C_RST} status | start | stop | restart | rotate | log | uninstall"
+    echo
+}
+
+rotate_endpoint() {
+    local ep
+    ep=$(random_endpoint)
+    if ! sed -i "s/^Endpoint = .*/Endpoint = ${ep}/" "$CONF"; then
+        echo "remnawave-warp: не удалось записать $CONF" >&2
+        exit 1
+    fi
+    systemctl restart "wg-quick@${IFACE}"
+    # Ручная ротация — вмешательство оператора: снимаем backoff watchdog.
+    rm -f "${STATE_DIR}/watchdog.state"
+    echo -e "  ${C_GRN}✔${C_RST} Endpoint сменён на ${ep}"
+    sleep 2
+    show_status
+}
+
+uninstall_warp() {
+    local reply
+    echo -e "  ${C_YLW}▲${C_RST} Будут удалены туннель WARP, watchdog, CLI, правило и sysctl-файл."
+    read -r -p "  Для подтверждения введите yes: " reply
+    [[ "$reply" == yes ]] || { echo "  Отменено."; exit 0; }
+
+    systemctl disable --now "wg-quick@${IFACE}" >/dev/null 2>&1
+    systemctl disable --now remnawave-warp-watchdog.timer >/dev/null 2>&1
+    systemctl stop remnawave-warp-watchdog.service >/dev/null 2>&1
+    rm -f /etc/systemd/system/remnawave-warp-watchdog.service \
+          /etc/systemd/system/remnawave-warp-watchdog.timer
+    systemctl daemon-reload
+    # Страховка: если интерфейс когда-то умер без PostDown, правило и clamp
+    # пережили бы перезапуск и тихо ломали маршрутизацию.
+    ip rule del fwmark "$FWMARK" table "$WTABLE" 2>/dev/null
+    iptables -t mangle -D POSTROUTING -o "$IFACE" -p tcp -m tcp \
+        --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$WMSS" 2>/dev/null
+    ip link del "$IFACE" 2>/dev/null
+    rm -f "$CONF" "$RP_FLAG_FILE"
+    sysctl --system >/dev/null 2>&1
+    rm -rf "$APP_DIR" "$STATE_DIR"
+    rm -f /usr/local/bin/wgcf /usr/local/bin/remnawave-warp
+    echo -e "  ${C_GRN}✔${C_RST} WARP удалён. Пакет wireguard оставлен установленным."
+    echo
+}
+
+case "${1:-status}" in
+    start)     systemctl start "wg-quick@${IFACE}"; sleep 1; show_status ;;
+    stop)      systemctl stop "wg-quick@${IFACE}"; sleep 1; show_status ;;
+    restart)   systemctl restart "wg-quick@${IFACE}"; sleep 1; show_status ;;
+    rotate)    rotate_endpoint ;;
+    log)       journalctl -u remnawave-warp-watchdog.service -n 50 -f ;;
+    uninstall) uninstall_warp ;;
+    status)    show_status ;;
+    *)         echo "Использование: remnawave-warp {status|start|stop|restart|rotate|log|uninstall}"; exit 1 ;;
+esac
+WARPCLIEOF
+  chmod 755 /usr/local/bin/remnawave-warp
+  ok "CLI установлен: remnawave-warp (status | rotate | log | uninstall)"
+}
+
+# Проверка «как видит сеть сам Xray»: пинг с меткой идёт по тому же правилу,
+# что и помеченный трафик ноды.
+warp_verify() {
+  local rp hs age ok_ping=0
+  systemctl is-active --quiet "wg-quick@${WARP_IFACE}" \
+    || { warn "WARP: интерфейс $WARP_IFACE не активен (journalctl -u wg-quick@$WARP_IFACE)."; return 0; }
+
+  if ip rule show 2>/dev/null | grep -q "fwmark 0x$(printf '%x' "$WARP_FWMARK") lookup $WARP_TABLE"; then
+    ok "WARP: правило fwmark $WARP_FWMARK → table $WARP_TABLE на месте"
+  else
+    warn "WARP: НЕТ правила fwmark $WARP_FWMARK → table $WARP_TABLE — трафик пойдёт с реального IP сервера (remnawave-warp restart)."
+  fi
+
+  rp="$(warp_rp_filter_effective)"
+  if [[ "$rp" == 1 ]]; then
+    warn "WARP: rp_filter=1 (strict) — обратный трафик туннеля будет теряться."
+  else
+    ok "WARP: rp_filter=$rp (обратный трафик проходит)"
+  fi
+
+  hs="$(wg show "$WARP_IFACE" latest-handshakes 2>/dev/null | awk '{print $2}' | head -1)"
+  if [[ "$hs" =~ ^[0-9]+$ ]] && (( hs > 0 )); then
+    age=$(( $(date +%s) - hs ))
+    ok "WARP: хэндшейк ${age}s назад"
+  fi
+
+  if have ping; then
+    if ping -m "$WARP_FWMARK" -c 1 -W 3 1.1.1.1 >/dev/null 2>&1 \
+        || ping -I "$WARP_IFACE" -c 1 -W 3 1.1.1.1 >/dev/null 2>&1; then
+      ok_ping=1
+    fi
+    if (( ok_ping )); then
+      ok "WARP: ICMP через туннель проходит (маршрут помеченных пакетов работает)"
+    else
+      warn "WARP: ICMP через туннель не проходит — проверьте: remnawave-warp status, remnawave-warp log"
+    fi
+  fi
+  return 0
+}
+
+# Полная установка/переустановка WARP. Идемпотентна: аккаунт и состояние
+# переиспользуются, поэтому повторный запуск установщика не регистрирует
+# новый аккаунт в Cloudflare (там это rate-limit'ится).
+warp_enable() {
+  local arch
+  warp_validate_settings
+  arch="$(warp_arch)" \
+    || die "WARP: архитектура $(uname -m) не поддерживается (нужны x86_64 или arm64)."
+  [[ -d /run/systemd/system ]] \
+    || die "WARP: нужен systemd (wg-quick@ и watchdog без него не работают)."
+
+  warp_prompt_license
+  warp_install_deps
+  warp_install_wgcf "$arch"
+
+  if ! warp_register; then
+    if [[ -f "$WARP_CONF" ]]; then
+      warn "Регистрация не удалась, но готовый $WARP_CONF есть — переиспользую его."
+    else
+      die "WARP: не удалось получить профиль Cloudflare. Повторите позже или с другого IP (rate-limit)."
+    fi
+  fi
+  warp_apply_license
+
+  # Конфиг пересобираем всегда: так применяются изменения WARP_MTU/FWMARK/TABLE
+  # из повторного запуска, а endpoint получает свежий случайный адрес.
+  if [[ -f "$WARP_STATE_DIR/wgcf/wgcf-profile.conf" ]]; then
+    warp_render_conf "$WARP_STATE_DIR/wgcf/wgcf-profile.conf" "$WARP_CONF" \
+      || die "WARP: не удалось собрать $WARP_CONF из профиля wgcf."
+    ok "Конфиг туннеля записан: $WARP_CONF (MTU $WARP_MTU, table $WARP_TABLE, fwmark $WARP_FWMARK)"
+  elif [[ ! -f "$WARP_CONF" ]]; then
+    die "WARP: нет ни профиля wgcf, ни готового $WARP_CONF."
+  fi
+
+  warp_relax_rp_filter
+  warp_write_watchdog
+  warp_write_cli
+
+  systemctl enable "wg-quick@$WARP_IFACE" >/dev/null 2>&1 || true
+  if systemctl restart "wg-quick@$WARP_IFACE" >/dev/null 2>&1; then
+    ok "Интерфейс $WARP_IFACE поднят"
+  else
+    die "WARP: интерфейс не поднялся. Смотрите: journalctl -u wg-quick@$WARP_IFACE"
+  fi
+  warp_wait_handshake || true
+  warp_verify
+}
+
+# Демонтаж WARP (используется --uninstall и reconfigure при выключении).
+warp_disable() {
+  systemctl disable --now "wg-quick@$WARP_IFACE" >/dev/null 2>&1 || true
+  systemctl disable --now remnawave-warp-watchdog.timer >/dev/null 2>&1 || true
+  systemctl stop remnawave-warp-watchdog.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/remnawave-warp-watchdog.service \
+        /etc/systemd/system/remnawave-warp-watchdog.timer
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  ip rule del fwmark "$WARP_FWMARK" table "$WARP_TABLE" 2>/dev/null || true
+  iptables -t mangle -D POSTROUTING -o "$WARP_IFACE" -p tcp -m tcp \
+      --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$WARP_MSS" 2>/dev/null || true
+  ip link del "$WARP_IFACE" 2>/dev/null || true
+  rm -f "$WARP_CONF" "$WARP_RP_FILTER_FILE"
+  rm -rf -- "$WARP_DIR" "$WARP_STATE_DIR"
+  rm -f /usr/local/bin/wgcf /usr/local/bin/remnawave-warp
+  have sysctl && sysctl --system >/dev/null 2>&1 || true
+  ok "WARP удалён (туннель, watchdog, CLI, правило маршрутизации)"
+}
+
+# Ключ WARP+ — необязательный. Спрашиваем только в интерактивном режиме и не
+# сохраняем на диск: он нужен один раз, при регистрации.
+warp_prompt_license() {
+  local input
+  [[ -z "${WARP_LICENSE:-}" ]] || return 0
+  [[ "${NONINTERACTIVE:-0}" == 1 ]] && return 0
+  has_tty || return 0
+  printf ' %s?%s Ключ WARP+ %s[Enter — бесплатный тариф]%s: ' \
+    "${C_MAG:-}${C_B:-}" "${C_RST:-}" "${C_DIM:-}${C_GRY:-}" "${C_RST:-}" > /dev/tty
+  IFS= read -r input < /dev/tty || true
+  input="$(printf '%s' "$input" | tr -cd 'a-zA-Z0-9-')"
+  if [[ -n "$input" ]]; then
+    WARP_LICENSE="$input"
+    note "Ключ WARP+ принят (не сохраняется на диск)"
+  else
+    note "WARP остаётся на бесплатном тарифе"
+  fi
+}
+
+# Один домен/geosite-паттерн из env: нормализуем к виду «domain:…», «geosite:…»
+# и т.п. Возвращает ненулевой код на мусоре, чтобы опечатка не уехала в профиль.
+warp_normalize_route_item() {
+  local item="$1" prefix rest
+  item="${item#"${item%%[![:space:]]*}"}"
+  item="${item%"${item##*[![:space:]]}"}"
+  [[ -n "$item" ]] || return 1
+  case "$item" in
+    domain:*|full:*|geosite:*|regexp:*) prefix="${item%%:*}" ; rest="${item#*:}" ;;
+    *) prefix="domain" ; rest="$item" ;;
+  esac
+  [[ -n "$rest" && ${#item} -le 253 ]] || return 1
+  case "$prefix" in
+    geosite)
+      [[ "$rest" =~ ^[a-z0-9][a-z0-9!_:-]*$ ]] || return 1
+      ;;
+    regexp)
+      # Кавычка или обратный слэш в regexp: ломают JSON профиля и сам jq-фильтр.
+      case "$rest" in
+        *\"*|*\\*) return 1 ;;
+      esac
+      [[ "$rest" =~ ^[[:print:]]+$ ]] || return 1
+      ;;
+    *)
+      # domain/full: буквы, цифры, дефис, точки. Маска «*.» снимается: в Xray
+      # `domain:foo.net` и так покрывает все поддомены, а `domain:*.foo.net`
+      # матчером не понимается.
+      rest="${rest#\*.}"
+      [[ "$rest" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]] || return 1
+      rest="${rest,,}"
+      ;;
+  esac
+  printf '%s:%s' "$prefix" "$rest"
+}
+
+# Список того, что уходит через WARP: встроенные AI-сервисы + WARP_ROUTE_GEOSITE
+# + WARP_ROUTE_DOMAINS (через пробел или запятую).
+warp_route_domain_list() {
+  local item
+  local -a extra=()
+  printf '%s\n' "${WARP_ROUTE_DOMAINS_DEFAULT[@]}"
+  IFS=', ' read -r -a extra <<<"${WARP_ROUTE_GEOSITE//,/ }" || true
+  for item in "${extra[@]}"; do
+    [[ -n "$item" ]] && printf 'geosite:%s\n' "$item"
+  done
+  IFS=', ' read -r -a extra <<<"${WARP_ROUTE_DOMAINS//,/ }" || true
+  for item in "${extra[@]}"; do
+    [[ -n "$item" ]] && printf '%s\n' "$item"
+  done
+}
+
+# JSON-массив паттернов для jq в multiselect_filter (без дублей).
+warp_route_domains_json() {
+  local raw norm out="" seen=" "
+  while IFS= read -r raw; do
+    [[ -n "$raw" ]] || continue
+    norm="$(warp_normalize_route_item "$raw")" || {
+      warn "WARP: пропускаю некорректный паттерн маршрута «$raw» (нужно domain:…, full:…, geosite:… или домен)."
+      continue
+    }
+    [[ "$seen" == *" $norm "* ]] && continue
+    seen+="$norm "
+    out+="${out:+,}\"$norm\""
+  done < <(warp_route_domain_list)
+  printf '[%s]' "$out"
+}
+
 # --- Caddyfile, L4 и проверки ---
 caddy_build_matches() {
   have caddy \
@@ -3414,6 +4328,16 @@ uninstall_node() {
     warn "UFW не активен — правила не трогаю."
   fi
 
+  # WARP снимаем до Caddy: правило fwmark и MSS-clamp не должны пережить
+  # удаление, иначе помеченный трафик уходил бы в никуда.
+  if [[ -f /etc/systemd/system/remnawave-warp-watchdog.service || -f "$WARP_CONF" ]]; then
+    if (( DRY_RUN )); then
+      note "[dry-run] снять WARP: wg-quick@$WARP_IFACE, watchdog, ip rule fwmark $WARP_FWMARK, $WARP_CONF"
+    else
+      warp_disable || warn "Не удалось полностью удалить WARP — проверьте ip rule и ip link."
+    fi
+  fi
+
   if have systemctl; then
     run_cmd systemctl stop caddy || true
     run_cmd systemctl disable caddy || true
@@ -3472,6 +4396,11 @@ reconfigure_print_summary() {
     kv "CDN"            "${CDN_HOST:-} (${CDN_TRANSPORT:-ws})"
   else
     kv "CDN"            "(выключен)"
+  fi
+  if (( ${ENABLE_WARP:-0} )); then
+    kv "WARP"           "включён (${WARP_ROUTE_MODE:-ai}, fwmark ${WARP_FWMARK:-255})"
+  else
+    kv "WARP"           "(выключен)"
   fi
   kv "minClientVer"     "${REALITY_MIN_CLIENT_VER:-0.0.0}"
   kv "ACME"             "${ACME_METHOD:-auto} (для новых сертификатов)"
@@ -3593,9 +4522,46 @@ reconfigure_ensure_cdn_cert() {
   ok "CDN-сертификат установлен для $CDN_HOST"
 }
 
+reconfigure_choose_warp() {
+  local on="${ENABLE_WARP:-0}" mode="${WARP_ROUTE_MODE:-ai}" route_default=1
+  ask_bool on "Поднять исходящий туннель WARP (Cloudflare)?" "${on:-y}"
+  ENABLE_WARP="$on"
+  if (( ENABLE_WARP )); then
+    [[ "$mode" == "all" ]] && route_default=2
+    ask_choice mode "Что заворачивать в WARP" "$route_default" \
+      "ai: только AI/заблокированные сервисы — остальное напрямую (рекомендуется)" \
+      "all: весь исходящий трафик ноды через WARP"
+    WARP_ROUTE_MODE="$mode"
+    note "WARP: включён, режим $WARP_ROUTE_MODE, fwmark $WARP_FWMARK"
+  else
+    note "WARP: будет выключен (туннель и watchdog удаляются)"
+  fi
+}
+
+# Применение решения по WARP: туннель поднимается/снимается, профиль и
+# маршрутизация пересобираются. WARP не трогает Caddy и сертификаты, поэтому
+# идёт отдельно от reconfigure_apply — там перезапуск Caddy не нужен.
+reconfigure_apply_warp() {
+  warp_validate_settings
+  if (( ENABLE_WARP )); then
+    warp_enable
+    WARP_LOCAL_IP="$(ip -4 addr show "$WARP_IFACE" 2>/dev/null \
+      | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)"
+    WARP_READY=1
+    # Маршруты через WARP касаются только исходящих соединений, но сертификаты
+    # и Caddy их не используют — перезапуск не нужен.
+    ok "WARP включён ($WARP_ROUTE_MODE, fwmark $WARP_FWMARK)"
+  else
+    warp_disable
+    ok "WARP выключен"
+  fi
+}
+
 reconfigure_apply() {
   (( ENABLE_XHTTP )) && ENABLE_XHTTP=1 || ENABLE_XHTTP=0
   (( ENABLE_CDN )) && ENABLE_CDN=1 || ENABLE_CDN=0
+  ENABLE_WARP="$(parse_bool "${ENABLE_WARP:-n}" 0)"
+  export ENABLE_WARP WARP_ROUTE_MODE WARP_FWMARK WARP_TABLE WARP_MTU WARP_IFACE
 
   if ! REALITY_MIN_CLIENT_VER="$(normalize_client_version "${REALITY_MIN_CLIENT_VER:-0.0.0}")"; then
     die "REALITY_MIN_CLIENT_VER: нужен вид 0.0.0."
@@ -3627,6 +4593,13 @@ reconfigure_apply() {
     reconfigure_apply_theme
   fi
   reconfigure_ensure_cdn_cert
+
+  # WARP поднимаем до записи env-файла: если регистрация в Cloudflare не
+  # удалась, fail-fast случится раньше, чем профиль уедет в панель с
+  # outbound'ом, которого на хосте нет.
+  if [[ "${RECONFIGURE_WARP_DIRTY:-0}" == 1 ]]; then
+    reconfigure_apply_warp
+  fi
 
   write_env_store
   ok "Настройки сохранены в $ENV_STORE"
@@ -3671,6 +4644,9 @@ run_reconfigure() {
   : "${CDN_TRANSPORT:=ws}" "${CDN_HOST:=}" "${CDN_WS_PATH:=/api/v1/stream}"
   : "${CDN_XHTTP_PATH:=/api/v3/sync/c1}" "${CDN_GRPC_PATH:=/api/v4/stream}"
   RECONFIGURE_THEME_DIRTY=0
+  RECONFIGURE_WARP_DIRTY=0
+  ENABLE_WARP="$(parse_bool "${ENABLE_WARP:-n}" 0)"
+  WARP_ROUTE_MODE="${WARP_ROUTE_MODE:-ai}"
 
   banner
   printf '\n %s%s%s\n' "${C_B:-}${C_CYN:-}" "Изменение настроек без переустановки" "${C_RST:-}"
@@ -3685,6 +4661,7 @@ run_reconfigure() {
     printf '   2) XHTTP / CDN (SNI, путь, target, CDN-домен, транспорт)\n' > /dev/tty
     printf '   3) minClientVer REALITY\n' > /dev/tty
     printf '   4) ACME method (для новых сертификатов)\n' > /dev/tty
+    printf '   5) WARP (включить/выключить, режим маршрутизации)\n' > /dev/tty
     printf '   0) Сохранить и применить\n' > /dev/tty
     printf '   q) Выйти без изменений\n' > /dev/tty
     ask choice__ "Выберите пункт" "0"
@@ -3717,6 +4694,10 @@ run_reconfigure() {
         unset __acme_default
         warn "Уже выпущенные сертификаты продолжат продлеваться прежним способом; новое значение — для новых выпусков/перевыпуска."
         ;;
+      5)
+        reconfigure_choose_warp
+        RECONFIGURE_WARP_DIRTY=1
+        ;;
       0)
         reconfigure_apply
         exit 0
@@ -3726,7 +4707,7 @@ run_reconfigure() {
         exit 0
         ;;
       *)
-        warn "Введите 0, 1, 2, 3, 4 или q."
+        warn "Введите 0, 1, 2, 3, 4, 5 или q."
         ;;
     esac
   done
@@ -3785,6 +4766,19 @@ while [[ $# -gt 0 ]]; do
       XRAY_TEMPLATE_CHOICE="${2:-}"
       [[ -n "$XRAY_TEMPLATE_CHOICE" ]] || { echo "--xray-template требует значение (standard или split)" >&2; exit 2; }
       shift ;;
+    --warp)       WARP_SETTING=1 ;;
+    --no-warp)    WARP_SETTING=0 ;;
+    --warp-route)
+      WARP_ROUTE_MODE="${2:-}"
+      case "$WARP_ROUTE_MODE" in
+        ai|all) ;;
+        *) echo "--warp-route принимает ai или all" >&2; exit 2 ;;
+      esac
+      shift ;;
+    --warp-mark)
+      WARP_FWMARK="${2:-}"
+      warp_valid_mark "$WARP_FWMARK" || { echo "--warp-mark требует число 1..2147483647" >&2; exit 2; }
+      shift ;;
     --panel-url)
       REMNAWAVE_PANEL_URL="${2:-}"
       [[ -n "$REMNAWAVE_PANEL_URL" ]] || { echo "--panel-url требует значение" >&2; exit 2; }
@@ -3822,6 +4816,15 @@ elif [[ "$CF_MODE_SETTING" == 0 ]]; then
 elif [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]]; then
   CF_MODE=1
 fi
+
+# Явный флаг WARP перекрывает env/сохранённое значение; пустое ENABLE_WARP
+# означает «решить по режиму мастера» (быстрый — включить, расширенный — спросить).
+if [[ "$WARP_SETTING" == 1 ]]; then
+  ENABLE_WARP=1
+elif [[ "$WARP_SETTING" == 0 ]]; then
+  ENABLE_WARP=0
+fi
+[[ "$WARP_SETTING" == 1 || "$WARP_ENV_PRESENT" == 1 ]] && WARP_ENV_PRESENT=1
 
 
 
@@ -4224,6 +5227,20 @@ QUICK_SETUP="$(parse_bool "${QUICK_SETUP:-n}" 0)"
 REMNAWAVE_AUTO_SETUP="$(parse_bool "${REMNAWAVE_AUTO_SETUP:-n}" 0)"
 ENABLE_XHTTP="$(parse_bool "${ENABLE_XHTTP:-y}" 0)"
 ENABLE_CDN="$(parse_bool "${ENABLE_CDN:-n}" 0)"
+# WARP: пустое значение означает «мастер решит по режиму», поэтому дефолт 0
+# (быстрый режим выставит 1 сам в prompt_flags).
+ENABLE_WARP="$(parse_bool "${ENABLE_WARP:-n}" 0)"
+WARP_ROUTE_MODE="${WARP_ROUTE_MODE,,}"
+WARP_ROUTE_MODE="${WARP_ROUTE_MODE:-ai}"
+case "$WARP_ROUTE_MODE" in
+  ai|all) ;;
+  *) die "WARP_ROUTE_MODE/--warp-route: допустимо ai или all, получено «$WARP_ROUTE_MODE»." ;;
+esac
+warp_valid_mark "$WARP_FWMARK" \
+  || die "WARP_FWMARK/--warp-mark: нужно число 1..2147483647, получено «$WARP_FWMARK»."
+if (( ENABLE_WARP )) && [[ "$(warp_arch 2>/dev/null || true)" == "" ]]; then
+  die "WARP на архитектуре $(uname -m) не поддерживается (нужны x86_64 или arm64)."
+fi
 
 # Новые настройки нормализуются после загрузки ENV_STORE: сохранённое значение
 # должно побеждать дефолт, а явный флаг — сохранённое.
@@ -4259,7 +5276,7 @@ if has_tty; then
 {
   printf '\n'
   printf ' %s%s Добро пожаловать в мастер установки! %s\n' "${C_B:-}${C_CYN:-}" "${C_RST:-}" ""
-  printf ' %sБыстрый режим задаст всего 8 вопросов; расширенный — все настройки по блокам.%s\n' "${C_DIM:-}${C_GRY:-}" "${C_RST:-}"
+  printf ' %sБыстрый режим задаст всего 9 вопросов; расширенный — все настройки по блокам.%s\n' "${C_DIM:-}${C_GRY:-}" "${C_RST:-}"
   printf ' %sЕсли не знаете что ответить — жмите Enter для значения по умолчанию.%s\n' "${C_DIM:-}${C_GRY:-}" "${C_RST:-}"
   printf '\n'
 } > /dev/tty 2>/dev/null || true
@@ -4281,7 +5298,7 @@ elif [[ "$NONINTERACTIVE" == 1 ]] || (( QUICK_SETUP_ENV_PRESENT )) \
 else
   SETUP_MODE="quick"
   ask_choice SETUP_MODE "Режим установки" "1" \
-    "quick: Быстрая автоустановка — всего 8 вопросов (домен, токены, панель, CDN, XHTTP target), остальное автоматически (рекомендуется)" \
+    "quick: Быстрая автоустановка — всего 9 вопросов (домен, токены, панель, CDN, XHTTP target, WARP), остальное автоматически (рекомендуется)" \
     "advanced: Расширенная настройка — все вопросы по блокам, полный ручной контроль"
   if [[ "$SETUP_MODE" == "quick" ]]; then QUICK_SETUP=1; else QUICK_SETUP=0; fi
 fi
@@ -4462,6 +5479,7 @@ if (( ! QUICK_SETUP )); then
   note "VLESS Reality/Vision и Hysteria2 включены всегда. Дополнительно можно включить:"
   note "  • XHTTP — современный транспорт, лучше работает в некоторых сетях"
   note "  • VLESS за CDN — прячет TCP-маршрут VLESS за Cloudflare/аналогами (Hysteria2 остаётся прямой)"
+  note "  • WARP — исходящий туннель до Cloudflare для AI-сервисов (OpenAI, Anthropic, Gemini)"
 fi
 : "${C_B:=}" "${C_CYN:=}" "${C_RST:=}" "${C_DIM:=}" "${C_GRY:=}" "${C_MAG:=}"
 prompt_flags
@@ -4706,6 +5724,14 @@ fi
 export XRAY_TEMPLATE_CHOICE SELF_STEAL_TEMPLATE SELF_STEAL_TEMPLATE_URL
 export REMNAWAVE_PANEL_URL REMNAWAVE_API_TOKEN REMNAWAVE_AUTO_SETUP
 export CF_MODE CLOUDFLARE_API_TOKEN CLOUDFLARE_ZONE QUICK_SETUP
+if (( ENABLE_WARP )); then
+  export ENABLE_WARP WARP_ROUTE_MODE WARP_FWMARK WARP_TABLE WARP_MTU WARP_IFACE
+  export WARP_ROUTE_DOMAINS WARP_ROUTE_GEOSITE
+elif [[ -n "${WARP_SETTING}${WARP_ENV_PRESENT}" ]]; then
+  # Явно выключенный WARP тоже сохраняем: иначе повторный запуск в быстром
+  # режиме включил бы его обратно по дефолту.
+  export ENABLE_WARP
+fi
 
 # Запись CDN-хоста создаётся проксируемой: именно оранжевое облако направляет
 # трафик через CDN на origin. Это делается при каждом включённом CDN, а не
@@ -4762,6 +5788,15 @@ if (( ENABLE_CDN )); then
 fi
 kv "Config Profile" "$NODE_DIR/Multiselect.json"
 kv "Шаблон подписки" "$XRAY_TEMPLATE_CHOICE ($NODE_DIR/Xray_template.json)"
+if (( ENABLE_WARP )); then
+  if [[ "$WARP_ROUTE_MODE" == "all" ]]; then
+    kv "WARP"         "весь исходящий трафик ноды → Cloudflare WARP (fwmark $WARP_FWMARK)"
+  else
+    kv "WARP"         "AI-сервисы (OpenAI, Anthropic, Gemini) → Cloudflare WARP (fwmark $WARP_FWMARK)"
+  fi
+else
+  kv "WARP"           "(отключён — трафик идёт напрямую)"
+fi
 kv "PANEL_IP"      "$PANEL_IP"
 kv "NODE_API_PORT" "$NODE_API_PORT"
 if (( QUICK_SETUP )); then
@@ -5198,7 +6233,26 @@ else
   warn "BBR не активировался (сейчас: $cc). Возможно нужно новое ядро/перезапуск."
 fi
 
-step 9 "Нода Remnawave (compose)"
+step 9 "WARP — исходящий туннель Cloudflare"
+if (( ENABLE_WARP )); then
+  note "Туннель WireGuard до Cloudflare: подменяет адрес выхода для AI-сервисов,"
+  note "которые не пускают IP хостингов. Основной трафик сервера и клиентов не затрагивается."
+  warp_enable
+  WARP_LOCAL_IP="$(ip -4 addr show "$WARP_IFACE" 2>/dev/null \
+    | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)"
+  WARP_READY=1
+else
+  WARP_LOCAL_IP=""
+  note "WARP отключён: трафик ноды идёт напрямую с IP сервера."
+  # Туннель мог остаться от прошлого запуска: неиспользуемый, он только мешает
+  # (лишний интерфейс, правило и таймер watchdog продолжали бы жить).
+  if [[ -f /etc/systemd/system/remnawave-warp-watchdog.service || -f "$WARP_CONF" ]]; then
+    log "Удаляю WARP, оставшийся от предыдущей установки"
+    warp_disable
+  fi
+fi
+
+step 10 "Нода Remnawave (compose)"
 mkdir -p "$NODE_DIR"
 echo
 
@@ -5369,7 +6423,7 @@ if (( REMNAWAVE_AUTO_SETUP )) && [[ -n "${PANEL_NODE_UUID:-}" ]]; then
   panel_trigger_node_start "$PANEL_NODE_UUID" || true
 fi
 
-step 10 "Проверка слушателей и маршрутизации"
+step 11 "Проверка слушателей и маршрутизации"
 
 
 
@@ -5456,6 +6510,14 @@ verify_http_layer
 (( tls_failures == 0 )) || die "Не прошли TLS-проверку маршруты: $tls_failures. Установка не считается завершённой."
 ok "Все SNI/TLS-маршруты прошли проверку"
 
+# WARP: проверяем ровно то, на чём чаще всего ломается — правило метки,
+# rp_filter и проход ICMP через туннель. Нода при этом уже работает: Xray
+# уходит в WARP только помеченным трафиком, поэтому сбой WARP не роняет ноду.
+if (( ENABLE_WARP )) && [[ "$WARP_READY" == 1 ]]; then
+  printf '   %s%sWARP%s\n' "${C_B:-}" "${C_MAG:-}" "${C_RST:-}"
+  warp_verify
+fi
+
 prune_matching_files "$LOG_DIR" 'remnanode-setup-*.log' 10
 
 log "Очистка установочных остатков (apt, Docker)"
@@ -5494,6 +6556,14 @@ if [[ -n "${CUSTOM_CORE_URL:-}" ]]; then
   kv "Xray core"     "кастомный: $CUSTOM_CORE_URL"
 else
   kv "Xray core"     "штатный из образа"
+fi
+if (( ENABLE_WARP )) && [[ "$WARP_READY" == 1 ]]; then
+  if [[ "$WARP_ROUTE_MODE" == "all" ]]; then
+    kv "WARP"         "весь исходящий трафик → Cloudflare ($WARP_LOCAL_IP, fwmark $WARP_FWMARK)"
+  else
+    kv "WARP"         "AI-сервисы → Cloudflare ($WARP_LOCAL_IP, fwmark $WARP_FWMARK)"
+  fi
+  kv "WARP CLI"      "remnawave-warp (status | rotate | log | uninstall)"
 fi
 kv "REALITY"        "minClientVer=$REALITY_MIN_CLIENT_VER, XHTTP target=$XHTTP_TARGET"
 if [[ "$ACME_METHOD_USED" == "dns" ]]; then

@@ -1,5 +1,39 @@
 # Changelog
 
+## [1.3.0] — 2026-11-10
+
+### Added
+- **WARP**: исходящий туннель Cloudflare (WireGuard) для AI-сервисов и заблокированных
+  доменов. Реализован нативно в установщике (`lib/45-warp.sh`), по мотивам
+  [tagashi666/vps-warp](https://github.com/tagashi666/vps-warp): регистрация аккаунта через
+  `wgcf` (тег и SHA256 закреплены), `wg-quick@warp` с `Table` и правилом `ip rule fwmark`,
+  TCP MSS clamping, понижение `rp_filter` с закреплением в `sysctl.d`, watchdog с ротацией
+  endpoint и backoff до 30 минут, CLI `remnawave-warp` (status/start/stop/rotate/log/uninstall).
+  В туннель уходит только помеченный трафик — остальной идёт напрямую с IP сервера.
+- `ENABLE_WARP`, `--warp` / `--no-warp`, `--warp-route ai|all`, `--warp-mark N`:
+  WARP спрашивается девятым вопросом быстрого режима (по умолчанию — да) и может быть
+  выключен флагом/env.
+- `WARP_ROUTE_DOMAINS`, `WARP_ROUTE_GEOSITE`: свой список доменов/geosite поверх встроенного
+  набора AI-сервисов (`geosite:openai`, `geosite:anthropic`, `geosite:google-gemini`,
+  `geosite:category-ai-!cn`, `claude.ai`, `chatgpt.com`, `perplexity.ai`, …). Некорректные
+  паттерны отбрасываются с предупреждением, а не уезжают в Config Profile.
+- `Config Profile`: outbound `WARP` (`freedom` + `ForceIPv4` + `sockopt.mark`) и правило
+  маршрутизации, вставляемое после BLOCK-правил и перед маршрутом по умолчанию. При повторной
+  сборке профиля правило и outbound не дублируются, при выключении WARP — удаляются.
+- `--reconfigure`: пункт 5 — включить/выключить WARP и выбрать режим маршрутизации.
+- `selfcheck.sh`: проверка туннеля WARP (активность, правило `fwmark`, `rp_filter`, возраст
+  хэндшейка), когда `ENABLE_WARP=y`.
+- `tests/warp-checks.sh`: разбор профиля wgcf, конфиг WireGuard, fail-closed на битом профиле,
+  нормализация маршрутов, вставка правила в профиль, тела watchdog/CLI, идемпотентность
+  env-файла. CI получил отдельный шаг и инварианты WARP.
+
+### Changed
+- Нумерация шагов установки: WARP — шаг 9, нода — шаг 10, проверки — шаг 11.
+  Быстрый режим теперь задаёт 9 вопросов вместо 8.
+- Тест порядка шага «Нода Remnawave» ищет секцию по названию, а не по номеру: номера
+  шагов сдвигаются при добавлении новых, порядок внутри секции — нет.
+- `--uninstall` снимает WARP (туннель, watchdog, правило, `sysctl`-файл) до Caddy.
+
 ## [1.2.0] — 2026-11-03
 
 ### Added
